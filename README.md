@@ -50,7 +50,6 @@ lfv rewind notes.md snap_01HXYZ   # automatically creates a new branch
 lfv mv notes.md archive/          # rename is a first‑class event
 lfv delete old.md && lfv snap     # deletion is part of history
 lfv revive old.md                 # restore from anywhere
-
 ```
 
 ## How to Use It (Everyday Commands)
@@ -75,6 +74,8 @@ LFV stores only two immutable object types: **Object** (file content, addressed 
 Mutable state (branches, tags, HEAD, working tree status) lives in an `index.db` (SQLite) – it’s a reconstructable cache, not part of history.
 
 No tree objects, no staging area, no multi-file commits. Written in Rust.
+
+Snapshot history forms a **directed tree (forest), not a DAG**: each Snapshot has exactly one parent pointer. Branches diverge and stay independent — there is no topological merge. To align two branches, use `lfv rebase` (pure parent-pointer reconnection, no content merging). The UI uses file-hash (object's blake3) to identify content equivalence across branches.
 
 ## Roadmap
 

@@ -1,6 +1,6 @@
 # LFV — Lightweight File Versioning
 
-> This is the English design document for the LFV project. For the Chinese version, see `design_zh-cn.md`.
+> This is the English design document for the LFV project. For the Chinese version, see `design.zh-cn.md`.
 
 ---
 
@@ -70,8 +70,8 @@ In order to stay "lightweight", the following are **out of scope**:
 | Tag | A human-readable name for a snapshot (optional), used to stably reference a specific version. |
 | Action | Actions change the state of a file. Available actions include `track`, `snap`, and `untrack`, plus two actions with no corresponding command: `modify` (achieved by the user editing the file) and `auto-track` / `auto-delete` (applied automatically by LFV during scanning in response to OS file create/delete events; see §6). |
 
-> Note: **All of the above concepts are scoped to a single file** — this is the most fundamental difference between LFV and git.
-> Furthermore, a path is not a file's identity; **it is merely a field on a Snapshot**: a rename is appending a new Snapshot, and a deletion is appending a Snapshot with `object=null`. The entire file lifecycle is this Snapshot chain.
+> [!Note]
+> **All of the above concepts are scoped to a single file** — this is the most fundamental difference between LFV and git.
 
 ### 4.1 File Identity: file-id Decoupled from Path
 
@@ -89,13 +89,20 @@ There are **only two true "storage objects"** in an LFV repository:
 | Storage Object | Contents | Addressing | Immutability |
 | --- | --- | --- | --- |
 | **Object** | Raw file bytes (compressed) | Content-addressed: `blake3(content)` | Fully immutable (write-once) |
-| **Snapshot** | Event record: path, object pointer (nullable), message, author, timestamp, parent snapshot, digest | Identifier-addressed: `snap_<ULID>` | Append-only, never rewritten |
-
-**There is no tree object** — the biggest structural difference from git. Git's tree describes "the directory listing of a commit," but LFV's snapshot naturally corresponds to a single file; a Snapshot points directly to an Object with no intermediate layer.
+| **Snapshot** | Event record: path, object pointer (nullable), message, author, timestamp, parent snapshot id, digest | Identifier-addressed: `snap_<ULID>` | Append-only, never rewritten |
 
 Everything else (HEAD, branches, tags, file status, config) is **mutable state / index** and is not a "storage object." Mutable state can be reconstructed if corrupted (as long as Objects and Snapshots are intact); storage objects are immutable — the repository's source of truth.
 
-> Because a Snapshot carries the `path` field, **rename/move is also an immutable history event** — structurally identical to "content change" and "delete", distinguishable only by comparing fields with the parent snapshot. This avoids the truth-source fragmentation that would result from maintaining a separate, mutable `aliases` list.
+About Snapshots:
+
+- The entire file lifecycle is the Snapshot chain.
+- A Snapshot carries the `path` field; the path is not the file's identity.
+- **Rename/move** is also an immutable history event — structurally identical to "add", "content change", and "delete", distinguishable only by comparing fields with the parent snapshot.
+  Rename = appending a new Snapshot; delete = appending a Snapshot with `object=null`.
+- Each Snapshot has **exactly one parent pointer**, forming a directed tree (forest). This differs from Git's DAG topology: once branches diverge, they evolve independently and there is no topological merge point.
+- In rendering and visualization layers, however, snapshots with the same `file-id` can be treated as one group.
+
+**There is no tree object** — the biggest structural difference from Git. Git's tree describes "the directory listing of a commit," but LFV's snapshot naturally corresponds to a single file; a Snapshot points directly to an Object with no intermediate layer.
 
 ### 4.3 Mutable Index: Status Table, Branches, HEAD, Tags
 
@@ -492,6 +499,7 @@ Simply copy or sync the entire working directory (including `.lfv`) to another d
 10. **Deletion = deletion marker; history is never lost**: `lfv delete` removes the file from disk and marks its status-table entry as `modified`. `lfv snap` then confirms the deletion by appending an `object=null` Snapshot and removing the file record from the status table. All historical snapshots are fully preserved and the file can be revived at any time via `lfv revive`.
 11. **`file-id` is the only stable reference**: all commands that accept `<file>` also accept a path or `f_*`. A `file-id` is assigned at track time and persists through the file's entire lifecycle — including after deletion — and is the only still-valid reference token after the file disappears or its path changes.
 12. **Track-by-default policy**: files in the working directory are, under normal circumstances, always in a tracked state. LFV performs a lazy scan on every command invocation: newly created files are auto-tracked; tracked files deleted by the OS are automatically flagged `D` and receive a deletion marker on the next `lfv snap`. This matches the mental model of "file-centric version management" (see §6).
+13. **Snapshot topology is a directed tree, not a DAG**: each Snapshot has exactly one parent pointer, forming a directed forest. Branches diverge and evolve independently; there is no topological merge point. To "realign" two branches, the user must explicitly run `lfv rebase` (not implemented yet) — branches never merge automatically. At the UI layer, file-hash (the object's blake3) serves as the measure of content identity, so `lfv log --graph` and `lfv branches` can show when two branches share the same content at a given point, while each Snapshot's identity (ULID) remains unique and independent. In LFV's single-user, single-file, local scenario this design incurs almost no cost while significantly reducing the implementation complexity of the storage layer, index layer, and `log` rendering.
 
 ## 10. Technology Choices
 

@@ -65,14 +65,14 @@ LFV (Lightweight File Versioning) 的目标：
 | 跟踪文件 | Tracked File | 由 `lfv track` 加入仓库管理的某个文件。内部以 `file-id`（ULID）作为稳定身份，**与路径完全解耦**；其在工作树上的位置（路径）是 Snapshot 的字段，可随历史演化。 |
 | 文件状态 | File Status | 工作目录文件有三种状态：unmodified、modified（new 和 deleted 也是 modified）和 untracked。未跟踪/忽略文件在状态表中就是 untracked，它可由 `config.yaml` / `.lfvignore` 重建。 |
 | 对象 | Object | 内容寻址的文件内容存储单元；按内容哈希去重，不同文件可能共享同一对象。 |
-| 快照 | Snapshot | 某个跟踪文件在某一时刻的"事件记录"：内容指针 + 路径 + 元数据（消息、时间戳、作者、父快照）。一条 Snapshot 同时承担"内容变更""改名/移动""删除"三种事件。成功 Snapshot 一个文件后，该文件在状态表中的状态变为 unmodified。 |
+| 快照 | Snapshot | 某个跟踪文件在某一时刻的"事件记录"：内容指针 + 路径 + 元数据（消息、时间戳、作者、父快照）。一条 Snapshot 同时承担"内容变更""改名/移动""删除"三种事件。成功 Snapshot 一个文件后，该文件在状态表中的状态变为 unmodified。|
 | 分支 | Branch | 一个跟踪文件下的一条快照链；默认分支 `main`。每个文件的分支命名空间彼此独立。 |
 | 头部 | HEAD | 某个跟踪文件 **当前所在** 的分支与最新快照指针。 |
 | 标签 | Tag | 对某个快照的可读命名（可选），用于稳定地引用某个版本。 |
 | 动作 | Action | 动作改变一个文件的状态。可用的动作包括 track、snap、untrack，还有两个没有对应命令的动作：modify（由用户修改文件达成）和 auto-track / auto-delete（由 LFV 在扫描时对 OS 文件新建/删除事件自动应用，详见 §6）。 |
 
-> 注意：**所有上述概念都以"单个文件"为作用域**——这是 LFV 与 git 最本质的区别。
-> 进一步地，路径（path）不是文件的身份，**只是 Snapshot 上的一个字段**：改名 = 追加一条新 Snapshot，删除 = 追加一条 `object=null` 的 Snapshot。整个文件生命周期就是这条 Snapshot 链。
+> [!note] 注意
+> **所有上述概念都以"单个文件"为作用域**——这是 LFV 与 git 最本质的区别。
 
 ### 4.1 文件身份：file-id 与路径解耦
 
@@ -90,13 +90,19 @@ LFV 仓库中 **真正的"存储对象"只有两类**：
 | 存储对象 | 内容 | 寻址方式 | 不可变性 |
 | ---- | ---- | ---- | ---- |
 | **Object** | 文件原始字节（压缩后） | 内容寻址：`blake3(content)` | 完全不可变（写一次） |
-| **Snapshot** | 事件记录：path、object 指针（可为 null）、消息、作者、时间、父快照、digest | 标识符寻址：`snap_<ULID>` | 仅 append，不重写 |
-
-**没有 tree 对象**——这是 LFV 与 git 最大的结构差异。git 的 tree 用来描述"某次提交包含的目录清单"，而 LFV 的快照天然只对应一个文件，Snapshot 直接指向 Object，无需中间层。
+| **Snapshot** | 事件记录：path、object 指针（可为 null）、消息、作者、时间、父快照ID、digest | 标识符寻址：`snap_<ULID>` | 仅 append，不重写 |
 
 其它一切（HEAD、branches、tags、文件状态、config）都是 **可变状态/索引**，不属于"存储对象"。可变状态出错可以重建（只要 Object + Snapshot 还在）；存储对象不可篡改，是仓库的真理之源（source of truth）。
 
-> 由于 Snapshot 自身承载 `path` 字段，**重命名/移动也是不可篡改的历史事件**——它和"内容变更""删除"在结构上完全同形，仅靠对父快照的字段比对即可区分。这避免了维护一份独立、可变的 `aliases` 列表所带来的真理源分裂。
+关于 Snapshot ：
+- 整个文件生命周期就是 Snapshot 链。
+- Snapshot 自身承载 `path` 字段，路径（path）不是文件的身份。
+- **重命名/移动**也是不可篡改的历史事件——它和"新增"、"内容变更"、"删除"在结构上完全同形，仅靠对父快照的字段比对即可区分。
+  改名 = 追加一条新 Snapshot，删除 = 追加一条 `object=null` 的 Snapshot。
+- 每条 Snapshot **只有一个 parent 指针**，整体构成有向树（森林），这与 Git 的 DAG 图拓扑不同，分支出去即独立演化，不存在拓扑意义上的合并点。
+- 但在渲染和视觉层面上可以将同一 `file-id` 的快照视为一个。
+
+**没有 tree 对象**——这是 LFV 与 Git 最大的结构差异。git 的 tree 用来描述"某次提交包含的目录清单"，而 LFV 的快照天然只对应一个文件，Snapshot 直接指向 Object，无需中间层。
 
 ### 4.3 可变索引：状态表、分支、HEAD、标签
 
@@ -492,6 +498,7 @@ lfv snap docs/old-note.md -m "resumed from old history"
 10. **删除即 deletion-marker，历史永不丢失**：`lfv delete` 把文件从 FS 中删除，把状态表的文件标记为 `modified`。`lfv snap` 时相当于确认这一删除，即追加一条 `object=null` 的 Snapshot，并删除状态表的该文件记录。所有历史 Snapshot 完整保留，随时可 `lfv revive`。
 11. **`file-id` 是唯一稳定引用**：所有接受 `<file>` 的命令同时接受路径或 `f_*`。`file-id` 在 track 时分配，贯穿文件整个生命周期（含删除后），是文件消失、路径变更后唯一仍然有效的引用手段。
 12. **默认全跟踪策略**：工作目录下的文件，正常情况下都处于被跟踪状态。LFV 在每次命令执行时做惰性扫描：新建文件自动 `track`，OS 删除的跟踪文件会被自动标记为 `D` 状态，并在下次 `lfv snap` 时自动完成 deletion-marker。这贴合"文件中心的版本管理"场景（详见 §6）。
+13. **Snapshot 拓扑为有向树，非 DAG**：每条 Snapshot 只有一个 parent 指针，整体形成有向森林。分支分叉后独立演化，不存在拓扑意义上的合并点。两条分支若想"走回同一轨道"，须显式执行 `lfv rebase`（还未实现），而非自动合流。界面层以 file-hash（object 的 blake3）作为"内容同一性"的判断依据，用户在 `lfv log --graph` 或 `lfv branches` 中可直观看到"哪两个分支在此处内容相同"，但底层 Snapshot 身份（ULID）始终唯一、独立。此设计在 LFV 的单人单文件本地场景下代价几乎为零，却大幅降低了存储层、索引层和 `log` 渲染的实现复杂度。
 
 ## 10. 技术选型
 
