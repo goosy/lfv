@@ -125,7 +125,8 @@ A/                                   # 工作目录
     ├── index.db                     # 状态、分支、标签、头部等索引（SQLite 或 sled）
     ├── objects/                     # 内容寻址对象存储
     │   ├── ab/
-    │   │   └── cdef0123...zstd      # 对象文件（按 hash 分桶 + zstd 压缩）
+    │   │   ├── cdef0123...zstd      # zstd 压缩对象
+    │   │   └── cdef0123...raw       # 原样对象（过小/过大/不可压）
     │   └── ...
     ├── files/                       # 每个跟踪文件的元数据
     │   └── <file-id>/
@@ -138,11 +139,26 @@ A/                                   # 工作目录
 
 ### 5.1 对象存储
 
-- 内容寻址：对象名 = `blake3(content)`；
+- 内容寻址：对象身份 = `blake3(原始字节)`；分桶路径中的 hash 前缀来自原始内容，与是否压缩无关；
 - 分桶：前 2 个十六进制字符作为目录名，避免单目录文件过多；
-- 压缩：使用 `zstd` 压缩存储；解压在内存中完成；
-- 大文件（默认阈值 > 16 MiB）：跳过压缩，原始字节存储以避免内存峰值；
+- 压缩：对原始字节使用 `zstd`（默认 level **3**）压缩后落盘，扩展名 `.zstd`；读对象时在内存中解压；
+- 原样存储（扩展名 `.raw`）：满足以下 **任一** 条件时不压缩：
+  - **floor**：`size < min_bytes`（默认 **4 KiB**，4096 字节）——过小，帧开销可能使压缩后更大；
+  - **ceiling**：`size >= max_bytes`（默认 **16 MiB**，16777216 字节）——避免大文件整段读入内存时的峰值；
+  - **无效压缩**：尝试压缩后 `compressed_len >= original_len`（`reject_if_larger`，默认 **true**）——对已压缩二进制等无收益内容；
 - 跨文件共享：相同内容只存一份对象，节省空间。
+
+#### 5.1.1 压缩默认配置（`config.yaml`）
+
+```yaml
+compression:
+  enabled: true
+  algorithm: zstd
+  level: 3              # zstd 1..=22
+  min_bytes: 4096       # floor: size < min → .raw
+  max_bytes: 16777216   # ceiling: size >= max → .raw
+  reject_if_larger: true
+```
 
 ### 5.2 快照记录格式
 
@@ -499,6 +515,7 @@ lfv snap docs/old-note.md -m "resumed from old history"
 11. **`file-id` 是唯一稳定引用**：所有接受 `<file>` 的命令同时接受路径或 `f_*`。`file-id` 在 track 时分配，贯穿文件整个生命周期（含删除后），是文件消失、路径变更后唯一仍然有效的引用手段。
 12. **默认全跟踪策略**：工作目录下的文件，正常情况下都处于被跟踪状态。LFV 在每次命令执行时做惰性扫描：新建文件自动 `track`，OS 删除的跟踪文件会被自动标记为 `D` 状态，并在下次 `lfv snap` 时自动完成 deletion-marker。这贴合"文件中心的版本管理"场景（详见 §6）。
 13. **Snapshot 拓扑为有向树，非 DAG**：每条 Snapshot 只有一个 parent 指针，整体形成有向森林。分支分叉后独立演化，不存在拓扑意义上的合并点。两条分支若想"走回同一轨道"，须显式执行 `lfv rebase`（还未实现），而非自动合流。界面层以 file-hash（object 的 blake3）作为"内容同一性"的判断依据，用户在 `lfv log --graph` 或 `lfv branches` 中可直观看到"哪两个分支在此处内容相同"，但底层 Snapshot 身份（ULID）始终唯一、独立。此设计在 LFV 的单人单文件本地场景下代价几乎为零，却大幅降低了存储层、索引层和 `log` 渲染的实现复杂度。
+14. **对象压缩双阈值**：`min_bytes`（floor，默认 4 KiB）与 `max_bytes`（ceiling，默认 16 MiB）分别处理过小与过大文件；`blake3` 始终对原始字节计算；跳过或无效压缩的对象以 `.raw` 存储，压缩对象为 `.zstd`（详见 §5.1）。
 
 ## 10. 技术选型
 
@@ -506,7 +523,7 @@ lfv snap docs/old-note.md -m "resumed from old history"
 - **CLI 框架**：`clap` v4，使用 derive 风格定义命令树。
 - **错误处理**：`thiserror`（库级别定义错误类型） + `anyhow`（CLI 顶层收尾）。
 - **哈希**：`blake3`（速度快，足够强）。
-- **压缩**：`zstd`（压缩比/速度平衡好）。
+- **压缩**：`zstd` level 3；默认 `min_bytes` 4 KiB、`max_bytes` 16 MiB、`reject_if_larger: true`（详见 §5.1）。
 - **元数据序列化**：`serde` + 严格 YAML（人类可读的配置/元数据） + `serde_json`（snapshots.log 行格式）。`.lfv` 下所有配置与元数据文件统一使用 `.yaml` 后缀；严格 YAML 指 LFV 只写入和接受一个受限子集：映射、序列、字符串、数字、布尔值和 null，不依赖锚点、别名、复杂 tag 或隐式类型推断。
 - **索引存储**：`rusqlite`（嵌入式 SQLite，单文件 `index.db`）。
 - **文本 diff**：`similar`（行/词级 diff，输出 unified 格式）。
@@ -594,9 +611,8 @@ tests/
 下列问题会在开发过程中根据实际反馈决定：
 
 1. `index.db` 选型最终是 `rusqlite` 还是 `sled` / `redb`？
-2. 默认压缩阈值与压缩等级具体取多少？
-3. 二进制文件的 diff 是否需要更友好的"图片缩略图差异"等扩展？
-4. `lfv status --include-untracked` 是否要递归扫描整个工作树以发现 `.lfvignore` 静态排除和 `config.yaml` 动态 untracked 的文件？性能 vs. 易用性的权衡。
-5. 改名自动识别（`rename.autodetect`）的阈值：仅在内容哈希完全一致时识别，还是允许"相似度 ≥ N%"的近似匹配？后者复杂度高，倾向先只做精确匹配。
-6. `lfv revive` 默认从哪一条 Snapshot 恢复内容——删除前最后一次"非 deletion-marker"快照，还是要求用户必须显式指定 `<snap>`？倾向前者作为默认，并允许用户覆盖。
-7. 在同一个工作目录路径上，**先被软删除后又重新 `lfv track`** 的文件：应当复用旧 `file-id`（自动续接历史）还是分配新 `file-id`（视为不同的文件）？倾向 **分配新 file-id**——再次出现的同名文件并不一定语义相同，自动续接历史有误导风险；如需续接，用户可显式 `lfv revive`。
+2. 二进制文件的 diff 是否需要更友好的"图片缩略图差异"等扩展？
+3. `lfv status --include-untracked` 是否要递归扫描整个工作树以发现 `.lfvignore` 静态排除和 `config.yaml` 动态 untracked 的文件？性能 vs. 易用性的权衡。
+4. 改名自动识别（`rename.autodetect`）的阈值：仅在内容哈希完全一致时识别，还是允许"相似度 ≥ N%"的近似匹配？后者复杂度高，倾向先只做精确匹配。
+5. `lfv revive` 默认从哪一条 Snapshot 恢复内容——删除前最后一次"非 deletion-marker"快照，还是要求用户必须显式指定 `<snap>`？倾向前者作为默认，并允许用户覆盖。
+6. 在同一个工作目录路径上，**先被软删除后又重新 `lfv track`** 的文件：应当复用旧 `file-id`（自动续接历史）还是分配新 `file-id`（视为不同的文件）？倾向 **分配新 file-id**——再次出现的同名文件并不一定语义相同，自动续接历史有误导风险；如需续接，用户可显式 `lfv revive`。

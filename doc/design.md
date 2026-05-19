@@ -125,7 +125,8 @@ A/                                   # Working directory
     ├── index.db                     # Status, branches, tags, head index (SQLite or sled)
     ├── objects/                     # Content-addressed object store
     │   ├── ab/
-    │   │   └── cdef0123...zstd      # Object file (bucketed by hash prefix + zstd-compressed)
+    │   │   ├── cdef0123...zstd      # zstd-compressed object
+    │   │   └── cdef0123...raw       # raw object (too small/large/incompressible)
     │   └── ...
     ├── files/                       # Per-tracked-file metadata
     │   └── <file-id>/
@@ -138,11 +139,26 @@ A/                                   # Working directory
 
 ### 5.1 Object Store
 
-- Content-addressed: object name = `blake3(content)`;
+- Content-addressed: object identity = `blake3(raw bytes)`; the hash prefix in the bucket path is derived from raw content, independent of whether the object is compressed;
 - Bucketing: first 2 hex characters used as directory name to avoid excessive files in a single directory;
-- Compression: stored using `zstd`; decompression performed in memory;
-- Large files (default threshold > 16 MiB): skip compression, store raw bytes to avoid memory spikes;
+- Compression: raw bytes are compressed with `zstd` (default level **3**) and stored with a `.zstd` extension; decompression is performed in memory on read;
+- Raw storage (`.raw` extension): store uncompressed when **any** of the following holds:
+  - **floor**: `size < min_bytes` (default **4 KiB**, 4096 bytes) — too small; frame overhead may make compressed output larger;
+  - **ceiling**: `size >= max_bytes` (default **16 MiB**, 16777216 bytes) — avoid memory spikes from reading entire large files;
+  - **ineffective compression**: after attempting compression, `compressed_len >= original_len` (`reject_if_larger`, default **true**) — no benefit for already-compressed binaries, etc.;
 - Cross-file sharing: identical content is stored as a single object, saving space.
+
+#### 5.1.1 Default Compression Config (`config.yaml`)
+
+```yaml
+compression:
+  enabled: true
+  algorithm: zstd
+  level: 3              # zstd 1..=22
+  min_bytes: 4096       # floor: size < min → .raw
+  max_bytes: 16777216   # ceiling: size >= max → .raw
+  reject_if_larger: true
+```
 
 ### 5.2 Snapshot Record Format
 
@@ -500,6 +516,7 @@ Simply copy or sync the entire working directory (including `.lfv`) to another d
 11. **`file-id` is the only stable reference**: all commands that accept `<file>` also accept a path or `f_*`. A `file-id` is assigned at track time and persists through the file's entire lifecycle — including after deletion — and is the only still-valid reference token after the file disappears or its path changes.
 12. **Track-by-default policy**: files in the working directory are, under normal circumstances, always in a tracked state. LFV performs a lazy scan on every command invocation: newly created files are auto-tracked; tracked files deleted by the OS are automatically flagged `D` and receive a deletion marker on the next `lfv snap`. This matches the mental model of "file-centric version management" (see §6).
 13. **Snapshot topology is a directed tree, not a DAG**: each Snapshot has exactly one parent pointer, forming a directed forest. Branches diverge and evolve independently; there is no topological merge point. To "realign" two branches, the user must explicitly run `lfv rebase` (not implemented yet) — branches never merge automatically. At the UI layer, file-hash (the object's blake3) serves as the measure of content identity, so `lfv log --graph` and `lfv branches` can show when two branches share the same content at a given point, while each Snapshot's identity (ULID) remains unique and independent. In LFV's single-user, single-file, local scenario this design incurs almost no cost while significantly reducing the implementation complexity of the storage layer, index layer, and `log` rendering.
+14. **Dual compression thresholds**: `min_bytes` (floor, default 4 KiB) and `max_bytes` (ceiling, default 16 MiB) handle files that are too small or too large to compress; `blake3` is always computed over raw bytes; objects that skip compression or are rejected as ineffective are stored as `.raw`, compressed objects as `.zstd` (see §5.1).
 
 ## 10. Technology Choices
 
@@ -507,7 +524,7 @@ Simply copy or sync the entire working directory (including `.lfv`) to another d
 - **CLI framework**: `clap` v4, using the derive-style command tree definition.
 - **Error handling**: `thiserror` (library-level error type definitions) + `anyhow` (top-level CLI error aggregation).
 - **Hashing**: `blake3` (fast and strong enough).
-- **Compression**: `zstd` (good compression ratio / speed balance).
+- **Compression**: `zstd` level 3; defaults `min_bytes` 4 KiB, `max_bytes` 16 MiB, `reject_if_larger: true` (see §5.1).
 - **Metadata serialization**: `serde` + strict YAML (human-readable config/metadata) + `serde_json` (JSON Lines row format for `snapshots.log`). All config and metadata files under `.lfv/` use the `.yaml` extension. "Strict YAML" means LFV only writes and accepts a restricted subset: mappings, sequences, strings, numbers, booleans, and null — no anchors, aliases, complex tags, or implicit type coercion.
 - **Index storage**: `rusqlite` (embedded SQLite, single-file `index.db`).
 - **Text diff**: `similar` (line/word-level diff, unified format output).
@@ -595,9 +612,8 @@ tests/
 The following will be resolved based on practical feedback during development:
 
 1. Should `index.db` ultimately use `rusqlite` or `sled` / `redb`?
-2. What are the specific default compression threshold and compression level?
-3. Does binary file diffing need a friendlier extended mode such as "image thumbnail diff"?
-4. Should `lfv status --include-untracked` recursively scan the entire working tree to discover files statically excluded by `.lfvignore` and dynamically excluded by `config.yaml`? Performance vs. usability trade-off.
-5. Threshold for rename auto-detection (`rename.autodetect`): detect only on exact content-hash match, or allow approximate matching at "similarity ≥ N%"? The latter is significantly more complex; leaning toward exact match first.
-6. For `lfv revive`, which snapshot should content be restored from by default — the last non-deletion-marker snapshot before deletion, or should the user be required to specify `<snap>` explicitly? Leaning toward the former as default, with user override available.
-7. For a file at a path that was soft-deleted and then `lfv track`ed again: should the old `file-id` be reused (automatically continuing history) or a new `file-id` assigned (treating it as a different file)? Leaning toward **assigning a new `file-id`** — a same-name file reappearing is not necessarily semantically the same file; auto-continuing history risks being misleading. Users who want to resume can explicitly run `lfv revive`.
+2. Does binary file diffing need a friendlier extended mode such as "image thumbnail diff"?
+3. Should `lfv status --include-untracked` recursively scan the entire working tree to discover files statically excluded by `.lfvignore` and dynamically excluded by `config.yaml`? Performance vs. usability trade-off.
+4. Threshold for rename auto-detection (`rename.autodetect`): detect only on exact content-hash match, or allow approximate matching at "similarity ≥ N%"? The latter is significantly more complex; leaning toward exact match first.
+5. For `lfv revive`, which snapshot should content be restored from by default — the last non-deletion-marker snapshot before deletion, or should the user be required to specify `<snap>` explicitly? Leaning toward the former as default, with user override available.
+6. For a file at a path that was soft-deleted and then `lfv track`ed again: should the old `file-id` be reused (automatically continuing history) or a new `file-id` assigned (treating it as a different file)? Leaning toward **assigning a new `file-id`** — a same-name file reappearing is not necessarily semantically the same file; auto-continuing history risks being misleading. Users who want to resume can explicitly run `lfv revive`.
