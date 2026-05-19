@@ -62,13 +62,14 @@ In order to stay "lightweight", the following are **out of scope**:
 | Repository | The `.lfv` directory under the working directory; holds metadata and object storage for all tracked files. |
 | Working Tree | The working directory itself (excluding `.lfv`); where users actually operate on files. |
 | Tracked File | A file brought under repository management by `lfv track`. Identified internally by a `file-id` (ULID) that is **fully decoupled from its path**; the file's location in the working tree is a field on each Snapshot and can evolve over history. |
-| File Status | Working-directory files have three statuses: `unmodified`, `modified` (new and deleted files are also `modified`), and `untracked`. Files that are untracked or ignored appear as `untracked` in the status table; that table can be reconstructed from `config.yaml` / `.lfvignore`. |
+| File Status | For paths already in LFV's view, status is `unmodified`, `modified`, or `untracked` (see §6.6). |
 | Object | A content-addressed storage unit for file content; deduplicated by content hash — different files may share the same object. |
 | Snapshot | An "event record" for a tracked file at a point in time: content pointer + path + metadata (message, timestamp, author, parent snapshot). A single Snapshot covers content changes, renames/moves, and deletions. After a file is successfully snapshotted, its status in the status table becomes `unmodified`. |
 | Branch | A chain of snapshots for a tracked file; the default branch is `main`. Branch namespaces are independent per file. |
 | HEAD | The current branch and latest snapshot pointer for a tracked file. |
 | Tag | A human-readable name for a snapshot (optional), used to stably reference a specific version. |
 | Action | Actions change the state of a file. Available actions include `track`, `snap`, and `untrack`, plus two actions with no corresponding command: `modify` (achieved by the user editing the file) and `auto-track` / `auto-delete` (applied automatically by LFV during scanning in response to OS file create/delete events; see §6). |
+| LFV-visible | Files remaining in the working directory after `.lfvignore` directory pruning. |
 
 > [!Note]
 > **All of the above concepts are scoped to a single file** — this is the most fundamental difference between LFV and git.
@@ -108,10 +109,18 @@ About Snapshots:
 
 The mutable index lives in `index.db`, recording working-directory file status and branch/tag information for each file. It is a reconstructable cache of current state and is not part of the immutable history objects. `index.db` contains the following index tables:
 
-- **file_states** (status table): core fields include `fullpath` (repo-relative path), `status` (`untracked` / `modified` / `unmodified`), and `file_id` (null for untracked files). The status table also serves as the "current path index": for tracked, non-deleted files, `fullpath → file_id` is how the CLI resolves paths to files.
+- **file_states** (status table): core fields include `fullpath`, `status` (`untracked` / `modified` / `unmodified`), and `file_id` (null when `untracked`).
+- **scan_meta** (scan metadata): `last_completed_at`, mtimes of `.lfvignore` and `config.yaml` from the last scan, etc., used for incremental scans and rule invalidation (see §6.7).
 - **branches**: per-file branch pointer table.
 - **tags**: per-file tag table.
 - **head**: per-file current branch and latest snapshot pointer.
+
+> [!note] About `file_states`
+> - Normally, it records only LFV-visible files that currently exist in the working tree (`stat` succeeds and the path does not match `.lfvignore`);
+> - `untracked` rows correspond to paths on the dynamic `untracked` list in `config.yaml` that also exist on disk;
+> - if a path disappears from disk, its row is deleted (`config.yaml` may keep the list entry);
+> - **Exception**: a tracked file that disappeared from disk but is waiting for `lfv snap` to record the current FS state remains as `modified`; `status` renders it as `D` (§6.4).
+> - For tracked files that still exist on disk, `fullpath → file_id` resolves CLI paths; after the file disappears, it can still be addressed by `file-id`.
 
 ## 5. Repository Layout
 
@@ -221,17 +230,23 @@ This section describes all actions that change a file's tracking state — inclu
 
 ### 6.1 Tracking Policy: Track-by-Default
 
-LFV adopts a **track-by-default** policy: files in the working directory should, under normal circumstances, all be in a tracked state. To this end, LFV performs a lazy scan of the working tree on every command invocation (especially `lfv status`, `lfv track`, and `lfv snap`), **automatically responding to OS-level create and delete events** — no background daemon required. It primarily compares the working tree against the status table to detect newly created and deleted files, then updates the status table accordingly.
+LFV adopts a **track-by-default** policy: files in the working directory should, under normal circumstances, all be in a tracked state. To this end, relevant commands run a **lazy working-tree scan** before executing (algorithm in §6.7), automatically responding to OS-level create and delete events — no background daemon required.
 
 ### 6.2 Auto-track (New Files)
 
-When a scan finds a path in the working tree that is not yet in the status table (and is not excluded by `.lfvignore` or `config.yaml`), it is treated as an "OS-created file." LFV automatically applies the `track` action: assigns a `file-id`, adds it to the tracking list, but **does not immediately append a Snapshot**. At this point the tracking record has no content (content is `null`), which is inconsistent with the actual file on disk, so the status is `modified`. A Snapshot is produced by a subsequent `lfv snap` (with no arguments, it batch-processes all `modified` files).
+When a scan finds a path that is **LFV-visible** and not yet in the status table:
+
+- If it matches `.lfvignore` -> **ignore** it (no registration; §6.6);
+- If it is on the dynamic `untracked` list in `config.yaml` -> register it as `untracked` (§6.6);
+- Otherwise -> treat it as an OS-created file, auto-`track` it, assign a `file-id`, and set status to `modified`.
+
+No Snapshot is appended immediately; the first Snapshot is written by a later `lfv snap`.
 
 Auto-track is triggered by: `lfv status` (applied immediately during scan), `lfv track` (with no arguments), and `lfv snap` (before batch-snapshotting with no arguments).
 
-**Cancelling tracking**: if you do not want a file to be auto-tracked, run `lfv untrack <file>`. LFV writes the path into the `untracked` list in `config.yaml` and updates the status table to reflect this. For files that already have history, they will no longer be tracked and will produce no new history. For files that were auto-tracked, since no Snapshot exists at that point, no deletion-marker snapshot will be produced and no trace will be left in the repository.
+**Cancelling tracking**: `lfv untrack <file>` writes the path into the dynamic `untracked` list in `config.yaml`; when the path exists on disk, it synchronously records `untracked` in the status table. Files with existing history are guaranteed not to produce new Snapshots. Auto-tracked files with no history only have their tracking cache removed, ensuring no Snapshot is appended.
 
-For files marked via `lfv untrack <file>`, because the status table has the cached state and `config.yaml` has them in the `untracked` list, subsequent scans will not auto-track them again.
+When a path is in config `untracked` and exists on disk, scans will not auto-track it. If it disappears from disk, the status-table row is deleted (§6.7); when it reappears, it is registered as `untracked` again per §6.2.
 
 **Friendly hint for same-path new files**: if a path previously had a deleted `file-id` (i.e. a deletion marker was appended for that path), and auto-track assigns a new `file-id` at the same path, `lfv status` will append a hint below that file's entry:
 
@@ -244,17 +259,9 @@ For files marked via `lfv untrack <file>`, because the status table has the cach
 
 This hint appears only when auto-track has assigned a new `file-id`; once the new `file-id` records its first Snapshot, it stands as an independent file and the hint disappears.
 
-For `untracked` files that still have history (no deletion marker), running `lfv track <file>` again first removes the entry from the dynamic `untracked` list in `config.yaml`, then resumes tracking under the original `file-id` and updates the status table to `tracked`. Note that this differs from tracking a *deleted* file (which has a deletion marker), where a new `file-id` is always assigned by default unless the user explicitly runs `lfv revive`.
+For `untracked` files that still have history, because their latest Snapshot still points to an Object, running `lfv track <file>` again first removes the entry from the dynamic `untracked` list in `config.yaml`, then resumes tracking under the original `file-id` and updates the corresponding status-table row to tracked state as a cache. Note that this differs from tracking a deleted file: after delete, `lfv track <file>` creates a new `file-id` by default unless the user explicitly runs `lfv revive`.
 
-### 6.3 Auto-delete (OS-deleted Files)
-
-When a scan finds that a **tracked file's** path has disappeared from the working tree, and there is no evidence of a rename (i.e. rename auto-detection could not pair it), the file is treated as "OS-deleted."
-
-LFV does **not** immediately append a deletion-marker Snapshot; instead it marks the file `D` (suspected delete). When `lfv snap` is subsequently run with no arguments, all files in `D` status have their deletion automatically confirmed — a Snapshot with `object=null` is appended and the corresponding `file-id` is removed from the current-path index in the status table.
-
-This design gives the user a window before `lfv snap`: while a file is still in `D` status, they can still run `lfv mv f_old <new-path>` to reclassify it as a rename, avoiding accidental deletion.
-
-### 6.4 Rename / Move (`lfv mv`)
+### 6.3 Rename / Move (`lfv mv`)
 
 - `lfv mv <src> <dst>`: migrates the tracked file corresponding to `src` to the `dst` path and appends a Snapshot. Both `<src>` and `<dst>` may be a path or a `file-id` (`f_*` prefix).
   - If `src` still exists in the working tree and `dst` does not, the CLI first moves the file to `dst` on disk, then appends the snapshot (atomic semantics).
@@ -267,20 +274,91 @@ This design gives the user a window before `lfv snap`: while a file is still in 
   - Auto-detection can also be disabled (useful for bulk rename + edit scenarios to avoid mispairing).
 - History display: `lfv log <file>` renders rename events as "`R` old-path -> new-path", alongside `A`(add) / `M`(modify) / `D`(delete) / `R+M`(rename+modify) (see §5.2.1).
 
+### 6.4 Auto-delete (OS-deleted Files)
+
+When a scan finds that a **tracked file's** path has disappeared from the working tree, and there is no evidence of a rename (i.e. rename auto-detection could not pair it), the file is treated as "OS-deleted."
+
+LFV does **not** immediately append a deletion-marker Snapshot; instead it marks the file as `modified`. Because the current path does not exist in the filesystem, `lfv status` renders it as `D`.
+
+The next `lfv snap` records the state update. Subsequent processing is described in §6.5.
+
+This design gives the user a window before `lfv snap`: while a file is still in `D` status, they can still run `lfv mv f_old <new-path>` to reclassify it as a rename, avoiding accidental deletion.
+
 ### 6.5 `lfv delete`
 
-`lfv delete <file>`: marks the file as `modified` in the status table and deletes it from disk. On the next `lfv snap`, a Snapshot is appended for the corresponding `file-id` — `path = <current path>`, **`object = null`** (deletion marker). After this, the `file-id` can no longer be resolved via the current path, but the last known path is preserved in the deletion-marker snapshot; `lfv list --deleted` can still display it by path.
+`lfv delete <file>`: sets the file to `modified` in the status table and deletes it from disk. On the next `lfv snap`, LFV checks the target file's current filesystem state: if the file does not exist, it appends a Snapshot with `object = null` and removes the corresponding `file-id` from the current-path index in the status table.
+
+After this, the `file-id` can no longer be resolved via the current path, but the last known path is preserved in that Snapshot; `lfv list --deleted` can still display it by path.
 
 **Complete history is preserved**: the file can still be queried via `lfv log` / `lfv show` / `lfv diff`; to "revive" it, use `lfv revive` (see §7.2) or `lfv rewind <snap>` — both automatically create a new branch (without disturbing the existing deletion event).
 
-### 6.6 Exclusion Mechanisms: `.lfvignore` and `config.yaml`
+### 6.6 `.lfvignore` and `config.yaml` (Two Layers)
 
-Track-by-default would otherwise include temporary files, build artifacts, etc., so an ignore mechanism is necessary:
+Track-by-default would otherwise include temporary files and build artifacts. `.lfvignore` and `config.yaml` are **not** the same kind of "exclusion list":
 
-- The `.lfvignore` file at the working directory root (syntax compatible with `.gitignore`) lists **statically excluded** path patterns that must never be tracked;
-- `config.yaml` stores **dynamic tracking configuration** maintained by LFV commands — for example, per-path `untracked` entries written by `lfv untrack <file>` and removed by `lfv track <file>`;
-- `.lfvignore` takes priority over `config.yaml`: if a path matches `.lfvignore`, `lfv track <file>` must error and prompt the user to edit `.lfvignore`; dynamic config cannot override a static exclusion;
-- The `.lfv/` directory itself is always implicitly excluded; no `.lfvignore` entry is needed.
+| | `.lfvignore` | `config.yaml` (dynamic `untracked`) |
+| --- | --- | --- |
+| Nature | Static, repo-wide, **highest priority** | Dynamic policy via `lfv untrack` / `lfv track` |
+| Status table | **Not stored** in `file_states` | Stored as `untracked` when it **exists** on disk; when it disappears from disk, the status-table row is **deleted** (`config.yaml` list entry may remain) |
+| Working-tree scan | **Invisible**: pruned/skipped; no OS create/delete detection | **Visible**: participates in §6.7; status-table rows are maintained only for paths that exist on disk |
+| `lfv track <file>` | **Error** if matched; edit `.lfvignore` | Remove from `untracked` list and track |
+| `lfv untrack <file>` | **Error** if matched | Write config; if it exists on disk, record `untracked` |
+| `lfv status --include-untracked` | **Never listed** | **Only source** (`untracked` rows in the status table, all from config) |
+
+Additional rules:
+
+- `.lfv/` is always implicitly treated like `.lfvignore` and is not stored in the status table;
+- paths matching `.lfvignore` **do not exist** for LFV: no auto-track, no untrack listing, not in `--include-untracked`;
+- on `rebuild-index`, `untracked` rows = dynamic `config.yaml` list ∩ LFV-visible paths ∩ paths that **exist on disk**.
+
+### 6.7 Working-Tree Scan (Lazy Scan)
+
+Several commands (`lfv status`, `lfv track`, `lfv snap`, etc.) trigger a working-tree scan beforehand, comparing disk against `index.db`, updating `file_states`, and driving the automatic actions in §6.2–§6.5.
+
+#### 6.7.1 Scan Actions
+
+Definitions:
+
+- Dynamic untracked: a path is in the dynamic `untracked` list in `config.yaml`.
+- Trackable candidate: a path is not in the dynamic `untracked` list in `config.yaml`.
+- Status update:
+  - If LFV-visible and dynamic untracked: set status to `untracked`;
+  - If LFV-visible and already has a tracked status row: compare mtime/size -> compare hash -> set `modified` or `unmodified`; the chain does not necessarily need to run to completion before a result is known;
+  - If LFV-visible, unregistered, and a trackable candidate: auto-track (§6.2);
+  - If LFV-invisible: delete the corresponding status-table row, keep `config.yaml` and historical Snapshots unchanged, and do not produce `D`;
+- Dynamic untracked: a path in the dynamic `untracked` list in `config.yaml`.
+
+| Layer | Scope | Behavior |
+| --- | --- | --- |
+| **A. Registered paths** | Rows in `file_states` with an existing `fullpath` | For each row, first decide whether LFV visibility must be rechecked based on `.lfvignore` mtime. If invisible, delete the status-table row; if visible, update status. Cost O(registered paths). |
+| **B. Discover new paths** | LFV-visible paths seen during traversal that are not yet registered | Dynamic untracked files are set to `untracked`; trackable candidates are auto-tracked (§6.2). |
+
+All scan actions update the status table. In addition, `lfv track` and `lfv untrack` update both `config.yaml` and `file_states` (`untracked`).
+
+#### 6.7.2 Incremental Scan and Invalidation
+
+`scan_meta` records the last scan completion time and rule-file mtimes. Scans are **incremental by default** to avoid fully recursing the working tree on every command:
+
+- **Invalidate** (any triggers a controlled full walk for layer B):
+  - `scan_meta` is empty (first scan or after `rebuild-index`);
+  - `.lfvignore` mtime is newer than recorded (walk/prune boundaries change; **does not** write ignore paths into the status table);
+  - `config.yaml` mtime is newer (reconcile the dynamic `untracked` list with LFV-visible paths: register `untracked` rows for paths that exist, delete rows for paths that do not);
+  - user runs `lfv status --refresh` (or equivalent forced refresh).
+- **Otherwise (incremental)**:
+  - **Directories**: if dir mtime ≤ `last_completed_at` and the directory is already registered as scanned → do not descend; combined with `.lfvignore` **directory pruning** (pruned trees are invisible to LFV);
+  - **Files**: if already in `file_states` and file mtime ≤ `last_completed_at` → skip layer-B "new path" handling (layer A still `stat`s).
+- **Scan end**: update `last_completed_at` (recommended: scan start time) and `.lfvignore` / `config.yaml` mtimes.
+
+> **Note**: mtime-based incrementality may miss changes when copies do not preserve timestamps or on coarse-grained filesystems; use `--refresh` as a fallback.
+
+#### 6.7.3 When Scans Run
+
+| Command / scenario | Scan |
+| --- | --- |
+| `lfv status` | Default incremental scan (§6.7.2) |
+| `lfv status --refresh` | Scan after forced invalidation |
+| `lfv track` (no args), `lfv snap` (no args) | Scan before batch track / snap |
+| `lfv status --include-untracked` | Does **not** add or alter scanning; output only (§7.3.2) |
 
 ## 7. CLI Commands
 
@@ -298,9 +376,9 @@ Track-by-default would otherwise include temporary files, build artifacts, etc.,
 | Command | Description |
 | --- | --- |
 | `lfv track [<file>]` | Add a file to tracking. When `<file>` is given, errors if the path matches `.lfvignore`; otherwise removes it from the `untracked` list in `config.yaml`. If the path was previously untracked (not deleted), the original `file-id` is reused and the status table is updated to `modified` (awaiting the first `lfv snap` if there is no history). With no argument, scans and tracks all trackable files not yet in the status table. |
-| `lfv untrack <file>` | Stop tracking this path: write it into the dynamic `untracked` list in `config.yaml` and update the status table entry to `untracked`. Full history is preserved; the file can be re-tracked at any time via `lfv track <file>`, and then snapshotted or revived. |
-| `lfv mv <old> <new>` | Record a rename pre-mark in the status table for the `file-id` of `<old>`, targeting `<new>`. Whether an actual file move is performed in the working tree is governed by §6.4. |
-| `lfv delete <file>` | Mark the file as `modified` in the status table and delete it from disk. On the next `lfv snap`, when LFV detects it as `modified` with no file present, it appends a `object=null` deletion-marker snapshot and removes the entry from the `untracked` list in `config.yaml`. Updates the cached status in the status table. Full history is preserved and the file can be revived at any time. |
+| `lfv untrack <file>` | Stop tracking: errors if LFV-invisible; if visible, updates the dynamic `untracked` list in `config.yaml`; if it exists on disk, records `untracked` in the status table, otherwise config only. History is preserved; re-track via `lfv track` / `lfv revive`. |
+| `lfv mv <old> <new>` | Migrates the `file-id` corresponding to `<old>` to `<new>` and immediately appends a rename / rename+modify / revive Snapshot. Whether an actual file move is performed in the working tree is governed by §6.3. |
+| `lfv delete <file>` | Sets the file to `modified` in the status table and deletes it from disk. On a later `lfv snap`, if it is `modified` and absent from disk, LFV appends an `object = null` Snapshot, removes it from the `untracked` list in `config.yaml`, and updates the status-table cache. Its history remains complete and it can be revived at any time. |
 | `lfv revive <ref>` | Revive a deleted file. `<ref>` may be a `file-id`, the last known path, or a specific Snapshot id. Automatically creates a new branch (`revive/<...>`) and restores the content to the working tree from the selected snapshot. |
 | `lfv list [--deleted]` | List all tracked files with their current branch and latest snapshot summary. By default shows only active files; `--deleted` also lists files with a deletion marker. |
 
@@ -308,17 +386,16 @@ Track-by-default would otherwise include temporary files, build artifacts, etc.,
 
 | Command | Description |
 | --- | --- |
-| `lfv status [<file>]` | **Without `<file>`: list all `modified` tracked files in the repository.** Runs a lazy scan first (auto-tracks newly created files, skips `untracked` entries in the status table). Normal output shows only currently tracked files, each line including the `file-id` (`f_*`). With `<file>`: show the status of that file only. |
+| `lfv status [<file>]` | **Without `<file>`: list all `modified` tracked files.** Runs a lazy scan per §6.7 first. Default output shows tracked changes only, each line with `file-id` (`f_*`). `--include-untracked`: see §7.3.2. `--refresh`: force a full scan-cache refresh. With `<file>`: that file only. |
 | `lfv snap [<file>] [-m <msg>]` | Create a new snapshot for a file. **Without `<file>`: batch-snapshot all `modified` tracked files.** Refuses if working content is unchanged (unless `--allow-empty`). |
 | `lfv log <file>` | List the snapshot history for a file. Supports `--branch <name>`, `--graph`, `--limit N`. |
 | `lfv show <file> <snap>` | Output metadata for a specific snapshot; `--content` outputs the content; `--out <path>` exports it. |
 
 Notes:
 - For `modified` files in `lfv status`: deleted files show as `D`; files whose path differs from the last snapshot show as `R`; files with no snapshot yet show as `A`; all others show as `M`; files with both content and path changes show as `R+M`.
-- During `lfv snap`: `D` files get a deletion marker appended; other modified files get a content snapshot; `unmodified` files are skipped. A lazy scan runs first (auto-tracking new files).
-- To also show untracked files (statically excluded by `.lfvignore` or dynamically excluded by `config.yaml`) in `lfv status`, use `--include-untracked`. They are listed separately at the bottom as `~` lines, without a `file-id` column (since they have none).
+- During `lfv snap`: each target modified file is checked against the current filesystem state. If the file exists, LFV writes or reuses an Object and appends a content Snapshot; if it does not exist, LFV appends a Snapshot with `object = null`; `unmodified` files are skipped. A lazy scan per §6.7 runs first; when `<file>` is specified, only that file is processed.
 
-#### 7.3.1 `lfv status` Output Format
+#### 7.3.1 `lfv status` Output Format (Tracked Files)
 
 `lfv status` output looks like:
 
@@ -338,18 +415,17 @@ Tracked files (changes):
                       to continue its history instead, run:
                         lfv mv f_01HA7BCD f_01HA7EEE
 
-Ignored / excluded (not auto-tracked):
-  ~   docs/scratch/tmp.bin             (843 KB, matched .lfvignore)
-  ~   drafts/local.md                  (2.1 KB, untracked by config.yaml)
+Untracked (config.yaml):
+  ~   drafts/local.md                  (2.1 KB)
 ```
 
 **Status flags:**
 
 - `A` = add (newly tracked, no snapshot yet)
 - `M` = modified (includes newly tracked files not yet snapshotted)
-- `R` = rename (auto-detected or registered via `lfv mv`; no distinction needed)
-- `D` = suspected delete (missing from disk; will be confirmed as a deletion marker on the next `lfv snap`)
-- `~` = not tracked (excluded by `.lfvignore` or `config.yaml`; not auto-tracked)
+- `R` = rename (auto-detected pending rename; explicit `lfv mv` appends a Snapshot immediately)
+- `D` = suspected delete (**tracked** file missing from disk; confirmed as deletion marker on next `lfv snap`)
+- `~` = dynamic untracked (`status = untracked`, config policy + file exists on disk)
 
 **The `file-id` column:**
 
@@ -360,6 +436,16 @@ Displays `f_*` (ULID with `f_` prefix), abbreviated to the first 10 characters b
 - `lfv mv f_01HA7BCD f_01HA7EEE` — the old `file-id` takes over the path of the new `file-id`, appending an `R+M` snapshot; the new `file-id`'s tracking record is cancelled.
 - `lfv mv docs/old-note.md docs/notes/new.md` — equivalent form using paths.
 - `lfv delete f_01HA7DEF` — can explicitly register a deletion by `file-id` even when the file is no longer in the working tree.
+
+#### 7.3.2 `--include-untracked` (Display Dynamic Untracked)
+
+Separate from the working-tree scan in §6.7: this flag **only changes output** — no extra full-tree walk.
+
+- **Single source**: rows with `file_states.status = untracked` (all already confirmed by scanning to exist on disk; §6.7.1).
+- LFV-visible only: paths matching `.lfvignore` never appear (§6.6). `.lfvignore` is a static exclusion rule; `lfv status` does not list LFV-invisible files.
+- After the tracked-files block in §7.3.1, append an **Untracked** section as `~` lines (no `file-id`); `stat` for size. Paths that disappeared from disk have no status-table row, so there is no `~` line.
+
+See the §7.3.1 example; `~` meaning is in that section's status flags.
 
 ### 7.4 Diffing
 
@@ -409,8 +495,7 @@ echo "node_modules/" >> .lfvignore
 echo "*.tmp" >> .lfvignore
 
 lfv status
-# -> Lazy scan: all files in the working tree not excluded by .lfvignore or config.yaml
-#    are auto-tracked (tracking flag set, no Snapshot yet).
+# -> Lazy scan (§6.7): trackable new files are auto-tracked (tracking flag set, no Snapshot yet).
 #    All files show the `A` flag and have `modified` status in the status table.
 
 lfv snap -m "initial snapshot"   # Batch-snapshot all modified files; produces first Snapshot
@@ -469,7 +554,7 @@ lfv mv f_01HA7BCD f_01HA7EEE    # Old file-id takes over new path; new file-id c
 ### 8.6 Delete and Revive
 
 ```bash
-lfv delete docs/old-note.md     # Remove from status table's current path index; snap appends deletion marker
+lfv delete docs/old-note.md     # Mark modified and remove from disk; snap appends deletion marker
 lfv snap -m "remove old note"   # Commit deletion marker (or leave it for the next no-arg `lfv snap`)
 lfv log docs/old-note.md        # History is still fully queryable
 lfv revive docs/old-note.md     # Automatically creates a revive/<...> branch and restores content to working tree
@@ -514,9 +599,10 @@ Simply copy or sync the entire working directory (including `.lfv`) to another d
 9. **Path is a field on a Snapshot, not the file's identity**: `file-id` is fully decoupled from path; rename/move is recorded as an **immutable event**, structurally identical to "content change." This makes the Snapshot chain the complete source of truth for both file location and content, eliminating truth-source fragmentation from a mutable `aliases` list.
 10. **Deletion = deletion marker; history is never lost**: `lfv delete` removes the file from disk and marks its status-table entry as `modified`. `lfv snap` then confirms the deletion by appending an `object=null` Snapshot and removing the file record from the status table. All historical snapshots are fully preserved and the file can be revived at any time via `lfv revive`.
 11. **`file-id` is the only stable reference**: all commands that accept `<file>` also accept a path or `f_*`. A `file-id` is assigned at track time and persists through the file's entire lifecycle — including after deletion — and is the only still-valid reference token after the file disappears or its path changes.
-12. **Track-by-default policy**: files in the working directory are, under normal circumstances, always in a tracked state. LFV performs a lazy scan on every command invocation: newly created files are auto-tracked; tracked files deleted by the OS are automatically flagged `D` and receive a deletion marker on the next `lfv snap`. This matches the mental model of "file-centric version management" (see §6).
+12. **Track-by-default policy**: files in the working directory are, under normal circumstances, always in a tracked state. LFV runs an incremental lazy scan before relevant commands (§6.7): newly created files are auto-tracked; OS-deleted tracked files are flagged `D` and receive a deletion marker on the next `lfv snap`. This matches the mental model of "file-centric version management" (see §6).
 13. **Snapshot topology is a directed tree, not a DAG**: each Snapshot has exactly one parent pointer, forming a directed forest. Branches diverge and evolve independently; there is no topological merge point. To "realign" two branches, the user must explicitly run `lfv rebase` (not implemented yet) — branches never merge automatically. At the UI layer, file-hash (the object's blake3) serves as the measure of content identity, so `lfv log --graph` and `lfv branches` can show when two branches share the same content at a given point, while each Snapshot's identity (ULID) remains unique and independent. In LFV's single-user, single-file, local scenario this design incurs almost no cost while significantly reducing the implementation complexity of the storage layer, index layer, and `log` rendering.
 14. **Dual compression thresholds**: `min_bytes` (floor, default 4 KiB) and `max_bytes` (ceiling, default 16 MiB) handle files that are too small or too large to compress; `blake3` is always computed over raw bytes; objects that skip compression or are rejected as ineffective are stored as `.raw`, compressed objects as `.zstd` (see §5.1).
+15. **`.lfvignore` is invisible; the status table normally reflects files that exist on disk**: dynamic untracked paths enter the table when they exist on disk and are removed when they disappear (the config entry may remain); `--include-untracked` lists only `untracked` rows in the status table. Tracked, missing, modified files are the §6.4 exception and render as `D`. Scans are mtime-incremental by default with `.lfvignore` directory pruning (§6.6, §6.7).
 
 ## 10. Technology Choices
 
@@ -611,8 +697,6 @@ tests/
 
 The following will be resolved based on practical feedback during development:
 
-1. Does binary file diffing need a friendlier extended mode such as "image thumbnail diff"?
-2. Should `lfv status --include-untracked` recursively scan the entire working tree to discover files statically excluded by `.lfvignore` and dynamically excluded by `config.yaml`? Performance vs. usability trade-off.
-3. Threshold for rename auto-detection (`rename.autodetect`): detect only on exact content-hash match, or allow approximate matching at "similarity ≥ N%"? The latter is significantly more complex; leaning toward exact match first.
-4. For `lfv revive`, which snapshot should content be restored from by default — the last non-deletion-marker snapshot before deletion, or should the user be required to specify `<snap>` explicitly? Leaning toward the former as default, with user override available.
-5. For a file at a path that was soft-deleted and then `lfv track`ed again: should the old `file-id` be reused (automatically continuing history) or a new `file-id` assigned (treating it as a different file)? Leaning toward **assigning a new `file-id`** — a same-name file reappearing is not necessarily semantically the same file; auto-continuing history risks being misleading. Users who want to resume can explicitly run `lfv revive`.
+1. Threshold for rename auto-detection (`rename.autodetect`): detect only on exact content-hash match, or allow approximate matching at "similarity ≥ N%"? The latter is significantly more complex; leaning toward exact match first.
+2. For `lfv revive`, which snapshot should content be restored from by default — the last non-deletion-marker snapshot before deletion, or should the user be required to specify `<snap>` explicitly? Leaning toward the former as default, with user override available.
+3. For a file at a path that was soft-deleted and then `lfv track`ed again: should the old `file-id` be reused (automatically continuing history) or a new `file-id` assigned (treating it as a different file)? Leaning toward **assigning a new `file-id`** — a same-name file reappearing is not necessarily semantically the same file; auto-continuing history risks being misleading. Users who want to resume can explicitly run `lfv revive`.
