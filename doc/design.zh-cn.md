@@ -122,7 +122,7 @@ A/                                   # 工作目录
 └── .lfv/
     ├── config.yaml                  # 仓库级配置（严格 YAML）
     ├── HEAD                         # 全局占位（保留，主要为兼容查看）
-    ├── index.db                     # 状态、分支、标签、头部等索引（SQLite 或 sled）
+    ├── index.db                     # 状态、分支、标签、头部等索引（SQLite）
     ├── objects/                     # 内容寻址对象存储
     │   ├── ab/
     │   │   ├── cdef0123...zstd      # zstd 压缩对象
@@ -610,9 +610,8 @@ tests/
 
 下列问题会在开发过程中根据实际反馈决定：
 
-1. `index.db` 选型最终是 `rusqlite` 还是 `sled` / `redb`？
-2. 二进制文件的 diff 是否需要更友好的"图片缩略图差异"等扩展？
-3. `lfv status --include-untracked` 是否要递归扫描整个工作树以发现 `.lfvignore` 静态排除和 `config.yaml` 动态 untracked 的文件？性能 vs. 易用性的权衡。
-4. 改名自动识别（`rename.autodetect`）的阈值：仅在内容哈希完全一致时识别，还是允许"相似度 ≥ N%"的近似匹配？后者复杂度高，倾向先只做精确匹配。
-5. `lfv revive` 默认从哪一条 Snapshot 恢复内容——删除前最后一次"非 deletion-marker"快照，还是要求用户必须显式指定 `<snap>`？倾向前者作为默认，并允许用户覆盖。
-6. 在同一个工作目录路径上，**先被软删除后又重新 `lfv track`** 的文件：应当复用旧 `file-id`（自动续接历史）还是分配新 `file-id`（视为不同的文件）？倾向 **分配新 file-id**——再次出现的同名文件并不一定语义相同，自动续接历史有误导风险；如需续接，用户可显式 `lfv revive`。
+1. 二进制文件的 diff 是否需要更友好的"图片缩略图差异"等扩展？
+2. `lfv status --include-untracked` 是否要递归扫描整个工作树以发现 `.lfvignore` 静态排除和 `config.yaml` 动态 untracked 的文件？性能 vs. 易用性的权衡。
+3. 改名自动识别（`rename.autodetect`）的阈值：仅在内容哈希完全一致时识别，还是允许"相似度 ≥ N%"的近似匹配？后者复杂度高，倾向先只做精确匹配。
+4. `lfv revive` 默认从哪一条 Snapshot 恢复内容——删除前最后一次"非 deletion-marker"快照，还是要求用户必须显式指定 `<snap>`？倾向前者作为默认，并允许用户覆盖。
+5. 在同一个工作目录路径上，**先被软删除后又重新 `lfv track`** 的文件：应当复用旧 `file-id`（自动续接历史）还是分配新 `file-id`（视为不同的文件）？倾向 **分配新 file-id**——再次出现的同名文件并不一定语义相同，自动续接历史有误导风险；如需续接，用户可显式 `lfv revive`。

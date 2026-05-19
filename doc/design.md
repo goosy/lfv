@@ -122,7 +122,7 @@ A/                                   # Working directory
 └── .lfv/
     ├── config.yaml                  # Repository-level config (strict YAML)
     ├── HEAD                         # Global placeholder (reserved, mainly for compatibility)
-    ├── index.db                     # Status, branches, tags, head index (SQLite or sled)
+    ├── index.db                     # Status, branches, tags, head index (SQLite)
     ├── objects/                     # Content-addressed object store
     │   ├── ab/
     │   │   ├── cdef0123...zstd      # zstd-compressed object
@@ -611,9 +611,8 @@ tests/
 
 The following will be resolved based on practical feedback during development:
 
-1. Should `index.db` ultimately use `rusqlite` or `sled` / `redb`?
-2. Does binary file diffing need a friendlier extended mode such as "image thumbnail diff"?
-3. Should `lfv status --include-untracked` recursively scan the entire working tree to discover files statically excluded by `.lfvignore` and dynamically excluded by `config.yaml`? Performance vs. usability trade-off.
-4. Threshold for rename auto-detection (`rename.autodetect`): detect only on exact content-hash match, or allow approximate matching at "similarity ≥ N%"? The latter is significantly more complex; leaning toward exact match first.
-5. For `lfv revive`, which snapshot should content be restored from by default — the last non-deletion-marker snapshot before deletion, or should the user be required to specify `<snap>` explicitly? Leaning toward the former as default, with user override available.
-6. For a file at a path that was soft-deleted and then `lfv track`ed again: should the old `file-id` be reused (automatically continuing history) or a new `file-id` assigned (treating it as a different file)? Leaning toward **assigning a new `file-id`** — a same-name file reappearing is not necessarily semantically the same file; auto-continuing history risks being misleading. Users who want to resume can explicitly run `lfv revive`.
+1. Does binary file diffing need a friendlier extended mode such as "image thumbnail diff"?
+2. Should `lfv status --include-untracked` recursively scan the entire working tree to discover files statically excluded by `.lfvignore` and dynamically excluded by `config.yaml`? Performance vs. usability trade-off.
+3. Threshold for rename auto-detection (`rename.autodetect`): detect only on exact content-hash match, or allow approximate matching at "similarity ≥ N%"? The latter is significantly more complex; leaning toward exact match first.
+4. For `lfv revive`, which snapshot should content be restored from by default — the last non-deletion-marker snapshot before deletion, or should the user be required to specify `<snap>` explicitly? Leaning toward the former as default, with user override available.
+5. For a file at a path that was soft-deleted and then `lfv track`ed again: should the old `file-id` be reused (automatically continuing history) or a new `file-id` assigned (treating it as a different file)? Leaning toward **assigning a new `file-id`** — a same-name file reappearing is not necessarily semantically the same file; auto-continuing history risks being misleading. Users who want to resume can explicitly run `lfv revive`.
