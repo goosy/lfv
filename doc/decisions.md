@@ -1,120 +1,132 @@
 # LFV — Key Design Decisions
 
-> This document records **why** LFV is designed the way it is.
-
-Each entry explains the rationale behind a specific design choice, including the trade-offs accepted and the alternatives rejected.
+This document records **why** LFV is designed the way it is. Each entry explains the rationale behind a specific design choice, including accepted trade-offs and rejected alternatives.
 
 ## 1. Single-file scope
 
-All history objects belong to a single file; batch commands with no arguments simply execute the single-file operation on each file in sequence — there is no "global snapshot."
+All history objects belong to a single file; so-called global snapshot operations are essentially just executing the single-file snapshot operation on multiple files one by one.
 
-This follows directly from the project's founding motivation. The entire purpose of LFV is to track files as independent units. Allowing a global snapshot would reintroduce the cross-file coupling that `git` already handles — and that LFV deliberately avoids.
+The entire purpose of LFV is to track files as independent units. Requiring global snapshots would introduce cross-file coupling again—which is exactly the difference between Git and LFV.
 
 ## 2. Rewind never destroys history
 
-Any "go back in time" operation is implemented via **creating a new branch**, ensuring no snapshot before HEAD ever becomes unreachable.
+Snapshots are append-only and always reachable. Any "go back in time" operation is implemented by **creating a new branch**, never making snapshots before HEAD unreachable.
 
-Destructive undo is a constant source of user error and data loss. By making every rewind a branch creation, the invariant "snapshots are append-only and always reachable" is preserved unconditionally. The cost (slightly more complex branch management) is negligible compared to the safety guarantee.
+Destructive undo is a constant source of user error and data loss. Turning every rewind into branch creation preserves history by construction. The cost (slightly more complex branch management) is negligible compared with the safety guarantee.
 
-## 3. Append-only history
+`snapshots.log` is never rewritten. This naturally supports backup (incremental copying always works), auditing (a verifier can replay from the beginning), and crash recovery (partial writes at the tail can be detected and trimmed without corrupting earlier entries).
 
-`snapshots.log` is never rewritten.
+In-place mutation provides no meaningful benefit while sacrificing all three properties.
 
-Append-only files facilitate backup (incremental copy always works), auditing (a verifier can always replay from the beginning), and crash recovery (a partial write at the tail can be detected and trimmed without corrupting earlier entries). In-place mutation gains nothing and breaks all three properties.
+## 3. Content addressing + deduplication
 
-## 4. Content addressing + deduplication
+LFV follows the same storage principle as Git. The content-addressed key is the `file-id`, which serves as the persistent identity of a file and the only stable reference.
 
-Even with massive duplicate content across thousands of independent files, the object store holds only one copy.
+A `file-id` is assigned when a file is tracked and persists throughout the file's entire lifecycle, including after deletion. It remains the only valid reference after a file disappears or its path changes. Users and scripts need a stable handle for querying history (`lfv log`), restoring content (`lfv revive`), or continuing history (`lfv relink`).
 
-Per-file versioning without deduplication would produce catastrophic storage bloat (e.g. 1000 notes each versioned 100 times, even if most snapshots share content). Content-addressed storage makes deduplication zero-cost at the architecture level: two identical byte sequences simply resolve to the same object hash.
+Paths are convenience aliases for common usage. Any command that accepts `<file>` also accepts either a path or an `f_*` identifier. Both forms are supported everywhere so users are never forced to look up a `file-id` during routine work.
 
-## 5. SQLite as the index
+## 4. Tracking policy
 
-Metadata requiring random updates — status table, HEAD, branches, tags — lives in `index.db`; purely historical data lives in files.
+Files inside the working directory should normally always be tracked. LFV performs incremental lazy scans before relevant commands: newly created files are automatically tracked; tracked files deleted by the OS are marked as modified and shown as `D`; the next `lfv snap` appends a Snapshot according to the current filesystem state.
 
-The status table and branch pointers are **mutable** and need efficient random-access reads and atomic updates. A plain-file approach (e.g. one YAML per file) works at small scale but degrades badly with thousands of tracked files. SQLite provides ACID transactions, efficient indexed lookups, and a single-file deployment model — no daemon, no network. The historical Snapshot chain, by contrast, is append-only and sequential, so a flat JSON Lines file is simpler and sufficient.
+The LFV mental model is: "I have a directory, and every file in it has version history." A track-by-default policy fits this model. Requiring explicit opt-in for every file reverses the model and makes users responsible for remembering to run `lfv track` after every file creation. Forgetting means losing history.
 
-## 6. Small-tool philosophy
+Files are usually excluded through `.lfvignore` or `config.yaml`, but they serve different purposes:
 
-CLI subcommands are clear, composable, and scriptable; no premature abstraction toward a GUI or service.
+- Paths matched by `.lfvignore` are effectively invisible to LFV. They do not enter the status table, are not scanned, and never appear in output.
+- Untracked entries in `config.yaml` represent runtime management decisions and produce explicit feedback when tracking state changes.
 
-LFV is designed for automation, shell scripts, and integration with other tools (sync scripts, editors, CI). Prioritizing a clean CLI contract keeps the tool composable. A GUI or daemon layer can be built on top of a stable CLI; the reverse is painful. v1.0 deliberately excludes a GUI (see Non-Goals in `design.md §3`).
+Together, these two sources determine the tracking state reflected by the status table. The status table normally reflects files that currently exist on disk (except `D` entries), preventing large numbers of ghost rows and keeping `lfv status` aligned with the real working tree.
 
-## 7. Only two storage object types
+The distinction exists because ignored files and dynamically untracked files have different runtime and user-interface requirements.
 
-The only truly immutable storage objects in the repository are Object and Snapshot; there is no tree object. Everything else is mutable index (see `design.md §4.2`).
+## 5. Snapshot
 
-Git's tree object exists because a commit spans multiple files — a tree encodes "the directory listing of a commit." LFV's Snapshot corresponds to a single file and points directly to an Object, so an intermediate tree layer adds complexity with zero benefit. Keeping the object model minimal makes the storage layer, GC, and `verify` command simpler and easier to reason about.
+A Snapshot is a version record, roughly corresponding to a Git commit.
 
-## 8. Snapshot id separated from tamper-resistance
+Snapshot IDs use ULID for readability and chronological ordering. Tamper resistance is handled separately through the `digest` field and verified by `lfv verify`.
 
-Snapshot ids use ULID for human readability and time ordering; tamper-resistance is handled by the dedicated `digest` field, verified by `lfv verify` (see `design.md §5.2`).
+Content-addressed identifiers such as Git SHA hashes couple identity and integrity verification together, forcing a trade-off between opaque hashes and user-friendly identifiers. LFV separates these concerns: ULIDs are human-friendly, time-ordered, and content-independent, while `digest` provides integrity verification.
 
-Content-addressed ids (like Git's SHA hashes) couple identity with tamper-resistance, which forces a trade-off: either ids are opaque hashes (bad UX) or they are human-readable strings that cannot serve as integrity proofs. LFV separates these concerns: ULID ids are paste-friendly, time-ordered, and content-independent; the `digest` field provides independent tamper detection. `lfv verify` can check every Snapshot without touching ids.
+Within snapshots, ULIDs are fully decoupled from paths. Rename and move operations are recorded as immutable events, making the Snapshot chain the complete source of truth for both file location and file content.
 
-## 9. Path is a field on a Snapshot, not the file's identity
+Without a stable ULID-based identity, renames either break historical continuity or require a mutable alias table, causing the source of truth to become fragmented.
 
-`file-id` is fully decoupled from path; rename/move is recorded as an **immutable event**, structurally identical to "content change." This makes the Snapshot chain the complete source of truth for both file location and content, eliminating the truth-source fragmentation that a mutable `aliases` list would cause.
+## 6. Deletion is just a special Snapshot value; history is never lost
 
-If path were the file's identity, every rename would either break history continuity or require a mutable alias table. A mutable alias table splits the source of truth: history is in `snapshots.log`, but current identity is in the alias table — the two can drift, especially after crashes or partial syncs. By making path a field on each Snapshot and using a stable `file-id` as identity, the Snapshot chain becomes the sole source of truth for both file location and content. Rename, move, rename+modify, and delete are all just different field combinations on the same Snapshot structure.
+`lfv delete` removes the file from disk and marks the file as modified in the status table. During `lfv snap`, if the file no longer exists, LFV appends a Snapshot with `object = null` and removes the file record from the status table. All historical Snapshots remain intact and can be restored through `lfv revive`.
 
-## 10. Deletion = deletion marker; history is never lost
+Deletion in LFV is a state transition, not erasure. Erasing history would violate the append-only guarantee and make recovery impossible. Treating deletion as a Snapshot whose object is null keeps the model structurally consistent and requires no special storage-layer behavior.
 
-`lfv delete` removes the file from disk and marks its status-table entry as `modified`. `lfv snap` then checks the target file's FS state, and if the file does not exist, appends an `object=null` Snapshot and removes the file record from the status table. All historical snapshots are fully preserved and the file can be revived at any time via `lfv revive`.
+The two-step process provides a correction window. While the file remains in `D` state, `lfv mv` can still reclassify the event as a rename instead of a deletion.
 
-Deletion in LFV is a **state transition**, not an erasure. Erasing history would violate the append-only guarantee (Decision 3) and make `lfv revive` impossible. Treating delete as a Snapshot with `object=null` is structurally consistent with the rest of the model — no special cases in the storage layer.
+## 7. Snapshot topology is a directed tree, not a DAG
 
-The two-step design (mark `modified` → confirm on `lfv snap`) gives the user a recovery window: while the file is still in `D` status, `lfv mv` can reclassify it as a rename instead of a deletion.
+Each Snapshot has exactly one parent pointer, forming a directed forest. Branches diverge and evolve independently. There is no physical merge node with multiple parents.
 
-## 11. `file-id` is the only stable reference
+The topology is intentionally decoupled from content merging. Rejecting a Git-style DAG does not prevent content-level merging or alignment.
 
-All commands that accept `<file>` also accept a path or `f_*`. A `file-id` is assigned at track time and persists through the file's entire lifecycle — including after deletion — and is the only still-valid reference token after the file disappears or its path changes.
+### Why a directed tree (single parent)?
 
-After a file is deleted or renamed, its path no longer resolves. Users and scripts need a stable handle to query history (`lfv log`), restore content (`lfv revive`), or relink history (`lfv relink`). Path is a convenience alias for the common case; `file-id` is the durable identity. Both are accepted everywhere so users are never forced to look up ids for routine operations.
+LFV rejects multi-parent DAG topology primarily to preserve simplicity and deterministic historical tracing.
 
-## 12. Track-by-default policy
+- **Minimal storage and indexing**: `snapshots.log` only needs an optional `parent` field.
+- **Minimal algorithms**: Topological traversal becomes simple O(N) linear backtracking.
+- **History purity and readability**: Every snapshot has a unique ancestor path.
+- **No dual-line ambiguity**: Git merges create multiple valid historical paths. LFV's single-parent model eliminates that ambiguity entirely.
 
-Files in the working directory are, under normal circumstances, always in a tracked state. LFV runs an incremental lazy scan before relevant commands: newly created files are auto-tracked; OS-deleted tracked files are flagged `D` and receive a deletion marker on the next `lfv snap`.
+### Directed Tree vs. DAG
 
-The mental model of LFV is "I have a directory; every file in it has version history." Requiring explicit opt-in for every file inverts this: the user must remember to run `lfv track` after every new file creation, and forgetting loses history. Track-by-default matches the expected behavior and is consistent with how backup tools work. Files that should be excluded are handled via `.lfvignore` (a static exclusion list) or `lfv untrack` (dynamic per-file opt-out).
+| Dimension | Git DAG | LFV Directed Tree |
+| --- | --- | --- |
+| Topology | Commits may have multiple parents. | Snapshots have at most one parent. |
+| Complexity | High. Requires graph traversal and merge-related logic. | Low. A branched forest of linked histories. |
+| Integration | Merge commits create graph convergence points. | Rebase/content-level alignment without multi-parent nodes. |
+| Readability | History can be polluted by unrelated merges. | History remains clean and uniquely traceable. |
+| Target use case | Large collaborative software projects. | Single-user, single-file, local history tracking. |
 
-## 13. Snapshot topology is a directed tree, not a DAG
+## 8. `lfv mv` and `lfv relink` are separate commands
 
-Each Snapshot has exactly one parent pointer, forming a directed forest. Branches diverge and evolve independently; there is no topological merge point. To "realign" two branches, the user must explicitly run `lfv rebase` (not yet implemented) — branches never merge automatically.
+`lfv mv <src> <dst>` performs path operations only. `<dst>` cannot be a `file-id`. `lfv relink <f_src> --onto <f_dst>` is dedicated to history continuation.
 
-Git's DAG topology exists to support merge commits, which record "two branches were integrated into one." LFV explicitly excludes automatic merging (see Non-Goals in `design.md §3`) because per-file history rarely needs it — and when it does, the user should decide the outcome explicitly. A directed tree is strictly simpler: the storage layer, index layer, and `log` rendering never need to handle multiple parent pointers. At the UI layer, file-hash (the object's blake3) serves as the measure of content identity, so `lfv log --graph` and `lfv branches` can show when two branches share the same content, while each Snapshot's identity (ULID) remains unique and independent. In LFV's single-user, single-file, local scenario this design incurs almost no cost.
+Allowing `lfv mv <src> <f_dst-id>` would mix path manipulation with history continuation and create misleading expectations about which `file-id` survives the operation.
 
-## 14. Dual compression thresholds
+`lfv relink` also solves a second problem that `lfv mv` cannot: merging another file's history. A common case is when `<f_src>` contains a superset of `<f_dst>` and the user wants to preserve only one identity while splicing the full history chain together. This is a history-consolidation operation, fundamentally different from a rename.
 
-`min_bytes` (floor, default 4 KiB) and `max_bytes` (ceiling, default 16 MiB) handle files that are too small or too large to compress; `blake3` is always computed over raw bytes; objects that skip compression or are rejected as ineffective are stored as `.raw`, compressed objects as `.zstd` (see `design.md §5.1`).
+## 9. Only two storage object types
 
-A single threshold cannot handle both boundary cases. Files below the floor may actually grow after compression due to frame overhead. Files above the ceiling require reading the entire file into memory, causing memory spikes. The dual thresholds address each case explicitly; `reject_if_larger` handles already-compressed binaries (e.g. images) where compression provides no benefit. Computing `blake3` over raw bytes ensures the hash is independent of the storage format.
+The only immutable storage objects in the repository are Object and Snapshot. All other concepts are mutable indexes.
 
-## 15. `.lfvignore` is invisible; the status table normally reflects files that exist on disk
+## 10. Dual compression thresholds
 
-Dynamic untracked paths enter the table when they exist on disk and are removed when they disappear (the config entry may remain); `--include-untracked` lists only `untracked` rows in the status table. Tracked, missing, modified files are the exception and render as `D`. Scans are mtime-incremental by default with `.lfvignore` directory pruning (see `design.md §6.7, §6.8`).
+`min_bytes` (default 4 KiB) and `max_bytes` (default 16 MiB) handle files that are too small or too large for compression. `blake3` is always computed from raw bytes. Uncompressed objects are stored as `.raw`; compressed objects are stored as `.zstd`.
 
-Paths matching `.lfvignore` simply do not exist for LFV — they are not entered in the status table, not scanned, and not shown in any output. This matches `.gitignore` semantics and keeps the user mental model low-friction. The status table records only files that currently exist on disk (the `D` exception aside), avoiding a large number of "ghost rows" and ensuring `lfv status` output always reflects the real working tree state.
+A single threshold cannot handle both edge cases. Very small files may grow after compression due to framing overhead. Very large files can create memory spikes during compression. Dual thresholds explicitly address both problems.
 
-## 16. `lfv mv` and `lfv relink` are separate commands
+## 11. SQLite as the index
 
-`lfv mv <src> <dst>` handles path operations only; `<dst>` is not allowed to be a `file-id`. `lfv relink <f_src> --onto <f_dst>` handles history continuation exclusively.
+Metadata requiring random updates—status tables, branches, tags, and global file indexes—lives in `index.db`.
 
-If `lfv mv <src> <f_dst-id>` were allowed to mix path operations with history continuation, users would naturally assume that the surviving `file-id` after the operation is `<dst>`'s — but in a relink the surviving id is the `--onto` side (`f_dst`), while `f_src` is retired. This mental model mismatch almost inevitably causes misuse.
+The database is only a cache. The source of truth remains file-based.
 
-`lfv relink` also solves a second problem that `lfv mv` fundamentally cannot: **merging another file's history**. The typical case is where `<f_src>`'s content is a superset of `<f_dst>`'s, and the user does not need to keep both `file-id`s — they want to splice `f_src`'s entire snapshot chain onto `f_dst` and retire `f_src`. This is a semantic history-consolidation operation, categorically different from a path rename. Conflating the two would make both commands harder to understand.
+Status tables and branch pointers are mutable and require efficient indexed lookups and atomic updates. Plain-file approaches degrade significantly at scale. SQLite provides ACID transactions, efficient indexing, and single-file deployment without requiring a daemon or network service.
+
+## 12. Small-tool philosophy
+
+CLI subcommands should remain clear, composable, and scriptable. LFV avoids premature abstraction toward graphical interfaces or services.
+
+LFV is designed for automation, shell scripts, and integration with external tools. A GUI or daemon can always be built on top of a stable CLI; the reverse is much harder.
 
 ## Possible Future Extensions
 
-- Simple HTML5 interface with visual branch-tree display for a file.
-- Hook system, e.g. auto-snap before saving.
+- Simple HTML5 interface with visual branch-tree display.
+- Hook system (e.g., automatic snapshots before save).
 - Cross-repository object pool sharing.
-- Bridges to git LFS and NAS vendor APIs.
+- Bridges to Git LFS and NAS vendor APIs.
 
 ## Open Questions
 
-The following will be resolved based on practical feedback during development:
-
-1. **Rename auto-detection threshold** (`rename.autodetect`): detect only on exact content-hash match, or allow approximate matching at "similarity ≥ N%"? The latter is significantly more complex; leaning toward exact match first.
-2. **`lfv revive` default restore point**: restore from the last `object != null` snapshot before deletion, or require the user to specify `<snap>` explicitly? Leaning toward the former as default, with user override available.
-3. **History continuation for a same-name new file**: when `lfv revive` could continue history onto a newly tracked file at the same path, should an additional safety confirmation or `--force` be required to prevent users from accidentally splicing a semantically unrelated new file onto old history?
+1. **Rename auto-detection threshold** (`rename.autodetect`): exact hash match only, or similarity-based matching above a configurable threshold?
+2. **Default restore point for `lfv revive`**: automatically restore the latest non-null object snapshot, or require explicit snapshot selection?
+3. **History continuation for same-name new files**: should additional confirmation or `--force` be required when reviving history onto a newly created file with the same path?

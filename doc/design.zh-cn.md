@@ -138,11 +138,12 @@ A/                                   # 工作目录
     │   │   └── cdef0123...raw       # 原样对象（过小/过大/不可压）
     │   └── ...
     ├── files/                       # 每个跟踪文件的元数据
-    │   └── <file-id>/
-    │       ├── meta.yaml            # 文件级元数据（创建时间、可选属性）
-    │       ├── branches.yaml        # 该文件的分支表
-    │       ├── tags.yaml            # 该文件的标签表
-    │       └── snapshots.log        # append-only 的快照记录（JSON Lines）
+    │   ├── <file-id>/
+    │   │   ├── meta.yaml            # 文件级元数据（创建时间、可选属性）
+    │   │   ├── branches.yaml        # 该文件的分支表
+    │   │   ├── tags.yaml            # 该文件的标签表
+    │   │   └── snapshots.log        # append-only 的快照记录（JSON Lines）
+    │   └── ...
     └── logs/                        # CLI 操作日志（可选，便于调试）
 ```
 

@@ -138,11 +138,12 @@ A/                                   # Working directory
     │   │   └── cdef0123...raw       # raw object (too small/large/incompressible)
     │   └── ...
     ├── files/                       # Per-tracked-file metadata
-    │   └── <file-id>/
-    │       ├── meta.yaml            # File-level metadata (creation time, optional attributes)
-    │       ├── branches.yaml        # Branch table for this file
-    │       ├── tags.yaml            # Tag table for this file
-    │       └── snapshots.log        # Append-only snapshot records (JSON Lines)
+    │   ├── <file-id>/
+    │   │   ├── meta.yaml            # File-level metadata (creation time, optional attributes)
+    │   │   ├── branches.yaml        # Branch table for this file
+    │   │   ├── tags.yaml            # Tag table for this file
+    │   │   └── snapshots.log        # Append-only snapshot records (JSON Lines)
+    │   └── ...
     └── logs/                        # CLI operation logs (optional, for debugging)
 ```
 
