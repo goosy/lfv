@@ -61,30 +61,40 @@ Deletion in LFV is a state transition, not erasure. Erasing history would violat
 
 The two-step process provides a correction window. While the file remains in `D` state, `lfv mv` can still reclassify the event as a rename instead of a deletion.
 
-## 7. Snapshot topology is a directed tree, not a DAG
+## 7. Topology View Design
 
-Each Snapshot has exactly one parent pointer, forming a directed forest. Branches diverge and evolve independently. There is no physical merge node with multiple parents.
+Each Snapshot has exactly one parent pointer, forming a directed forest. Once branches diverge, they evolve independently. There is no topological merge point — that is, no physical Merge Snapshot with multiple parents. This differs fundamentally from Git's DAG model.
 
-The topology is intentionally decoupled from content merging. Rejecting a Git-style DAG does not prevent content-level merging or alignment.
+The Snapshot topology and content merging are intentionally decoupled. Maintaining a directed-tree Snapshot topology does not imply rejecting content-level merging or alignment for individual files.
 
-### Why a directed tree (single parent)?
+As a result, LFV exposes both Snapshots and Objects to the user. Objects serve as the visible nodes, while Snapshot links describe the inheritance relationships between them. From the user's perspective, the resulting view forms a DAG topology.
 
-LFV rejects multi-parent DAG topology primarily to preserve simplicity and deterministic historical tracing.
+### Core Reasons for a Directed-Tree Topology (Single Parent)
 
-- **Minimal storage and indexing**: `snapshots.log` only needs an optional `parent` field.
-- **Minimal algorithms**: Topological traversal becomes simple O(N) linear backtracking.
-- **History purity and readability**: Every snapshot has a unique ancestor path.
-- **No dual-line ambiguity**: Git merges create multiple valid historical paths. LFV's single-parent model eliminates that ambiguity entirely.
+LFV deliberately rejects Git-style DAG topology (multiple-parent nodes) for one reason: to preserve maximum simplicity at the storage layer and absolute determinism in historical tracing.
 
-### Directed Tree vs. DAG
+- **Minimal storage and indexing**: `snapshots.log` requires only an optional `parent` field. Snapshot history naturally becomes a set of physical forks in singly linked chains.
+- **Minimal algorithms**: Topological traversal degenerates into simple O(N) linear backtracking, avoiding Git's more complex topology-sorting and multi-path reachability analysis.
+- **Pure and readable history**: A directed tree guarantees that the ancestor path of every Snapshot is uniquely determined.
+- **No ambiguity of competing mainlines**: After a Git merge, multiple historical paths coexist in the topology and there is no inherent notion of which path is the "true" mainline. LFV's single-parent topology eliminates this ambiguity entirely and allows different branches to evolve at different granularities.
 
-| Dimension | Git DAG | LFV Directed Tree |
-| --- | --- | --- |
-| Topology | Commits may have multiple parents. | Snapshots have at most one parent. |
-| Complexity | High. Requires graph traversal and merge-related logic. | Low. A branched forest of linked histories. |
-| Integration | Merge commits create graph convergence points. | Rebase/content-level alignment without multi-parent nodes. |
-| Readability | History can be polluted by unrelated merges. | History remains clean and uniquely traceable. |
-| Target use case | Large collaborative software projects. | Single-user, single-file, local history tracking. |
+### Comparison: Directed Tree vs. DAG Topology
+
+| Dimension | Git DAG Topology | LFV Directed-Tree Topology |
+| :--- | :--- | :--- |
+| **Topology Definition** | A Commit may have one or more parents; multiple parents are used to represent merges. | A Snapshot may have at most one parent; the parent pointer is unique. |
+| **Underlying Complexity** | High. Requires handling complex cross-path relationships and multi-path reachability analysis. | Low. The structure is a branched forest of singly linked histories, making storage, traversal, and garbage collection lightweight. |
+| **Integration Mechanism** | **Topology-level Merge (Merge Commit)**: convergence is represented directly in the graph through multiple parent pointers. | **Reconstruction / Content-level Merge (Rebase / Content Merge)**: no physical convergence node exists; alignment is achieved through parent redirection or content continuation under a single-parent Snapshot. |
+| **History Readability** | Easily polluted. The history of a single file (`git log <file>`) can be obscured by unrelated commits and crossing merge lines. | Completely clean. The ancestor path is uniquely defined, preserving the file's actual evolution over time. |
+| **Target Scenario** | Distributed software projects with multiple collaborators, multiple files, and frequent merges. | Single-user, single-file, offline, local scenarios such as notes, configuration files, and NAS backups. |
+
+### Why a Composite View?
+
+LFV treats content merging and historical-topology merging as two separate concerns.
+
+When users merge files, what they actually care about is whether the content has been unified, not whether multiple historical branches converge into the same Snapshot node. In the LFV interface, a merge is considered complete as soon as the resulting Objects are identical; there is no need to force convergence at the Snapshot level.
+
+Git, by contrast, expresses convergence through Commit topology itself. LFV intentionally separates content structure from historical structure. This separation greatly simplifies merge algorithms and makes the workflow easier for users to understand.
 
 ## 8. `lfv mv` and `lfv relink` are separate commands
 
