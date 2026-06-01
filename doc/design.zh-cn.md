@@ -158,7 +158,7 @@ Tree Snapshot 同样只有一个 parent 指针，构成有向树，存放于 `.l
 LFV 的历史具有两个独立的拓扑层（见 `decisions.zh-cn.md §13、§18`）：
 
 - **Snapshot 层**（物理存储）：永远是有向树，每条 Snapshot 恰好有一个 parent 指针，结构永不改变。
-- **内容层**（派生视图）：以 object hash 为节点，将 Snapshot parent 关系投影到 object 身份上。单分支 object hash 唯一性不变量保证此层在任意单条分支上无环，整体是 DAG。
+- **内容层**（派生视图）：以 object hash 为节点，将 Snapshot parent 关系投影到 object 身份上。分支对象唯一性保证此层在任意单条分支上无环，整体是 DAG。
 
 ### 4.3 可变索引（Mutable Index）
 
@@ -619,6 +619,57 @@ f_src 已经产生了若干 Snapshot（链为 `snap_A1 -> snap_A2 -> ... -> snap
 | `lfv track`（无参）、`lfv snap`（无参） | 扫描后再批量 track / snap |
 | `lfv status --include-untracked` | **不**改变扫描；仅多打印状态表中的 `untracked` 行（§7.3.2） |
 
+### 6.9 环回检测与处理
+
+为保证每个文件的历史在单条分支上呈现**无环的内容演化 DAG**，LFV 在 `lfv snap` 时强制检测以保障 `分支对象唯一性`：
+
+- **在任意一条分支上，同一个 `file-object-hash` 最多只能出现一次。**
+- **历史完整性优先**：绝不静默丢弃或重写中间历史，用户必须显式执行 `rewind` 才能“跳过”重复段。
+- **分支清洁**：环回会污染当前分支，必须将中间历史移到 `detour_*` 分支，用户可审阅后决定是否删除。
+- **与 `rewind` 命令语义一致**：`lfv rewind` 本身就是用于“回到过去并自动建分支”， 唯一性不变量正是为此场景设计。
+
+#### 6.9.1 检测时机
+
+执行 `lfv snap <file>`（或批量 `lfv snap` 中对单个文件处理）时，在计算新快照的 `object` 字段后、写入 `snapshots.log` 之前，**沿着当前分支的 parent 链向上回溯**，检查是否存在祖先快照的 `object` 与新快照的 `object` 相同。
+
+- 若不存在相同 `object` → 正常追加新快照。
+- 若存在相同 `object`（记为 `ancestor_snap`）→ 触发**环回事件**，拒绝本次 `lfv snap`，并输出提示。
+
+#### 6.9.2 环回事件的处理
+
+LFV 不自动重写历史，而是提示用户使用 `lfv rewind` 来完成回溯，同时保留中间的所有历史：
+
+```
+warning: content of docs/note.md matches ancestor snap_01HXYZ on branch main
+         (object hash blake3:abc123...)
+suggestion: run `lfv rewind docs/note.md snap_01HXYZ`
+            this will create a new branch anchored before the duplicate,
+            preserving all intermediate history as a detour branch.
+```
+
+用户执行 `lfv rewind docs/note.md snap_01HXYZ` 后，LFV 会：
+
+1. 将当前分支（例如 `main`）重命名为 `detour_main`（若已存在则追加数字后缀）；
+2. 在 `main` 分支上创建一条**新快照**，其：
+   - `parent` 指向 `ancestor_snap` 的**父快照**（而非 `ancestor_snap` 本身）；
+   - `object` 等于新文件内容（即触发环回的那个 `object`）；
+   - `path`、`message` 等按正常快照记录。
+3. 将 `main` 的 HEAD 指向这个新快照，工作区内容保持不变（已是新内容）。
+
+这样，原分支上的中间历史（`ancestor_snap` 之后到当前的所有快照）全部被保留在 `detour_main` 分支中，而 `main` 分支则“跳过”了那段历史，直接接续到更早的状态，且**不会在 `main` 上产生重复的 object hash**。
+
+#### 6.9.3 对 `lfv verify` 的校验要求
+
+`lfv verify` 命令必须遍历每个文件的所有分支，检查是否存在同一分支上出现相同 `object` 的两次记录。若发现，报告为**数据完整性错误**（非警告），因为正常操作流程下不应发生（环回事件已被拒绝并引导用户使用 `rewind`）。
+
+```bash
+error: branch 'main' of file 'docs/note.md' contains duplicate object hash:
+       snap_01HXYZ (object blake3:abc123...)
+       snap_02HABC (object blake3:abc123...)
+       This violates the single-branch object uniqueness invariant.
+       Run `lfv repair --rebase` to fix (destructive).
+```
+
 ## 7. CLI 命令
 
 > 约定：`<file>` 指工作目录内某个文件的相对或绝对路径；CLI 在内部统一规范为相对于仓库根的相对路径。
@@ -647,7 +698,7 @@ f_src 已经产生了若干 Snapshot（链为 `snap_A1 -> snap_A2 -> ... -> snap
 | 命令 | 说明 |
 | ---- | ---- |
 | `lfv status [<file>]` | **省略 `<file>` 时列出所有 `modified` 的跟踪文件**；执行前按 §6.8 做惰性扫描。默认输出仅含 tracked 变更，每行带 `file-id`（`f_*`）。`--include-untracked` 见 §7.3.2。`--refresh` 强制全量刷新扫描缓存。指定 `<file>` 时仅显示该文件。 |
-| `lfv snap [<file>] [-m <msg>]` | 为某文件创建新快照。**省略 `<file>` 时，自动对所有 `modified` 状态的跟踪文件批量拍照**。若工作区内容未变化则拒绝（除非 `--allow-empty`）。`--tree` 参数见 §7.3.3。 |
+| `lfv snap [<file>] [-m <msg>]` | 为某文件创建新快照。**省略 `<file>` 时，自动对所有 `modified` 状态的跟踪文件批量拍照**。若工作区内容未变化则拒绝（除非 `--allow-empty`）。若违反 §6.9 分支对象唯一性，则拒绝创建快照并提示用户执行 `lfv rewind`。`--tree` 参数见 §7.3.3。 |
 | `lfv log <file>` | 列出该文件的快照历史，附带 tree 关联信息（来自 `tree_file_refs` 表）。支持 `--branch <name>`、`--graph`、`--limit N`。 |
 | `lfv log --tree` | 列出 tree 历史视图：沿 Tree Snapshot 链，每个节点显示 message、标签、时间戳。 |
 | `lfv show <file> <snap>` | 输出某个快照的元数据；`--content` 输出内容；`--out <path>` 导出。 |
@@ -739,7 +790,7 @@ lfv snap --tree --tag v1.0 -m "第一版完成"   # 创建时同步打标签
 
 | 命令 | 说明 |
 | ---- | ---- |
-| `lfv rewind <file> <snap>` | 把工作区文件内容恢复到指定快照。**自动新建分支**（命名规则 `rewind/<snap-short>/<n>`），并将 HEAD 切到新分支。 |
+| `lfv rewind <file> <snap>` | 把工作区文件内容恢复到指定快照。**自动新建分支**（命名规则 `rewind/<snap-short>/<n>`），并将 HEAD 切到新分支。当用于解决环回事件时（§6.9），将执行 `lfv rewind <file> <snap_ap>` snap_ap 为同 hash 祖先的父照。 |
 | `lfv rewind <t:tag|snap-id>` | 把工作区还原到指定 Tree Snapshot 的状态。更新 `.lfv/trees/HEAD`；对每个 file 采用 FF 优先策略（详见 §7.5.1）。 |
 | `lfv branches <file>` | 列出该文件的全部分支。 |
 | `lfv switch <file> <branch>` | 切换该文件的当前分支（同时把工作区内容更新为该分支头部快照）。仅针对 file 分支，不操作 tree。 |
@@ -795,7 +846,7 @@ run `lfv snap` first, or discard changes manually.
 | 命令 | 说明 |
 | ---- | ---- |
 | `lfv gc` | 回收未被任何快照引用的对象。 |
-| `lfv verify` | 校验对象存储的完整性（重算 hash 比对）。 |
+| `lfv verify` | 校验对象存储的完整性（重算 hash 比对）；同时遍历每个文件的所快照，检查同一分支是否有重复 object-id，有则报告数据完整性错误（详见 §6.9.3）。 |
 | `lfv export <file> [--format zip|tar] -o <out>` | 导出某文件的全部历史为独立归档，便于迁移。 |
 
 ## 8. 典型工作流

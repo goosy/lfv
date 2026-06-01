@@ -619,6 +619,58 @@ All scan actions update the status table. In addition, `lfv track` and `lfv untr
 | `lfv track` (no args), `lfv snap` (no args) | Scan before batch track / snap |
 | `lfv status --include-untracked` | Does **not** add or alter scanning; output only (§7.3.2) |
 
+### 6.9 Loopback Detection and Handling
+
+To ensure that each file's history presents an **acyclic content-evolution DAG** on any single branch, LFV enforces the **single-branch object-hash uniqueness invariant** at `lfv snap` time:
+
+- **On any single branch, the same `file-object-hash` may appear at most once.**
+- **History integrity first**: LFV never silently discards or rewrites intermediate history; the user must explicitly run `rewind` to "skip" a duplicate segment.
+- **Branch hygiene**: a loopback pollutes the current branch, so the intermediate history must be moved to a `detour_*` branch, where the user can review it before deciding whether to delete it.
+- **Consistent with `rewind` semantics**: `lfv rewind` is designed for "going back in time and automatically creating a branch"; the uniqueness invariant is precisely the safeguard that makes this scenario work.
+
+### 6.9.1 Detection Timing
+
+When executing `lfv snap <file>` (or processing an individual file during a batch `lfv snap`), after the new snapshot's `object` field is computed but **before** it is written to `snapshots.log`, LFV walks **up the current branch's parent chain** to check whether any ancestor snapshot has the same `object` as the new snapshot.
+
+- If no matching `object` is found → append the new snapshot normally.
+- If a matching `object` is found (call it `ancestor_snap`) → a **loopback event** is triggered, the current `lfv snap` is rejected, and a hint is printed.
+
+#### 6.9.2 Handling a Loopback Event (User Side)
+
+LFV does not rewrite history automatically; instead it prompts the user to use `lfv rewind` to perform the rewind while preserving all intermediate history:
+
+```
+warning: content of docs/note.md matches ancestor snap_01HXYZ on branch main
+         (object hash blake3:abc123...)
+suggestion: run `lfv rewind docs/note.md snap_01HXYZ`
+            this will create a new branch anchored before the duplicate,
+            preserving all intermediate history as a detour branch.
+```
+
+After the user runs `lfv rewind docs/note.md snap_01HXYZ`, LFV:
+
+1. Renames the current branch (e.g. `main`) to `detour_main` (appending a numeric suffix if the name already exists).
+2. Creates a **new snapshot** on `main` whose:
+   - `parent` points to the **parent of `ancestor_snap`** (not `ancestor_snap` itself);
+   - `object` equals the new file content (the `object` that triggered the loopback);
+   - `path`, `message`, etc. are recorded normally.
+3. Points `main`'s HEAD to this new snapshot; working-directory content is unchanged (it already matches the new content).
+
+This way, the intermediate history on the original branch (everything after `ancestor_snap` up to the present) is fully preserved in `detour_main`, while `main` "skips" that segment and continues from the earlier state, **without ever producing a duplicate object hash on `main`**.
+
+#### 6.9.3 Verification Requirements for `lfv verify`
+
+The `lfv verify` command must walk every branch of every file and check whether the same `object` appears twice on a single branch. If it does, this is reported as a **data-integrity error** (not a warning), because under normal operation loopback events are rejected and the user is guided to use `rewind`.
+
+```bash
+error: branch 'main' of file 'docs/note.md' contains duplicate object hash:
+       snap_01HXYZ (object blake3:abc123...)
+       snap_02HABC (object blake3:abc123...)
+       This violates the single-branch object uniqueness invariant.
+       Run `lfv repair --rebase` to fix (destructive).
+```
+
+
 ## 7. CLI Commands
 
 > Convention: `<file>` refers to a relative or absolute path of a file within the working directory; the CLI normalizes all paths internally to be relative to the repository root.
@@ -647,7 +699,7 @@ All scan actions update the status table. In addition, `lfv track` and `lfv untr
 | Command | Description |
 | --- | --- |
 | `lfv status [<file>]` | **Without `<file>`: list all `modified` tracked files.** Runs a lazy scan per §6.8 first. Default output shows tracked changes only, each line with `file-id` (`f_*`). `--include-untracked`: see §7.3.2. `--refresh`: force a full scan-cache refresh. With `<file>`: that file only. |
-| `lfv snap [<file>] [-m <msg>]` | Create a new snapshot for a file. **Without `<file>`: batch-snapshot all `modified` tracked files.** Refuses if working content is unchanged (unless `--allow-empty`). `--tree` parameter: see §7.3.3. |
+| `lfv snap [<file>] [-m <msg>]` | Create a new snapshot for a file. **Without `<file>`: batch-snapshot all `modified` tracked files.** Refuses if working content is unchanged (unless `--allow-empty`). If the single-branch object uniqueness invariant in §6.9 would be violated, refuses and prompts the user to run `lfv rewind`. `--tree` parameter: see §7.3.3. |
 | `lfv log <file>` | List the snapshot history for a file, with tree association information (from `tree_file_refs` table). Supports `--branch <name>`, `--graph`, `--limit N`. |
 | `lfv log --tree` | List the tree history view: walk the Tree Snapshot chain, showing message, tags, and timestamps for each node. |
 | `lfv show <file> <snap>` | Output metadata for a specific snapshot; `--content` outputs the content; `--out <path>` exports it. |
@@ -739,7 +791,7 @@ Text files use line-based diff (default 3-line context); binary files show only 
 
 | Command | Description |
 | --- | --- |
-| `lfv rewind <file> <snap>` | Restore the working-area file content to the specified snapshot. **Automatically creates a new branch** (naming pattern `rewind/<snap-short>/<n>`) and moves HEAD to the new branch. |
+| `lfv rewind <file> <snap>` | Restore the working-area file content to the specified snapshot. **Automatically creates a new branch** (naming pattern `rewind/<snap-short>/<n>`) and moves HEAD to the new branch. When used to resolve a loopback event (§6.9), `lfv rewind <file> <snap_ap>` will be executed, where `snap_ap` is the parent snapshot of the ancestor with the identical hash. |
 | `lfv rewind <t:tag|snap-id>` | Restore the working tree to the state of the specified Tree Snapshot. Updates `.lfv/trees/HEAD`; for each file uses the FF-priority strategy (see §7.5.1 for details). |
 | `lfv branches <file>` | List all branches for this file. |
 | `lfv switch <file> <branch>` | Switch the file's current branch (also updates working-area content to the head snapshot of that branch). Only targets file branches, does not operate on tree. |
@@ -795,7 +847,7 @@ User-input tag names are not allowed to contain `:` (namespace isolation).
 | Command | Description |
 | --- | --- |
 | `lfv gc` | Reclaim objects not referenced by any snapshot. |
-| `lfv verify` | Verify object store integrity (recompute hashes and compare). |
+| `lfv verify` | Verify object store integrity (recompute hashes and compare); also walk every branch of every file and report any duplicate object hash on a single branch as a data-integrity error (see §6.9.3). |
 | `lfv export <file> [--format zip\|tar] -o <out>` | Export all history for a file as a self-contained archive for migration. |
 
 ## 8. Typical Workflows
