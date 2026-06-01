@@ -45,11 +45,11 @@ LFV 的心智模型是"我有一个目录，其中每个文件都有版本历史
 
 Snapshot 为版本记录，大体对应 GIT 的 commmit。
 
-snapshot-id 采用 ULID 以保证可读性与时间排序；防篡改职责交由独立的 `digest` 字段承担，由 `lfv verify` 校验（详见 `design.md §5.2`）。
+Snapshot id 采用 ULID 以保证可读性与时间排序；防篡改职责交由独立的 `digest` 字段承担，由 `lfv verify` 校验（详见 `design.md §5.2`）。
 
 内容寻址 id（如 Git 的 SHA 哈希）将身份与防篡改耦合在一起，被迫在"不透明哈希（体验差）"和"可读字符串（无法作为完整性证明）"之间取舍。LFV 将这两个关注点分离：ULID id 便于粘贴、时间有序、内容无关；`digest` 字段提供独立的防篡改检测。`lfv verify` 可以在不触碰 id 的情况下校验每条 Snapshot。
 
-在快照中 ULID 与路径完全解耦；rename/move 被记为**不可变事件**。如此 Snapshot 链就是文件位置 + 内容的完整真理源。杜绝可变 `aliases` 列表导致的真理源分裂。
+在快照中 ULID 与路径完全解耦；rename/move 被记为**不可变事件**。将路径作为每条 Snapshot 的字段，Snapshot 链就成为文件位置与内容的唯一完整真理源。杜绝可变 `aliases` 列表导致的真理源分裂。
 
 路径每次改名要么打断历史连续性，没有 ULID，则需要一张可变的别名表，它使得真理源分裂。
 
@@ -65,11 +65,11 @@ LFV 的删除是**状态转移**，不是擦除。擦除历史违反 append-only
 
 `lfv snap --tree` 创建 **Tree Snapshot** 的方式与 `lfv snap` 创建 File Snapshot 完全一致：向 append-only 日志追加一条不可变事件记录，以 ULID 寻址，有单一 parent 指针，有用于防篡改的 `digest` 字段，并指向一个 Tree Object。
 
-Tree Object 是内容寻址的 JSON 清单——按路径排序的 `{path, file-object-hash}` 列表，包含当前 HEAD 下所有有有效（非 null）object 的跟踪文件。Tree Object 与 File Object 存放于同一 `objects/` 目录，按内容去重。两次内容完全相同的工作目录状态产生相同的 Tree Object hash，`objects/` 里只有一份物理条目。
+Tree Object 是内容寻址的 YAML 清单——按路径排序的 `{path: file-object-hash}` 条目列表，包含当前 HEAD 下所有有效（非 null）object 的跟踪文件。Tree Object 与 File Object 存放于同一 `objects/` 目录，按内容去重。两次内容完全相同的工作目录状态产生相同的 Tree Object hash，`objects/` 里只有一份物理条目。
 
-Tree Snapshot 存放于 `.lfv/trees/snapshots.log`，拥有独立的分支集合与标签集合，通过现有命令的 `--tree` 变体管理（`lfv log --tree`、`lfv branches --tree` 等）。仓库内可以不存在任何 Tree Snapshot；tree 层完全可选。
+Tree Snapshot 存放于 `.lfv/trees/snapshots.log`，拥有独立的标签集合，通过现有命令的 `--tree` 变体管理（`lfv log --tree` 等）。仓库内可以不存在任何 Tree Snapshot；tree 面完全可选。
 
-`lfv snap --tree` 要求所有 modified 跟踪文件必须已经完成快照（先执行 `lfv snap`，或同时加 `--snap-all`）。这确保 Tree Object 是从每个文件的当前 HEAD 构建的，不会静默地产生过期的 tree 快照。
+`lfv snap --tree` 要求所有 modified 跟踪文件必须已经完成快照（先执行 `lfv snap`，或加 `--snap-all` 参数）。这确保 Tree Object 是从每个文件的当前 HEAD 构建的，不会静默地产生过期的 tree 快照。
 
 **为什么不在 `lfv snap --tree` 内部自动 snap 文件**：将文件快照与 tree 快照分开，保持用户意图的明确性。Tree Snapshot 是刻意标记的里程碑；把可能很多个文件的快照作为副作用自动触发，会用无意的快照条目遮蔽各文件的独立历史。
 
@@ -129,13 +129,58 @@ LFV 物理上排斥 Git 式的 DAG 拓扑（多父节点），纯粹是为了保
 
 LFV 认为“内容合并”与“历史拓扑合并”是两件不同的事情。用户合并文件时，真正关心的是内容是否已经统一，而不是多个历史分支是否在快照拓扑上收敛为同一个节点。在LFV的界面下，只要 Object 一致就认为合并完成，不需要在快照上对齐。而 git 要在 commit 合一上做文章。这种分离，极大地方便了合并算法和用户的流程理解。
 
-## 10. `lfv mv` 与 `lfv relink` 不共用同一命令
+## 10. Tree 面的设计原则
 
-`lfv mv <src> <dst>` 只做路径操作，`<dst>` 不允许为 `file-id`。`lfv relink <f_src> --onto <f_dst>` 专门处理历史续接。
+### 10.1 tree-id 使用内容 hash，不使用 ULID
 
-若允许 `lfv mv <src> <f_dst-id>` 将路径操作与历史续接混用，用户会自然地以为操作完成后"留下来的 `file-id` 是 `<dst>` 那个"——而实际上续接后存活的是 `--onto` 一侧（即 `f_dst`），`f_src` 被退役。这一心智混淆几乎必然导致误操作。
+tree-id（Tree Object 的身份标识）采用 `blake3(规范化清单字节串)` 内容 hash，而不是像 file-id 那样分配独立的 ULID。
 
-`lfv relink` 还解决了 `lfv mv` 根本无法处理的第二个问题：**合并另一个文件的历史**。典型场景是 `<f_src>` 的内容是 `<f_dst>` 的超集，用户不需要同时保留两个 `file-id`，希望将 `f_src` 的完整快照链续接到 `f_dst` 上，然后退役 `f_src`。这是语义上的历史整合操作，与单纯的路径重命名是两个不同层次的概念，强行合并只会使两个命令都变得难以理解。
+一个仓库逻辑上只有"一棵 tree"——它是工作目录当前所有跟踪文件的集合，随内容变化而变化，不需要一个稳定的"这棵 tree 是谁"的身份。内容 hash 作为 tree-id 有两个好处：自然去重（两次内容完全相同的工作目录状态共享同一 Tree Object），以及省去为 tree 维护独立身份（ULID + meta.yaml）的开销。这与 file-id 的设计不同——file 需要跨改名/移动保持稳定身份，因此必须是与路径解耦的 ULID；tree 不需要跨内容变化保持身份，因此内容 hash 就足够了。
+
+### 10.2 Tree 没有分支，只有标签和 HEAD
+
+Tree Snapshot 链没有分支集合，只有：标签（`t:` 前缀，全局唯一）、单条 HEAD 指针（当前所在的 Tree Snapshot）。
+
+分支的核心价值在于支持"同一文件的多条独立演化线"——这是 file 面的典型需求（用户需要在不同分支上实验不同内容）。Tree 是里程碑式的全局快照，其使用模式是线性推进，不需要也不应该有多条并行演化线。引入 tree 分支只会增加心智负担，而不带来实质好处。
+
+**tree HEAD 存储在单独文件 `.lfv/trees/HEAD` 中**：tree HEAD 是不可从 Snapshot 链重建的当前状态（它记录"用户当前位于 tree 历史的哪个节点"，而非哪条 Snapshot 是最新的）。`index.db` 里的其他状态（分支指针、file HEAD）在 `rebuild-index` 时可以从 Snapshot 链派生重建；tree HEAD 一旦丢失无法重建，因此应独立于可重建的 `index.db`，以单独文件持久化，避免在 `rebuild-index` 时被意外覆盖。
+
+`lfv switch <branch>` 只针对 file 分支，不提供 tree 的切换操作（因为 tree 没有分支）。tree 的位置变更只通过 `lfv rewind t:<tag|snap-id>` 操作。
+
+### 10.3 tree rewind 不直接操作 config、分支或状态表
+
+`lfv rewind t:<tag|snap-id>` 执行时，只做两件事：更新 `.lfv/trees/HEAD`，以及对工作区文件执行字节级操作（写入或删除）。它不直接调用 `track`/`untrack`/`revive` 命令，不修改 `config.yaml` 动态 untracked 列表，不修改任何分支指针或状态表。
+
+`config.yaml`、分支和状态表属于 `track`/`untrack`/`delete`/`revive` 命令的职责边界。tree rewind 越过这个边界直接操作，会使用户难以预测哪些命令会对 config 产生副作用，破坏命令职责的清晰性。
+
+字节操作之后，现有的惰性扫描机制（§6.8）会在下次 `lfv status` 或 `lfv snap` 时自然感知变化并驱动状态更新。tree rewind 产生的"新增文件"和"消失文件"与 OS 直接操作文件产生的效果完全等同，用户的心智模型无需特殊化。
+
+### 10.4 tree rewind 对每个 file 采用 FF 优先策略
+
+`lfv rewind t:<tag|snap-id>` 对每个需要还原的 file，不直接执行 rewind（会产生新分支），而是先检查是否存在 Fast-Forward 路径：
+
+- **FF 路径**：若某条分支的当前 HEAD 的 object hash 等于目标 hash，直接 `switch` 到该分支，不新建分支。优先选当前分支（无切换成本）；若当前分支不匹配，选最近创建的匹配分支。
+- **rewind 路径**：否则执行标准 rewind，自动新建分支（`rewind/<snap-short>/<n>`）。
+
+tree rewind 是批量操作，可能同时影响数十个文件。若每个文件都无条件新建分支，产生的分支噪音会极大干扰用户对各文件历史的阅读。FF 路径在实践中覆盖大多数 tree rewind 场景（因为 tree-snapshot 通常紧随各文件 snap 之后创建，此时各文件 HEAD 的 object 就是 tree-object 里记录的 object），使零分支污染成为常态。只有真正需要回溯到非 HEAD 位置时才新建分支，与决策 2（回溯不破坏历史）保持一致。
+
+这与 git 的 Fast-Forward merge 机制同构：在能 FF 的情况下不产生额外节点，只在必要时才分叉。
+
+### 10.5 Tree Object 使用 YAML 块序列而非 JSON
+
+Tree Object 清单采用 YAML 块序列格式（`- "path": hash`），而非 JSON 数组（`[{"path":...,"object":...}]`）。
+
+**被否决的方案**：JSON 数组。JSON 的规范化需要额外约定（无多余空白、键顺序固定、无尾随逗号），实现时必须使用受控的序列化器而非普通 `to_string()`，规范化要求与格式规范分离，容易因实现疏漏产生不一致的 hash。
+
+**选择 YAML 块序列的理由**：
+
+**存储格式即规范化格式**：每行 `- "path": hash` 完全确定（引号、排序、单一换行符），blake3 对字节串直接摘要，无需额外规范化步骤。规范化约束体现在写入规则中，而非附加的序列化协议上。
+
+**路径作为键名的安全性**：YAML 中裸键（unquoted key）对 `#`、`[`、`{`、`,`、`&`、`*` 等字符有特殊含义，路径字符集与之存在冲突。双引号键名彻底消除所有特殊字符问题——包括含空格的路径（在 Windows/NAS 场景极为普遍）。路径始终以 Unix 分隔符 `/` 存储，不含 `\`，键内唯一需转义的字符是 `"`，实际路径中几乎不出现，因此引号带来的复杂度可忽略不计。
+
+**外部兼容性**：该格式是合法的 YAML 子集，外部程序可直接用标准 YAML 解析器读取。LFV 内部亦可用单行正则 `/^- "(.+)": (\S+)$/` 逐行解析，不依赖完整解析器。JSON 同样有外部兼容性，但 YAML 在字符节省和解析简便性上略优。
+
+**字符效率**：每条目约节省 20% 字符（YAML 行约 35 字符 vs. JSON 对象约 45 字符）。Tree Object 体积通常低于 `min_bytes` 压缩下限，以 `.raw` 存储，字符效率直接对应存储效率。
 
 ## 11. 存储对象仅两类
 
@@ -144,7 +189,7 @@ LFV 认为“内容合并”与“历史拓扑合并”是两件不同的事情�
 | 大类 | 子类型 | 内容 | 寻址方式 |
 | --- | --- | --- | --- |
 | Object | **File Object** | 文件原始字节（压缩后） | `blake3(原始字节)` |
-| Object | **Tree Object** | 按路径排序的 `{path, file-object-hash}` 清单（JSON） | `blake3(规范化清单)` |
+| Object | **Tree Object** | 按路径排序的 `{path: file-object-hash}` 清单（YAML） | `blake3(规范化清单字节串)` |
 | Snapshot | **File Snapshot** | 单个文件的事件记录 | `snap_<ULID>` |
 | Snapshot | **Tree Snapshot** | 工作目录整体状态的事件记录 | `snap_<ULID>` |
 
@@ -170,7 +215,31 @@ LFV 认为“内容合并”与“历史拓扑合并”是两件不同的事情�
 
 状态表和分支指针是**可变的**，需要高效的随机访问读取和原子更新。纯文件方案（如每文件一个 YAML）在小规模下可行，但在数千个被跟踪文件时性能急剧下降。SQLite 提供 ACID 事务、高效索引查找和单文件部署模型——无守护进程，无网络。历史 Snapshot 链则是 append-only 且顺序访问，用 JSON Lines 平文件更简单、足够用。
 
-## 14. 小工具优先
+## 14. `lfv mv` 与 `lfv relink`
+
+`lfv mv <src> <dst>` 只做路径操作，`<dst>` 不允许为 `file-id`。`lfv relink <f_src> --onto <f_dst>` 专门处理历史续接。
+
+若允许 `lfv mv <src> <f_dst-id>` 将路径操作与历史续接混用，用户会自然地以为操作完成后"留下来的 `file-id` 是 `<dst>` 那个"——而实际上续接后存活的是 `--onto` 一侧（即 `f_dst`），`f_src` 被退役。这一心智混淆几乎必然导致误操作。
+
+`lfv relink` 还解决了 `lfv mv` 根本无法处理的第二个问题：**合并另一个文件的历史**。典型场景是 `<f_src>` 的内容是 `<f_dst>` 的超集，用户不需要同时保留两个 `file-id`，希望将 `f_src` 的完整快照链续接到 `f_dst` 上，然后退役 `f_src`。这是语义上的历史整合操作，与单纯的路径重命名是两个不同层次的概念，强行合并只会使两个命令都变得难以理解。
+
+## 15. 文件的树索引使用 `tree_file_refs` DB 表
+
+每个 file 在哪些 Tree Snapshot 中出现的反向引用存入 `index.db` 的 `tree_file_refs` 表，而非每个 file-id 目录下的独立文件。字段：`tree_snap_id`（`snap_<ULID>`）、`file_id`、`file_object`（blake3 hash）。真理源为 `.lfv/trees/snapshots.log` + `.lfv/objects/`，`rebuild-index` 时重建。
+
+**被否决的替代方案**：每个 file-id 目录下维护一个 YAML 文件（`.lfv/trees/.yaml`），key = `snap_<ULID>`，value = file-object-hash。此方案在文件数量多时会产生大量小文件写入，且没有事务保证（写入中崩溃会产生不一致）。
+
+**采用 db 表的理由**：`index.db` 提供 ACID 事务，单表查询效率高，且 `tree_file_refs` 本就是纯缓存性质（真理源在 `.lfv/trees/snapshots.log` + `objects/`），放入 db 与其他可重建索引语义一致，`rebuild-index` 时统一重建，不会出现某个 file 的反向引用漏写的情况。
+
+**snap_id 作为主键（而非标签名）的理由**：每个 Tree Snapshot 都有 message，即使没有标签也有意义。snap_id 作为主键保证所有 Tree Snapshot 都被反向引用，渲染时再去 `.lfv/trees/snapshots.log` 动态查询标签：有标签则显示标签名，无标签则显示 message，二者都有意义。"打不打标签"只影响展示，不影响历史的完整性。
+
+## 16. 命名空间隔离：用户输入不允许包含 `:`
+
+tree 标签以 `t:` 为前缀（内部管理），file 有隐式 `f:` 命名空间（通常不显示）。**用户在输入分支名、标签名时不允许包含 `:`**，由此实现命名空间隔离，避免用户输入与内部前缀冲突。
+
+**为什么**：如果允许用户输入 `t:foo`，CLI 无法区分这是用户有意引用 tree 标签，还是用户真的想创建一个名为 `t:foo` 的 file 标签。通过禁止 `:` 出现在用户输入中，命名空间的所有权边界清晰：带前缀的引用总是内部生成的，不带前缀的引用总是用户输入的。
+
+## 17. 小工具优先
 
 CLI 子命令清晰、可组合、可脚本化；不为图形化或服务化做过早抽象。
 
