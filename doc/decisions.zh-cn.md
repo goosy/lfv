@@ -2,17 +2,17 @@
 
 本文档记录 LFV **为什么** 这样设计。每条说明一个具体设计选择背后的理由，包括接受的权衡和否定的替代方案。
 
-## 1. 单文件作用域
+## 1. 文件为中心
 
-所有历史对象都归属于单个文件；全局快照命令本质上只是对多个文件逐一执行单文件快照操作。
+所有快照都是对单个文件进行归档，全局快照命令本质上只是对多个文件逐一执行单文件快照操作。
 
-LFV 的全部目的就是将文件作为独立单元来跟踪。只允许全局快照会要求必须跨文件耦合——而正是 `GIT` 与 `LFV` 的区别。
+LFV 的目的就是将文件作为独立单元来跟踪。只允许全局快照而不允许独立文件快照，相当于要求跨文件耦合——而正是 `GIT` 与 `LFV` 的区别。
 
 ## 2. 回溯不破坏历史
 
 快照是 append-only 且始终可达，任何"回到过去"的操作都通过**新建分支**实现，绝不会让 HEAD 之前的快照变得不可达。
 
-破坏性撤销是用户错误和数据丢失的持续来源。通过让每次回溯都变为分支创建，让不破坏历史可行。代价（分支管理略复杂）与安全保证相比微不足道。
+破坏性撤销是用户错误和数据丢失的持续来源。通过让每次回溯都变为分支创建，确保历史不被破坏。代价（分支管理略复杂）与安全保证相比微不足道。
 
 `snapshots.log` 永不重写，天然支持备份（增量拷贝始终有效）、审计（验证器可以从头重放）和断电恢复（尾部的不完整写入可被检测并截断，不污染早期条目）。
 
@@ -51,7 +51,7 @@ snapshot-id 采用 ULID 以保证可读性与时间排序；防篡改职责交�
 
 在快照中 ULID 与路径完全解耦；rename/move 被记为**不可变事件**。如此 Snapshot 链就是文件位置 + 内容的完整真理源。杜绝可变 `aliases` 列表导致的真理源分裂。
 
-路径每次改名要么打断历史连续性，没有 ULID，则需要一张可变的别名表，它使得真理源分裂，
+路径每次改名要么打断历史连续性，没有 ULID，则需要一张可变的别名表，它使得真理源分裂。
 
 ## 6. 删除只是普通 Snapshot 的一种取值，历史永不丢失
 
@@ -61,21 +61,58 @@ LFV 的删除是**状态转移**，不是擦除。擦除历史违反 append-only
 
 两步设计（标记 `modified` → 在 `lfv snap` 时确认）给用户一个修正窗口：文件仍处于 `D` 状态时，可运行 `lfv mv` 将其重新归类为改名，避免误删。
 
-## 7. 拓扑视图设计
+## 7. Tree Snapshot 与 File Snapshot 对称
 
-每条 Snapshot 只有一个 parent 指针，整体形成有向森林。分支分叉后独立演化，不存在拓扑意义上的合并点（即物理上不存在多 parent 的 Merge Snapshot）。这与 GIT 的 DAG 不同。
+`lfv snap --tree` 创建 **Tree Snapshot** 的方式与 `lfv snap` 创建 File Snapshot 完全一致：向 append-only 日志追加一条不可变事件记录，以 ULID 寻址，有单一 parent 指针，有用于防篡改的 `digest` 字段，并指向一个 Tree Object。
+
+Tree Object 是内容寻址的 JSON 清单——按路径排序的 `{path, file-object-hash}` 列表，包含当前 HEAD 下所有有有效（非 null）object 的跟踪文件。Tree Object 与 File Object 存放于同一 `objects/` 目录，按内容去重。两次内容完全相同的工作目录状态产生相同的 Tree Object hash，`objects/` 里只有一份物理条目。
+
+Tree Snapshot 存放于 `.lfv/trees/snapshots.log`，拥有独立的分支集合与标签集合，通过现有命令的 `--tree` 变体管理（`lfv log --tree`、`lfv branches --tree` 等）。仓库内可以不存在任何 Tree Snapshot；tree 层完全可选。
+
+`lfv snap --tree` 要求所有 modified 跟踪文件必须已经完成快照（先执行 `lfv snap`，或同时加 `--snap-all`）。这确保 Tree Object 是从每个文件的当前 HEAD 构建的，不会静默地产生过期的 tree 快照。
+
+**为什么不在 `lfv snap --tree` 内部自动 snap 文件**：将文件快照与 tree 快照分开，保持用户意图的明确性。Tree Snapshot 是刻意标记的里程碑；把可能很多个文件的快照作为副作用自动触发，会用无意的快照条目遮蔽各文件的独立历史。
+
+## 8. 单分支 object hash 唯一性不变量与环路防止
+
+**不变量**：在某个文件历史的任意单条分支上，同一个 file-object-hash 最多出现一次。
+
+若无此约束，某条分支可能回访之前出现过的内容状态，在内容层图中产生反向边（环路）。环路使内容层的渲染产生歧义：同一个节点在时间线上出现两次，其注释（message、时间戳）变得不明确。
+
+**机制**：`lfv snap` 计算新内容 hash 时，若发现它与当前分支某个祖先的 object hash 相同，则拒绝追加快照，改为输出提示：
+
+```
+warning: content of docs/note.md matches ancestor snap_2 on branch B
+suggestion: run `lfv rewind docs/note.md snap_2` to re-anchor
+            this will preserve the intermediate history as branch detour_B
+```
+
+用户执行 `lfv rewind` 后：
+1. 当前分支重命名为 `detour_<原分支名>`——中间历史完整保留。
+2. 在原分支名上新建一条快照，其 parent 指向**匹配祖先的父快照**（而非祖先本身），使新快照与祖先在 Snapshot 链上是两个独立节点，尽管它们的 object hash 相同。
+
+**为什么指向祖先的父，而非祖先本身**：若新快照的 parent 是该祖先，则两者 object hash 相同、parent 也相同——在 Snapshot 链中无法区分，渲染时无法表达两者之间的有效边。
+
+**为什么是提示而非自动 rewind**：中间历史（detour）可能是用户有意为之，值得在归档前审阅。将决策暴露给用户，与 LFV 一贯"不静默地重构历史"的哲学一致。
+
+**`lfv verify` 强制校验**：单分支唯一性不变量是可检验的属性。`lfv verify` 遍历每条分支，将任何违反报告为数据完整性错误，而非警告。同一分支上出现相同 object hash 的第二次，意味着环路防止流程被绕过，正常操作下不应发生。
+
+## 9. 拓扑视图设计
+
+每条 Snapshot 只有一个 parent 指针，整体形成有向森林——无论是 File Snapshot 链还是 Tree Snapshot 链，均如此。分支分叉后独立演化，不存在拓扑意义上的合并点（即物理上不存在多 parent 的 Merge Snapshot）。这与 GIT 的 DAG 不同。
 
 Snapshot 有向树拓扑与“内容合并（Content Merge）”是解耦的，坚持快照的有向树拓扑，并不等于排斥单文件在内容层面的合并与对齐。
 
 所以，在用户视角，视图是快照与对象都向用户暴露：用户以 Object 为显示上的节点，从 Snapshot 链接看这些节点的继承关系，在用户视图上是 DAG 拓扑。
 
-### 坚持有向树拓扑（Single Parent）的核心理由
+- **Snapshot 层**（存储层）：永远是有向树。每条 Snapshot 恰好有一个 parent 指针。这一层是物理存储的内容，结构永不改变。
+- **内容层**（派生层）：节点为 object hash，边由 Snapshot parent 关系投影到 object 身份而来。若无额外约束，此层可能出现环路（某分支回访了之前出现过的 object hash）。决策 8 通过强制"单分支 object hash 唯一性"不变量，在此层消除环路，使其成为 DAG。
 
 LFV 物理上排斥 Git 式的 DAG 拓扑（多父节点），纯粹是为了保持底层的**极致简单与历史追溯的绝对确定性**：
 
 - **存储与索引极简**：`snapshots.log` 仅需 optional `parent` 字段，快照历史天然是单向链表的物理分叉。
-- **算法极简**：`拓扑排序退化为简单的 O(N) 线性回溯，彻底规避了 Git 中复杂的图拓扑排序（Topology Sort）和环路检测算法。
-- **历史绝对纯净与可读**：有向树保证了任何快照的“祖先路径”是唯一确定的。
+- **算法极简**：拓扑排序退化为简单的 O(N) 线性回溯，彻底规避了 Git 中复杂的图拓扑排序（Topology Sort）和环路检测算法。
+- **历史绝对纯净与可读**：有向树保证了任何快照的`祖先路径`是唯一确定的。
 - **无双线并行歧义**：Git merge 后分支在拓扑上存在两条路径，无法区分哪条是真正的主线。LFV 的单父拓扑从根源上杜绝此问题，这样可以保证各个分支的颗粒度可以是不同的。
 
 ### 优缺点对比（有向树拓扑 vs. DAG 拓扑）
@@ -92,7 +129,7 @@ LFV 物理上排斥 Git 式的 DAG 拓扑（多父节点），纯粹是为了保
 
 LFV 认为“内容合并”与“历史拓扑合并”是两件不同的事情。用户合并文件时，真正关心的是内容是否已经统一，而不是多个历史分支是否在快照拓扑上收敛为同一个节点。在LFV的界面下，只要 Object 一致就认为合并完成，不需要在快照上对齐。而 git 要在 commit 合一上做文章。这种分离，极大地方便了合并算法和用户的流程理解。
 
-## 8. `lfv mv` 与 `lfv relink` 不共用同一命令
+## 10. `lfv mv` 与 `lfv relink` 不共用同一命令
 
 `lfv mv <src> <dst>` 只做路径操作，`<dst>` 不允许为 `file-id`。`lfv relink <f_src> --onto <f_dst>` 专门处理历史续接。
 
@@ -100,17 +137,32 @@ LFV 认为“内容合并”与“历史拓扑合并”是两件不同的事情�
 
 `lfv relink` 还解决了 `lfv mv` 根本无法处理的第二个问题：**合并另一个文件的历史**。典型场景是 `<f_src>` 的内容是 `<f_dst>` 的超集，用户不需要同时保留两个 `file-id`，希望将 `f_src` 的完整快照链续接到 `f_dst` 上，然后退役 `f_src`。这是语义上的历史整合操作，与单纯的路径重命名是两个不同层次的概念，强行合并只会使两个命令都变得难以理解。
 
-## 9. 存储对象仅两类
+## 11. 存储对象仅两类
 
-仓库内真正不可变的存储对象只有 Object 与 Snapshot；其余概念均为可变索引（详见 `design.md §4.3`）。
+仓库内真正不可变的存储对象分为 **Object** 与 **Snapshot** 两大类，每类各有两种子类型。其余概念均为可变索引（详见 `design.zh-cn.md §4.2`）。
 
-## 10. 对象压缩双阈值
+| 大类 | 子类型 | 内容 | 寻址方式 |
+| --- | --- | --- | --- |
+| Object | **File Object** | 文件原始字节（压缩后） | `blake3(原始字节)` |
+| Object | **Tree Object** | 按路径排序的 `{path, file-object-hash}` 清单（JSON） | `blake3(规范化清单)` |
+| Snapshot | **File Snapshot** | 单个文件的事件记录 | `snap_<ULID>` |
+| Snapshot | **Tree Snapshot** | 工作目录整体状态的事件记录 | `snap_<ULID>` |
+
+两种 Object 子类型均存放于同一个 `objects/` 目录，按内容 hash 去重，完全不可变。两种 Snapshot 子类型均为 append-only，格式相同（JSON Lines），但分别存放于不同目录：
+- File Snapshot: `.lfv/files/<file-id>/snapshots.log`
+- Tree Snapshot: `.lfv/trees/snapshots.log`
+
+**为什么现在需要 Tree Object**：LFV 的应用场景包括对整个工作目录进行里程碑式快照（例如"这本书的某个完整版本"）。Tree Object 使这成为一等操作，同时保持核心不变量——内容身份由 hash 决定，而非快照 id。两次内容完全相同的工作目录状态产生相同的 Tree Object hash，`objects/` 里只有一份，与两个文件内容相同时共享同一 File Object 的机制完全一致。
+
+**为什么 Tree Object 存储 file-object-hash 而非 file-snapshot-id**：LFV 历史图的节点身份是内容（object hash），不是元数据记录（snapshot id）。Tree Object 引用 file-object-hash，从端到端都是内容寻址；若引用 snapshot id，则树的身份会与偶发的元数据（message、时间戳）耦合，破坏去重和内容节点语义。
+
+## 12. 对象压缩双阈值
 
 `min_bytes`（floor，默认 4 KiB）与 `max_bytes`（ceiling，默认 16 MiB）分别处理过小与过大的文件；`blake3` 始终对原始字节计算；跳过或无效压缩的对象以 `.raw` 存储，压缩对象为 `.zstd`（详见 `design.md §5.1`）。
 
 单一阈值无法同时处理两个边界情况。过小的文件压缩后可能因帧开销反而变大；过大的文件在压缩时会产生内存峰值（需要将整个文件读入内存）。双阈值明确区分这两种情况，`reject_if_larger` 则兜底处理已压缩的二进制（如图片）等无压缩收益的情形。`blake3` 始终对原始字节计算，确保 hash 与存储格式无关。
 
-## 11. 以 SQLite 作为索引
+## 13. 以 SQLite 作为索引
 
 状态表、branches、tags、文件的全局快速索引等，需要随机更新的元数据放入 `index.db`。
 
@@ -118,7 +170,7 @@ LFV 认为“内容合并”与“历史拓扑合并”是两件不同的事情�
 
 状态表和分支指针是**可变的**，需要高效的随机访问读取和原子更新。纯文件方案（如每文件一个 YAML）在小规模下可行，但在数千个被跟踪文件时性能急剧下降。SQLite 提供 ACID 事务、高效索引查找和单文件部署模型——无守护进程，无网络。历史 Snapshot 链则是 append-only 且顺序访问，用 JSON Lines 平文件更简单、足够用。
 
-## 12. 小工具优先
+## 14. 小工具优先
 
 CLI 子命令清晰、可组合、可脚本化；不为图形化或服务化做过早抽象。
 

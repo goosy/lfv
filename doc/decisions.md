@@ -61,17 +61,54 @@ Deletion in LFV is a state transition, not erasure. Erasing history would violat
 
 The two-step process provides a correction window. While the file remains in `D` state, `lfv mv` can still reclassify the event as a rename instead of a deletion.
 
-## 7. Topology View Design
+## 7. Symmetry Between Tree Snapshots and File Snapshots
 
-Each Snapshot has exactly one parent pointer, forming a directed forest. Once branches diverge, they evolve independently. There is no topological merge point — that is, no physical Merge Snapshot with multiple parents. This differs fundamentally from Git's DAG model.
+`lfv snap --tree` creates a **Tree Snapshot** in exactly the same way that `lfv snap` creates a File Snapshot: by appending an immutable event record to an append-only log. It is addressed by a ULID, has a single parent pointer, contains a `digest` field for tamper detection, and points to a Tree Object.
 
-The Snapshot topology and content merging are intentionally decoupled. Maintaining a directed-tree Snapshot topology does not imply rejecting content-level merging or alignment for individual files.
+A Tree Object is a content-addressed JSON manifest — a path-sorted list of `{path, file-object-hash}` entries representing all tracked files whose current HEAD resolves to a valid (non-null) object. Tree Objects and File Objects are stored in the same `objects/` directory and deduplicated by content. Two identical workspace states produce the same Tree Object hash and therefore share the same physical object entry.
 
-As a result, LFV exposes both Snapshots and Objects to the user. Objects serve as the visible nodes, while Snapshot links describe the inheritance relationships between them. From the user's perspective, the resulting view forms a DAG topology.
+Tree Snapshots are stored in `.lfv/trees/snapshots.log`. They maintain their own branch and tag sets and are managed through `--tree` variants of existing commands (`lfv log --tree`, `lfv branches --tree`, etc.). A repository may contain no Tree Snapshots at all; the tree layer is entirely optional.
 
-### Core Reasons for a Directed-Tree Topology (Single Parent)
+`lfv snap --tree` requires that all modified tracked files have already been snapshotted (either by running `lfv snap` first or by using `--snap-all`). This guarantees that the Tree Object is built from the current HEAD of every file and prevents silently creating stale tree snapshots.
 
-LFV deliberately rejects Git-style DAG topology (multiple-parent nodes) for one reason: to preserve maximum simplicity at the storage layer and absolute determinism in historical tracing.
+**Why not automatically snapshot files inside `lfv snap --tree`?** File snapshots and tree snapshots are intentionally separate so that user intent remains explicit. A Tree Snapshot is a deliberate milestone. Automatically creating file snapshots as a side effect would pollute individual file histories with unintended entries.
+
+## 8. Single-branch object-hash uniqueness invariant and cycle prevention
+
+**Invariant**: on any single branch of a file's history, the same file-object-hash must appear at most once.
+
+Without this invariant, a branch could revisit a previous content state, creating a backward edge in the content-layer graph (a cycle). Cycles make content-layer rendering ambiguous: a node appears at two points in the timeline, and its annotation (message, timestamp) becomes unclear.
+
+**Mechanism**: when `lfv snap` computes a new content hash and finds it equal to an ancestor's object hash on the current branch, it refuses to append the snapshot and instead outputs:
+
+```
+warning: content of docs/note.md matches ancestor snap_2 on branch B
+suggestion: run `lfv rewind docs/note.md snap_2` to re-anchor
+            this will preserve the intermediate history as branch detour_B
+```
+
+The user then runs `lfv rewind`, which:
+1. Renames the current branch to `detour_<original-branch-name>` — preserving the intermediate history intact.
+2. Creates a new snapshot on the original branch name whose parent points to the **parent of the matching ancestor** (not the ancestor itself), so the new snapshot and the ancestor are distinct nodes in the snapshot chain even though their object hashes are equal.
+
+**Why point to the ancestor's parent, not the ancestor itself**: if the new snapshot's parent were the ancestor, both would share the same object hash and the same parent — they would be indistinguishable nodes in the snapshot chain, and the rendering could not show a meaningful edge between them.
+
+**Why warn instead of auto-rewind**: the intermediate history (detour) may be intentional and worth reviewing before archiving. Surfacing the decision to the user is consistent with LFV's general philosophy of not silently restructuring history.
+
+**`lfv verify` enforcement**: the single-branch uniqueness invariant is a checkable property. `lfv verify` traverses each branch and reports any violation as a data integrity error, not merely a warning. A second occurrence of the same object hash on a branch indicates the cycle-prevention flow was bypassed, which should not happen under normal operation.
+
+## 9. Topology View Design
+
+Every Snapshot has exactly one parent pointer, forming a directed forest. This applies equally to File Snapshot chains and Tree Snapshot chains. Once branches diverge, they evolve independently. There is no topological merge point — that is, no physical Merge Snapshot with multiple parents. This differs fundamentally from Git's DAG model.
+
+The Snapshot topology and content merging are intentionally decoupled. Maintaining a directed-tree Snapshot topology does not imply rejecting content-level merging or alignment.
+
+As a result, LFV exposes both Snapshots and Objects to the user. Objects serve as the visible nodes, while Snapshot links describe inheritance relationships between them. From the user's perspective, the resulting view forms a DAG.
+
+- **Snapshot layer (storage layer):** Always a directed tree. Every Snapshot has exactly one parent pointer. This layer represents the physical storage structure and never changes.
+- **Content layer (derived layer):** Nodes are object hashes. Edges are projected from Snapshot parent relationships onto object identities. Without additional constraints, cycles could appear when a branch revisits a previously seen object hash. Decision 8 eliminates such cycles through the single-branch object-hash uniqueness invariant, making the content layer a DAG.
+
+LFV deliberately rejects Git-style multi-parent DAG topology in order to preserve maximum simplicity at the storage layer and absolute determinism in historical tracing:
 
 - **Minimal storage and indexing**: `snapshots.log` requires only an optional `parent` field. Snapshot history naturally becomes a set of physical forks in singly linked chains.
 - **Minimal algorithms**: Topological traversal degenerates into simple O(N) linear backtracking, avoiding Git's more complex topology-sorting and multi-path reachability analysis.
@@ -92,11 +129,11 @@ LFV deliberately rejects Git-style DAG topology (multiple-parent nodes) for one 
 
 LFV treats content merging and historical-topology merging as two separate concerns.
 
-When users merge files, what they actually care about is whether the content has been unified, not whether multiple historical branches converge into the same Snapshot node. In the LFV interface, a merge is considered complete as soon as the resulting Objects are identical; there is no need to force convergence at the Snapshot level.
+When users merge files, what they actually care about is whether the content has been unified, not whether multiple historical branches converge into the same Snapshot node. In the LFV interface, a merge is considered complete once the resulting Objects are identical. There is no need to force convergence at the Snapshot level.
 
 Git, by contrast, expresses convergence through Commit topology itself. LFV intentionally separates content structure from historical structure. This separation greatly simplifies merge algorithms and makes the workflow easier for users to understand.
 
-## 8. `lfv mv` and `lfv relink` are separate commands
+## 10. `lfv mv` and `lfv relink` are separate commands
 
 `lfv mv <src> <dst>` performs path operations only. `<dst>` cannot be a `file-id`. `lfv relink <f_src> --onto <f_dst>` is dedicated to history continuation.
 
@@ -104,17 +141,30 @@ Allowing `lfv mv <src> <f_dst-id>` would mix path manipulation with history cont
 
 `lfv relink` also solves a second problem that `lfv mv` cannot: merging another file's history. A common case is when `<f_src>` contains a superset of `<f_dst>` and the user wants to preserve only one identity while splicing the full history chain together. This is a history-consolidation operation, fundamentally different from a rename.
 
-## 9. Only two storage object types
+## 11. Two storage object categories, each with two subtypes
 
-The only immutable storage objects in the repository are Object and Snapshot. All other concepts are mutable indexes.
+The truly immutable storage objects in the repository fall into two categories — **Object** and **Snapshot** — each with two subtypes. Everything else is mutable index (see `design.md §4.2`).
 
-## 10. Dual compression thresholds
+| Category | Subtype | Contents | Addressing |
+| --- | --- | --- | --- |
+| Object | **File Object** | Raw file bytes (compressed) | `blake3(raw bytes)` |
+| Object | **Tree Object** | Sorted `{path, file-object-hash}` manifest (JSON) | `blake3(canonical manifest)` |
+| Snapshot | **File Snapshot** | Event record for one file | `snap_<ULID>` |
+| Snapshot | **Tree Snapshot** | Event record for a working-tree state | `snap_<ULID>` |
+
+Both Object subtypes are stored in the same `objects/` bucket directory, content-addressed, fully immutable. Both Snapshot subtypes are append-only and follow the same JSON Lines format, but live in separate directories (`.lfv/files/<file-id>/` vs `.lfv/trees/`).
+
+**Why a Tree Object now exists**: LFV's use cases include whole-directory milestoning (e.g. "complete draft of this book"). A Tree Object makes this a first-class operation while preserving the core invariant — content identity is determined by hash, not by snapshot id. Two identical working-tree states produce the same Tree Object hash and share one entry in `objects/`, just as two files with identical content share one File Object.
+
+**Why Tree Object stores file-object-hashes, not file-snapshot-ids**: The node identity in LFV's history graph is content (object hash), not the metadata record (snapshot id). A Tree Object that references file-object-hashes is content-addressed end-to-end; referencing snapshot ids would couple the tree's identity to incidental metadata (message, timestamp), breaking deduplication and the content-node semantics.
+
+## 12. Dual compression thresholds
 
 `min_bytes` (default 4 KiB) and `max_bytes` (default 16 MiB) handle files that are too small or too large for compression. `blake3` is always computed from raw bytes. Uncompressed objects are stored as `.raw`; compressed objects are stored as `.zstd`.
 
 A single threshold cannot handle both edge cases. Very small files may grow after compression due to framing overhead. Very large files can create memory spikes during compression. Dual thresholds explicitly address both problems.
 
-## 11. SQLite as the index
+## 13. SQLite as the index
 
 Metadata requiring random updates—status tables, branches, tags, and global file indexes—lives in `index.db`.
 
@@ -122,7 +172,7 @@ The database is only a cache. The source of truth remains file-based.
 
 Status tables and branch pointers are mutable and require efficient indexed lookups and atomic updates. Plain-file approaches degrade significantly at scale. SQLite provides ACID transactions, efficient indexing, and single-file deployment without requiring a daemon or network service.
 
-## 12. Small-tool philosophy
+## 14. Small-tool philosophy
 
 CLI subcommands should remain clear, composable, and scriptable. LFV avoids premature abstraction toward graphical interfaces or services.
 

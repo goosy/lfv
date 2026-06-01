@@ -72,9 +72,6 @@ LFV (Lightweight File Versioning) 的目标：
 | 动作 | Action | 动作改变一个文件的状态。可用的动作包括 track、snap、untrack，还有两个没有对应命令的动作：modify（由用户修改文件达成）和 auto-track / auto-delete（由 LFV 在扫描时对 OS 文件新建/删除事件自动应用，详见 §6）。 |
 | LFV 可见 | 在 `.lfvignore` 匹配目录剪枝后，工作目录中剩余的文件 |
 
-> [!note] 注意
-> **所有上述概念都以"单个文件"为作用域**——这是 LFV 与 git 最本质的区别。
-
 ### 4.1 文件身份：file-id 与路径解耦
 
 `file-id` 是某个跟踪文件在仓库内部的稳定身份标识：
@@ -84,26 +81,37 @@ LFV (Lightweight File Versioning) 的目标：
 - 用户在 CLI 层面通过 **当前路径** 定位文件，CLI 内部经由状态表中的 `fullpath → file_id` 索引完成解析；
 - 跟踪文件的"当前路径"不存放于 `meta.yaml`，而是由状态表维护，并随 Snapshot 链的事件 **派生更新**——这是为了让仓库始终只有一份真理源（即 Snapshot 链），可变状态可重建。
 
-### 4.2 存储对象：Object 与 Snapshot
+### 4.2 存储对象：File Object、Tree Object、File Snapshot、Tree Snapshot
 
-LFV 仓库中 **真正的"存储对象"只有两类**：
+LFV 仓库中 **真正的"存储对象"分为两大类，各含两种子类型**：
 
-| 存储对象 | 内容 | 寻址方式 | 不可变性 |
-| ---- | ---- | ---- | ---- |
-| **Object** | 文件原始字节（压缩后） | 内容寻址：`blake3(content)` | 完全不可变（写一次） |
-| **Snapshot** | 事件记录：path、object 指针（可为 null）、消息、作者、时间、父快照ID、digest | 标识符寻址：`snap_<ULID>` | 仅 append，不重写 |
+| 大类 | 子类型 | 内容 | 寻址方式 | 不可变性 |
+| ---- | ---- | ---- | ---- | ---- |
+| Object | **File Object** | 文件原始字节（压缩后） | 内容寻址：`blake3(原始字节)` | 完全不可变（写一次） |
+| Object | **Tree Object** | 按路径排序的 `{path, file-object-hash}` 清单（规范化 JSON） | 内容寻址：`blake3(规范化清单)` | 完全不可变（写一次） |
+| Snapshot | **File Snapshot** | 单个文件的事件记录：path、file-object 指针（可为 null）、消息、作者、时间、父快照 id、digest | 标识符寻址：`snap_<ULID>` | 仅 append，不重写 |
+| Snapshot | **Tree Snapshot** | 工作目录整体状态的事件记录：tree-object 指针、消息、作者、时间、父快照 id、digest | 标识符寻址：`snap_<ULID>` | 仅 append，不重写 |
 
-其它一切（HEAD、branches、tags、文件状态、config）都是 **可变状态/索引**，不属于"存储对象"。可变状态出错可以重建（只要 Object + Snapshot 还在）；存储对象不可篡改，是仓库的真理之源（source of truth）。
+其它一切（HEAD、branches、tags、文件状态、config）都是 **可变状态/索引**，不属于"存储对象"。可变状态出错可以重建（只要 Object + Snapshot 还在）；存储对象不可篡改，是仓库的真理之源。
 
-关于 Snapshot ：
-- 整个文件生命周期就是 Snapshot 链。
-- Snapshot 自身承载 `path` 字段，路径（path）不是文件的身份。
-- **重命名/移动**也是不可篡改的历史事件——它和"新增"、"内容变更"、"删除"在结构上完全同形，仅靠对父快照的字段比对即可区分。
-  改名 = 追加一条新 Snapshot，删除 = 追加一条 `object=null` 的 Snapshot。
-- 每条 Snapshot **只有一个 parent 指针**，整体构成有向树（森林），这与 Git 的 DAG 图拓扑不同，分支出去即独立演化，不存在拓扑意义上的合并点。
-- 但在渲染和视觉层面上可以将同一 `file-id` 的快照视为一个。
+两种 Object 子类型均存放于同一 `objects/` 目录，按内容 hash 去重，完全不可变。两次内容完全相同的工作目录状态产生相同的 Tree Object hash，`objects/` 里只有一份，与两个文件内容相同时共享同一 File Object 完全一致。
 
-**没有 tree 对象**——这是 LFV 与 Git 最大的结构差异。Git 的 tree 用来描述「某次提交的目录清单」，而 LFV 的 Snapshot 天然只对应一个文件，直接指向 Object，无需中间层。
+关于 File Snapshot：
+- 整个文件生命周期就是 File Snapshot 链。
+- File Snapshot 自身承载 `path` 字段，路径不是文件的身份。
+- **重命名/移动**也是不可篡改的历史事件——结构上与"新增"、"内容变更"、"删除"完全同形，仅靠对父快照字段比对即可区分。
+- 每条 File Snapshot **只有一个 parent 指针**，整体构成有向树（森林）。分支出去即独立演化，不存在拓扑意义上的合并点。
+
+关于 Tree Snapshot：
+- Tree Snapshot 记录整个工作目录在某一时刻的里程碑状态。
+- 它指向一个 Tree Object（永不为 null），Tree Object 是当前 HEAD 下所有有有效 object 的跟踪文件的内容寻址清单。
+- Tree Snapshot 同样构成有向树（单 parent 指针），存放于 `.lfv/trees/<tree-id>/snapshots.log`。
+- tree 层完全可选：没有任何 Tree Snapshot 的仓库完全合法。
+
+**历史具有两个拓扑层**（见 `decisions.zh-cn.md §13、§18`）：
+- **Snapshot 层**：永远是有向树。每条 Snapshot 恰好有一个 parent 指针，是物理存储的内容。
+- **内容层**：以 object hash 为节点，将 Snapshot parent 关系投影到 object 身份上派生而来。单分支唯一性不变量（§6.9）保证此层在任意单条分支上无环，整体是 DAG。
+
 
 ### 4.3 可变索引：状态表、分支、HEAD、标签
 
@@ -122,6 +130,22 @@ LFV 仓库中 **真正的"存储对象"只有两类**：
 > - **例外**：已跟踪、盘上消失、待 `lfv snap` 记录当前 FS 状态的条目保留为 `modified`，`status` 输出时显示为 `D`（§6.5）。
 > - 对已跟踪且盘上仍存在的文件，`fullpath → file_id` 供 CLI 解析路径；盘上消失后仍可用 `file-id` 定位。
 
+### 4.4 Tree 相关概念
+
+| 概念 | 说明 |
+| ---- | ---- |
+| Tree Object | 内容寻址的 JSON 清单：当前 HEAD 下所有有有效（非 null）object 的跟踪文件，按路径排序的 `{path, file-object-hash}` 列表。与 File Object 一起存放于 `objects/`。 |
+| Tree Snapshot | 指向一个 Tree Object 的事件记录，有单一 parent 指针、消息、时间戳、作者和 `digest`。存放于 `.lfv/trees/<tree-id>/snapshots.log`。 |
+| tree-id | 首次创建 tree 时分配的稳定 ULID（类比 `file-id`），与任何路径或名称解耦。 |
+| Tree 分支 / Tree HEAD | 与文件分支和 HEAD 结构相同，但作用域是 `tree-id`。存放于 `index.db`。 |
+
+tree 层与 file 层是对同一 `objects/` 存储的**两个独立视图**：
+
+- `lfv log docs/note.md`——文件历史视图，沿该 file-id 的 File Snapshot 链游走
+- `lfv log --tree`——tree 历史视图，沿当前 tree-id 的 Tree Snapshot 链游走
+
+从一个 Tree Snapshot 出发，可通过 Tree Object 清单里的 file-object-hash 定位到某个文件在那个时刻的内容；进而在该文件的 Snapshot 链中查找 object hash 匹配的条目，即可找到对应的 File Snapshot（单分支唯一性不变量（§6.9）保证每条分支上至多有一个候选）。
+
 ## 5. 仓库结构
 
 ```
@@ -132,10 +156,12 @@ A/                                   # 工作目录
     ├── config.yaml                  # 仓库级配置（严格 YAML）
     ├── HEAD                         # 全局占位（保留，主要为兼容查看）
     ├── index.db                     # 状态、分支、标签、头部等索引（SQLite）
-    ├── objects/                     # 内容寻址对象存储
+    ├── objects/                     # 内容寻址对象存储（File Object + Tree Object）
     │   ├── ab/
-    │   │   ├── cdef0123...zstd      # zstd 压缩对象
-    │   │   └── cdef0123...raw       # 原样对象（过小/过大/不可压）
+    │   │   ├── cdef0123...zstd      # zstd 压缩 File Object
+    │   │   └── cdef0123...raw       # 原样 File Object（过小/过大/不可压）
+    │   ├── 7f/
+    │   │   └── a3bc9d12...raw       # Tree Object（清单 JSON，通常较小 → .raw）
     │   └── ...
     ├── files/                       # 每个跟踪文件的元数据
     │   ├── <file-id>/
@@ -144,6 +170,12 @@ A/                                   # 工作目录
     │   │   ├── tags.yaml            # 该文件的标签表
     │   │   └── snapshots.log        # append-only 的快照记录（JSON Lines）
     │   └── ...
+    ├── trees/                       # 每个 tree 的元数据（与 files/ 对称）
+    │   ├── <tree-id>/
+    │   ├── meta.yaml                # tree 级元数据（创建时间、显示名称）
+    │   ├── branches.yaml            # 该 tree 的分支表
+    │   ├── tags.yaml                # 该 tree 的标签表
+    │   └── snapshots.log            # append-only 的 tree 快照记录（JSON Lines）
     └── logs/                        # CLI 操作日志（可选，便于调试）
 ```
 
@@ -224,6 +256,42 @@ LFV 不在 Snapshot 中显式存"事件类型"字段，而是根据 `(parent, pa
 > 1. 单文件场景下，用户经常需要在 `log` 输出里凭肉眼按时间挑选快照；ULID 的可读性远好于纯 hash；
 > 2. 防篡改职责交给单独的 `digest` 字段，语义清晰，便于 `verify` 命令针对性校验；
 > 3. id 与 digest 解耦，将来想增删元数据字段时不会引起 id 漂移。
+
+### 5.3 Tree Snapshot 与 Tree Object 格式
+
+**Tree Snapshot**（`trees/<tree-id>/snapshots.log`，每行一个 JSON 对象）：
+
+```json
+{
+  "id": "snap_01HABC...",
+  "branch": "main",
+  "parent": "snap_01HABZ...",
+  "object": "blake3:7fa3bc9d...",
+  "created_at": "2026-05-17T10:00:00Z",
+  "author": "goosy",
+  "message": "第三章完成",
+  "tags": [],
+  "digest": "blake3:fedcba98..."
+}
+```
+
+与 File Snapshot 的区别：无 `path` 字段（tree 无需重定位路径），`object` 不可为 null（tree 快照始终记录真实状态——"整个工作目录被删除"在 tree 层没有意义）。
+
+**Tree Object**（存放于 `objects/`，内容寻址）：
+
+```json
+[
+  { "path": "docs/ch1.md",      "object": "blake3:abc123..." },
+  { "path": "docs/ch2.md",      "object": "blake3:def456..." },
+  { "path": "docs/ch3.md",      "object": "blake3:ghi789..." }
+]
+```
+
+条目按 `path` 字典序排列后序列化。规范化 JSON（无多余空白，键顺序固定）经 `blake3` 哈希得到 Tree Object 的身份。两次内容完全相同的工作目录状态——无论何时、以何种方式达到——产生相同的 Tree Object hash，`objects/` 里只有一份条目。
+
+Tree Object 通常很小（每个跟踪文件一行），低于 `min_bytes` 压缩下限，以 `.raw` 存储。
+
+**对比两个 Tree Snapshot**：逐条比对各自 Tree Object 清单。`path` 相同且 `object` hash 相同——未变；`path` 相同但 `object` hash 不同——已修改；仅出现在其中一个清单里——新增或删除。
 
 ## 6. 文件生命周期事件
 
