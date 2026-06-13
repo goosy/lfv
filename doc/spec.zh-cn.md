@@ -40,7 +40,7 @@ LFV (Lightweight File Versioning) 的目标：
    - 为该文件创建带注释的快照；
    - 查看该文件的历史快照列表；
    - 对比任意两个快照（或快照与当前内容）；
-   - 回溯（rewind）到某个历史快照——回溯时 **自动建立新分支**，绝不破坏既有历史。
+   - 回溯（rewind）到某个历史快照——回溯时 **自动建立新分支保存旧路径**，绝不破坏既有历史。
 3. 每个文件拥有 **独立的**：历史线、分支集合、标签集合。
 4. 提供良好的可移植性：`.lfv` 目录可以随工作目录一起拷贝/同步，迁移后行为一致。
 5. 数据存储紧凑：通过内容哈希去重和压缩，避免简单备份导致的存储膨胀。
@@ -49,7 +49,7 @@ LFV (Lightweight File Versioning) 的目标：
 
 - **多文件原子提交**：每次快照只针对单个文件，不存在"一次提交多个文件"的语义。
 - **分布式协作**：不实现 push / pull / remote / merge 等多用户协同语义。`.lfv` 通过外部同步（如 NAS、网盘）共享即可，但不解决并发冲突。
-- **完整的合并算法**：不为同一文件的两个分支提供自动 3-way merge；用户决定保留哪个分支即可。
+- **合并范围限制**：`merge` / `rebase` 仅针对单个文件的分支，不跨文件协调。
 - **替代 git**：在源代码工程场景下应继续使用 git；LFV 只服务"文件中心"场景。
 - **图形界面**：1.0 版本只提供 CLI；GUI 列为后续可能的扩展。
 - **暂存操作**：一律"工作区即快照应用部分"。
@@ -80,6 +80,11 @@ LFV 的快照是 **append-only 的事件记录层**，以 ULID 寻址，记录"�
 
 所有快照 append-only，不会重写已有快照。
 
+> [!note] File Object 与历史的关系
+> File Object 本身只是内容单元，不携带任何历史信息——它没有父子关系，不知道自己属于哪条分支，也不知道自己在哪个时间点产生。历史信息完全由 Snapshot 链承载。
+> 凡是需要历史上下文的操作（`lfv log`、`lfv merge`、`lfv rebase`），其参数必须是 `<FS-ish>`（分支名或快照 id），不能是纯粹的 file-object hash——后者仅标识"内容是什么"，不标识"历史在哪里"。
+> `<FO-ish>` 中的 file-id、路径、tag、snap-id、branch 均可在需要内容的场合使用（见 §4 导语）。
+
 #### 3.2.1 File Object
 
 File Object 是单个文件原始字节的内容寻址存储单元。它的身份标识为文件原始内容的 `blake3` 哈希——不同路径或历史的文件，若内容相同，共享同一个 File Object。File Object 完全不可变：写入一次，永不修改。存储细节（压缩、分桶、去重）见 §6.1。
@@ -88,7 +93,7 @@ File Object 是单个文件原始字节的内容寻址存储单元。它的身�
 
 - **首次跟踪时**分配一个独立的 ULID。
 - 与文件路径**无任何派生关系**，不会因改名、移动而变化；文件删除后 `file-id` 依然有效。
-- 文件的"当前路径"由可变索引（§3.3）维护，并随 Snapshot 链上的事件持续派生更新——Snapshot 链是唯一真理源，可变状态均可从中重建。
+- 文件的"当前路径"由可变索引（§3.4）维护，并随 Snapshot 链上的事件持续派生更新——Snapshot 链是唯一真理源，可变状态均可从中重建。
 
 #### 3.2.2 Tree Object
 
@@ -134,7 +139,7 @@ Tree Snapshot 与 File Snapshot 结构对称，但字段有以下差异：
 - `path` 字段为空（tree 不需要定位路径）。
 - `object` 不可为 null（tree 快照始终指向一个 Tree Object）。
 
-tree 层没有分支概念，因此也没有 `branches.yaml`。
+树面（tree plane）没有分支概念，因此也没有 `branches.yaml`。
 
 全局快照对用户来说可选：仓库可以没有任何 Tree Snapshot。
 
@@ -142,20 +147,50 @@ Tree Snapshot 同样只有一个 parent 指针，构成有向树，所有 Tree S
 
 从一个 Tree Snapshot 出发，可通过 Tree Object 清单里的 file-object-hash 定位到某个文件在那个时刻的内容；进而在该文件的 Snapshot 链中查找 object hash 匹配的条目，即可找到对应的 File Snapshot（单分支唯一性不变量保证每条分支上至多有一个候选）。
 
-#### 3.2.5 两层拓扑
+#### 3.2.5 拓扑面
 
-LFV 的历史具有两个独立的拓扑层（见 `decisions.zh-cn.md §13、§18`）：
+LFV 的历史具有两个独立的拓扑面（见 `decisions.zh-cn.md §13、§18`）：
 
-- **Snapshot 层**（物理存储）：永远是有向树，每条 Snapshot 恰好有一个 parent 指针，结构永不改变。
-- **内容层**（派生视图）：以 object hash 为节点，将 Snapshot parent 关系投影到 object 身份上。分支对象唯一性保证此层在任意单条分支上无环，整体是 DAG。
+- **快照拓扑面**（物理存储）：永远是有向树，每条 Snapshot 恰好有一个 parent 指针，结构永不改变。
+- **内容拓扑面**（派生视图）：以 object hash 为节点，将 Snapshot parent 关系投影到 object 身份上形成的 DAG 图。分支对象唯一性保证此面在任意单条分支上不会有回环。
 
-### 3.3 可变索引（Mutable Index）
+即，object 与 snapshot 是解耦关系，前者只有内容，后者描述拓扑，一个 object 可以有多个 snapshot 时间线经过。
+
+### 3.3 快照同的判定和同的祖先
+
+在 LFV 中，不同的快照可能指向同一个 File Object，LFV 称这２个快照**同的(co-referent)**，很多 LFV 操作就是建立在`同的`的基础上。
+
+比如变基和合并操作，就需要定位的同的祖先：在两条分支的 Snapshot 链中，分别向上回溯，找到各自历史上都曾出现过且`同的`的最近节点或节点对：
+
+- **base-snap-ours**：本分支历史中指向共同 file-object 的那条 Snapshot
+- **base-snap-theirs**：目标分支历史中指向同一 file-object 的那条 Snapshot
+- **base-object**：两者共同指向的 file-object（内容相同，只有一份）
+
+两分支的同的祖先 snap 可能是同一个，也可能是不同（当两条分支各自独立经历了相同内容时），所以base-snap-ours与base-snap-theirs往往并不是同一个快照。基于这个同的祖先的合并操作，特别是同的祖先非同一个快照的更普遍情况下的合并，LFV 称之为4路合并(4-way merge)。
+
+### 3.4 可变索引（Mutable Index）
 
 LFV 维护一个可重建的**可变索引**（Mutable Index）作为工作区状态缓存，避免每次命令都全量扫描文件系统；推荐实现为嵌入式数据库。存储对象（Object）与 Snapshot 链是仓库的唯一真理源，索引损坏时可随时从真理源重建。详见 §6.5。
 
 ## 4. CLI 功能规范
 
-> 约定：`<file>` 指工作目录内某个文件的相对或绝对路径；CLI 在内部统一规范为相对于仓库根的相对路径。
+以下参数约定，最终解析为4个存储对象之一(File Object、Tree Object、File Snapshot、Tree Snapshot)
+
+- `<FO-ish>` 最终解析为 File Object 的参数，包括：
+  - `<file>` 指工作目录内某个文件的相对或绝对路径；CLI 在内部统一规范为相对于仓库根的相对路径；工作目录未保存的文件版本，也当成一个特殊的 File Object
+  - `<file-id>` 文件身份标识ULID；
+  - `<tag>` 标签名称；
+  - `<snap-id>` 快照也会最终解析为 File Object
+  - `<branch>` 分支HEAD 最终解析为 File Object
+- `<FS-ish>` 最终解析为 File Snapshot 的参数，包括：
+  - `<snap-id>` 某个快照标识；
+  - `<branch>` 分支名称；
+- `<TO-ish>` 最终解析为 Tree Object 的参数，包括：
+  - `<tree-id>` 树身份标识ULID；
+  - `<T:tag>` 树标签名称；
+  - `<T:snap-id>` 某个树快照对应的 Tree Object；
+- `<TS-ish>` 最终解析为 Tree Snapshot 的参数，它只有：
+  - `<T:snap-id>` 某个树快照标识；
 
 ### 4.1 仓库管理
 
@@ -169,11 +204,11 @@ LFV 维护一个可重建的**可变索引**（Mutable Index）作为工作区�
 | 命令 | 说明 |
 | ---- | ---- |
 | `lfv track [<file>]` | 把某文件加入跟踪。指定 `<file>` 时，若路径匹配 `.lfvignore` 则报错；否则从 `config.yaml` 中 untracked 列表移除；若该路径此前是 untrack 而非 delete，则复用原 `file-id`，并将状态表更新为 `modified`（无历史快照时等待首次 `lfv snap`）。无 file 参数时，自动扫描所有可跟踪且尚未进入状态表的文件并加入跟踪。 |
-| `lfv untrack <file>` | 停止跟踪：LFV不可见则报错；可见则更新至 `config.yaml` 动态 untracked 列表；若盘上存在则状态表登记 `untracked`，否则仅 config；历史保留，可 `lfv track` / `lfv revive`。 |
-| `lfv mv <old> <new>` | 把 `<old>` 路径对应的跟踪文件迁移到 `<new>` 路径。`<old>` 和 `<new>` 均只接受路径，不接受 file-id。是否在工作树上执行实际的文件移动，由 §7.6 规定。 |
-| `lfv relink <f_src> --onto <f_dst>` | 把 f_src 的历史续接到 f_dst 上，声明"f_src 是 f_dst 的延续"。f_src 的快照（若有）以新生 ULID 追加到 f_dst 历史末尾；f_src 的 `file_states` 跟踪行取消，但其 `snapshots.log` 完整保留。详见 §7.7。 |
+| `lfv untrack <FO-ish>` | 停止跟踪：LFV不可见则报错；可见则更新至 `config.yaml` 动态 untracked 列表；若盘上存在则状态表登记 `untracked`，否则仅 config；历史保留，可 `lfv track` / `lfv revive`。 |
+| `lfv mv <old-file> <new-file>` | 把 `<old-file>` 路径对应的跟踪文件迁移到 `<new-file>` 路径。`<old-file>` 和 `<new-file>` 均只接受路径，不接受 file-id。是否在工作树上执行实际的文件移动，由 §7.6 规定。 |
+| `lfv relink <src-file-id> --onto <dst-file-id>` | 将 src-file-id 当前分支的历史续接到 dst-file-id 当前分支末尾，盘上文件改由 dst-file-id 标识，src-file-id 退役。**仅针对两个 file-id 各自当前分支**，不涉及其他分支，不做 4-way merge 内容合并。专为误产生新文件的场景设计，不应作为日常命令。详见 §7.6。 |
 | `lfv delete <file>` | 在状态表中将该文件设置为 modified，同时删除该文件。后续 `lfv snap` 时检测到它是 modified 且文件不存在时，追加一条 `object = null` 的 Snapshot，并移除出 `config.yaml` 中 untracked 列表。更新状态表的缓存状态。它的历史完整保留，随时可 `lfv revive`。 |
-| `lfv revive <ref>` | 复活已删除的文件。`<ref>` 可以是 `file-id`、最近已知路径或某条 Snapshot id。自动新建分支（`revive/<...>`），从所选快照恢复内容到工作树。 |
+| `lfv revive <FO-ish>` | 复活已删除的文件。`<FO-ish>` 接受 file-id、路径（LFV 内部通过 Snapshot 链解析为 file-id）、snap-id 或 branch 名。自动新建分支（`revive/<...>`），从所选快照恢复内容到工作树。 |
 | `lfv list [--deleted]` | 列出所有被跟踪文件，每个记录包括路径、当前分支、最新快照ID及摘要。默认仅列活跃文件，`--deleted` 同时列出最新 Snapshot 的 `object = null` 的文件。 |
 
 ### 4.3 状态与快照
@@ -182,9 +217,9 @@ LFV 维护一个可重建的**可变索引**（Mutable Index）作为工作区�
 | ---- | ---- |
 | `lfv status [<file>]` | **省略 `<file>` 时列出所有 `modified` 的跟踪文件**；执行前按 §7.3 做惰性扫描。默认输出仅含 tracked 变更，每行带 `file-id`（`f_*`）。`--include-untracked` 见 §4.3.2。`--refresh` 强制全量刷新扫描缓存。指定 `<file>` 时仅显示该文件。 |
 | `lfv snap [<file>] [-m <msg>]` | 为某文件创建新快照。**省略 `<file>` 时，自动对所有 `modified` 状态的跟踪文件批量拍照**。若工作区内容未变化则拒绝（除非 `--allow-empty`）。若违反 §7.10 分支对象唯一性，则拒绝创建快照并提示用户执行 `lfv rewind`。`--tree` 参数见 §4.3.3。 |
-| `lfv log <file>` | 列出该文件的快照历史，附带 tree 关联信息（来自 `tree_file_refs` 表）。支持 `--branch <name>`、`--graph`、`--limit N`。 |
-| `lfv log --tree` | 列出 tree 历史视图：沿 Tree Snapshot 链，每个节点显示 message、标签、时间戳。 |
-| `lfv show <file> <snap>` | 输出某个快照的元数据；`--content` 输出内容；`--out <path>` 导出。 |
+| `lfv log <FS-ish>` | 列出指定分支或快照所在分支的历史，附带 tree 关联信息（来自 `tree_file_refs` 表）。`<FS-ish>` 为分支名时显示该分支历史；为 snap-id 时显示该快照所在分支的历史。`--all` 显示该文件所有分支的历史；`--graph` 以 ASCII 图形式渲染分支拓扑；`--limit N` 限制条数。 |
+| `lfv log --tree` | 列出树面（tree plane）历史视图：沿 Tree Snapshot 链，每个节点显示 message、标签、时间戳。 |
+| `lfv show <FO-ish>` | 输出某个快照的元数据；`--content` 输出内容；`--out <path>` 导出。 |
 
 说明：
 - `lfv status` 命令对于 `modified` 文件，被删除的文件显示为 `D`，路径与上个快照不符的显示为 `R`，没有快照的显示为 `A`，其它的显示为 `M`，对内容和路径都有改变的，显示为 `R+M`。
@@ -200,7 +235,7 @@ $ lfv status --include-untracked
 Tracked files (changes):
   M   f_01HA7BCD...   docs/note.md
                       content changed (12.4 KB -> 12.7 KB)
-  R   f_01HA7XYZ...   docs/photo.jpg -> docs/2026/photo.jpg
+  R   f_01HA7ACE...   docs/photo.jpg -> docs/2026/photo.jpg
                       auto-detected (identical content hash)
   D   f_01HA7DEF...   docs/old-note.md
                       file missing on disk; will be deleted on next `lfv snap`
@@ -255,11 +290,12 @@ lfv snap --tree --tag v1.0 -m "第一版完成"   # 创建时同步打标签
 
 ### 4.4 对比
 
+工作区当前内容可作为一个未保存的特殊 `File Object`，可以用 `f_/path/to/file` 作为字面量。
+
 | 命令 | 说明 |
 | ---- | ---- |
-| `lfv diff <file>` | 工作区 vs. 最新快照。 |
-| `lfv diff <file> <snap>` | 工作区 vs. 指定快照。 |
-| `lfv diff <file> <snapA> <snapB>` | 两快照之间。 |
+| `lfv diff <FO-ish>` | 工作区 vs. 指定 FO-ish 所指向的 File Object。它相当于省略第二参数 `f_/path/to/file`，路径由第一个参数推断。 |
+| `lfv diff <FO-ish-A> <FO-ish-B>` | 两个 File Object 之间的对比。（既可以是不同文件，也可以是同文件不同版本） |
 
 文本文件使用基于行的 diff（默认上下文 3 行）；二进制文件仅显示元数据差异（大小、hash）。
 
@@ -267,14 +303,14 @@ lfv snap --tree --tag v1.0 -m "第一版完成"   # 创建时同步打标签
 
 | 命令 | 说明 |
 | ---- | ---- |
-| `lfv rewind <file> <snap>` | 把工作区文件内容恢复到指定快照。**自动新建分支**（命名规则 `rewind/<snap-short>/<n>`），并将 HEAD 切到新分支。当用于解决环回事件时（§7.10），将执行 `lfv rewind <file> <snap_ap>` snap_ap 为同 hash 祖先的父照。 |
-| `lfv rewind <t:tag|snap-id>` | 把工作区还原到指定 Tree Snapshot 的状态。更新 `.lfv/trees/HEAD`；对每个 file 采用 FF 优先策略（详见 §4.5.1）。 |
+| `lfv rewind <file> <FS-ish>` | 把工作区文件内容恢复到 `<FS-ish>` 所指向的快照对应的 File Object。**创建新分支指向原HEAD**，并将当前分支 HEAD 切到目标快照。当用于解决环回事件时（§7.10），将执行 `lfv rewind <file> <base-snap-ours>`，base-snap-ours 为同 hash 祖先的父快照。 |
+| `lfv rewind <TS-ish>` | 把工作区还原到指定 Tree Snapshot 的状态。更新 `.lfv/trees/HEAD`；对每个 file 采用 FF 优先策略（详见 §4.5.1）。 |
 | `lfv branches <file>` | 列出该文件的全部分支。 |
-| `lfv switch <file> <branch>` | 切换该文件的当前分支（同时把工作区内容更新为该分支头部快照）。仅针对 file 分支，不操作 tree。 |
+| `lfv switch <file> <branch>` | 切换该文件的当前分支（同时把工作区内容更新为该分支头部快照）。仅针对文件面，不操作树面。 |
 | `lfv branch-rename <file> <old> <new>` | 重命名分支。 |
 | `lfv branch-delete <file> <branch>` | 删除分支（仅删除指针，对象保留以防共享）。 |
 
-#### 4.5.1 `lfv rewind t:<tag|snap-id>` 的执行流程
+#### 4.5.1 `lfv rewind <TS-ish>` 的执行流程
 
 **前置校验**：检查工作区是否存在 modified 但尚无 file-object 的文件（新建、修改或删除但未 `lfv snap`）。若存在则拒绝执行：
 
@@ -284,7 +320,9 @@ error: the following files have unsaved changes (no file-object yet):
 run `lfv snap` first, or discard changes manually.
 ```
 
-**效果**：将整个工作树还原为目标 Tree Snapshot 所记录的状态，并推进 tree HEAD。对每个跟踪文件采用 FF 优先策略：若目标内容已可经由某个现有分支 HEAD 访问，则直接切换分支，不新建；否则创建新的 rewind 分支。目标快照之后新增的文件从工作区删除；快照中存在而当前已 untracked 或 deleted 的文件将字节写回磁盘，交由下次扫描接管。详细的逐文件算法见 §7.9。
+**实际执行**：满足前置后，对 `<TS-ish>` 涉及的每一个文件，都执行一遍 `lfv rewind <file> <FS-ish>`，其中 `<file>` `<FS-ish>` 从  `<TS-ish>` 中推导。同时将 tree HEAD 指向 `<TS-ish>`。
+
+**效果**：将整个工作树还原为目标 Tree Snapshot 所记录的状态，并推进 tree HEAD。对每个跟踪文件采用 FF 优先策略：若目标内容已可经由某个现有分支 HEAD 访问，则直接切换分支，不新建；否则创建新的分支用于保留原分支指向，将原分支定向至目标快照。目标快照之后新增的文件从工作区删除；快照中存在而当前已 untracked 或 deleted 的文件将字节写回磁盘，交由下次扫描接管。详细的逐文件算法见 §7.9。
 
 ### 4.6 标签
 
@@ -299,7 +337,110 @@ run `lfv snap` first, or discard changes manually.
 
 用户输入的标签名不允许包含 `:`（命名空间隔离）。
 
-### 4.7 维护
+### 4.7 合并与变基
+
+合并与变基操作均**仅针对文件面（file plane）分支**，与树面（tree plane）无关。两者都以**共的祖先** 为基点，通过 4-way merge 逐步重放变化，并引入冲突处理机制。即内容层 file-object 是对齐的坐标。
+
+> [!note] 注意
+> `lfv merge` 或 `lfv rebase`，与 `lfv relink` 有区别：
+> - `lfv merge` 或 `lfv rebase` 是同一个文件的历史版本操作，进行4路合并。
+> - `lfv relink` 涉及2个文件 ID 合并为一个文件 ID，不涉及3路合并内容，它只简单地把一个文件的当前分支历史挂到另一个文件的当前分支历史末尾。
+
+**参数约束**：`<target>` 只接受 `<FS-ish>`（分支名或快照 id）——file-object 不携带历史信息，无法作为历史操作的参数（见 §3.2）。分支名等价于该分支当前 HEAD 所在的快照。
+
+`lfv merge` 与 `lfv rebase` 均需先定位同的祖先（§3.3）。若无法找到任何同的祖先，报错拒绝操作：
+
+```
+error: no common ancestor found between branch 'main' and 'feature'
+       cannot merge/rebase without a shared content base.
+```
+
+#### 4.7.1 `lfv rebase <file> <FS-ish>`
+
+在本分支的 base-snap-ours 节点处插入目标分支的 base-snap-theirs 到 HEAD 之间的历史。
+
+**语义**：
+- 先将本分支 HEAD rewind 到共同祖先节点对应的快照 base-snap-ours（分支名保持不变，旧 HEAD 位置由新建的 `rebase/<target-short>/<n>` 分支来保留）
+- 再以目标分支的 base-snap-theirs 为基点，把目标分支从 base-snap-theirs 之后到其 HEAD 的每一步 file-object 变化，依次以 4-way merge 在本分支上重建，产生一系列新的 file-object 和对应 Snapshot
+- 最后把本分支原来从 base-snap-ours 之后到原 HEAD 的每一步 file-object 变化，依次以 4-way merge 继续应用在本分支上，产生一系列新的 file-object 和对应 Snapshot，本分支 HEAD 推进到新链末端
+
+**执行步骤**：
+
+1. 定位同的祖先（§3.3）；分别收集目标分支从 base-snap-theirs 之后到其 HEAD、以及本分支从 base-snap-ours 之后到原 HEAD 的有序 Snapshot 列表。
+2. 将本分支 HEAD rewind 到 base-snap-ours（保留当前分支名，新建分支指向原 HEAD）。
+3. 对目标分支的待应用序列中的每一步 `snap_i`（按时间顺序）：
+   - base = `snap_{i-1}` 的 file-object（首步用 base-object）
+   - ours = 本分支当前落脚点的 file-object
+   - theirs = `snap_i` 的 file-object
+   - 执行 4-way merge，产生新 file-object，追加新 Snapshot
+4. 对本分支原来从 base-snap-ours 之后的待重放序列，重复步骤 3 的处理逻辑，将本分支的历史重建在目标分支历史之后。
+   - 若遇**冲突**：暂停，输出冲突标记，等待用户解决后继续（见 §4.7.3）
+   - 若遇**环回**：提示用户二选一——rewind 跳过该步（接受后自动继续），或 abort 回滚（见 §4.7.4）
+
+**历史保留**：rebase 产生的是新的 Snapshot 链，不修改 Snapshot 层的任何已有记录；原 HEAD 位置由新建分支保留，随时可查。
+
+#### 4.7.2 `lfv merge <file> <FS-ish>`
+
+在本分支的当前 HEAD 处插入目标分支的 base-snap-theirs 到 HEAD 之间的历史。
+
+**语义**：
+- 保持本分支当前 HEAD 不动（分支名与位置均不变）
+- 以共同祖先 base-object 为基准，把目标分支从 base-snap-theirs 之后到其 HEAD 的每一步 file-object 变化，依次以 4-way merge 应用在本分支 HEAD 之上，产生一系列新的 file-object 和对应 Snapshot，本分支 HEAD 推进到新链末端
+
+**执行步骤**：
+
+1. 定位同的祖先（§3.3）；收集目标分支从 base-snap-theirs 之后到其 HEAD 的有序 Snapshot 列表（待应用序列）。
+2. 对待应用序列中的每一步 `snap_i`（按时间顺序）：
+   - base = `snap_{i-1}` 的 file-object（首步用 base-object）
+   - ours = 本分支当前落脚点的 file-object
+   - theirs = `snap_i` 的 file-object
+   - 执行 4-way merge，产生新 file-object，追加新 Snapshot
+   - 若遇**冲突**或**环回**：处理方式同 §4.7.3 / §4.7.4
+
+#### 4.7.3 冲突处理
+
+4-way merge 产生冲突时，LFV 暂停操作，将冲突标记写入工作区文件：
+
+```
+<<<<<<< ours (main)
+本分支的内容
+=======
+目标分支的内容
+>>>>>>> theirs (feature / snap_01HXYZ)
+```
+
+用户手动编辑解决冲突后，执行：
+
+```bash
+lfv merge --continue   # 或 lfv rebase --continue
+```
+
+LFV 将解决后的工作区内容作为新 file-object，追加 Snapshot，继续下一步重放。
+
+若用户放弃，执行：
+
+```bash
+lfv merge --abort   # 或 lfv rebase --abort
+```
+
+LFV 将分支 HEAD 恢复到操作前的原始状态，工作区内容一并还原，所有已追加的中间 Snapshot 通过分支指针回退隐藏（Snapshot 本身保留在 append-only 日志中，但不再被任何分支引用）。
+
+#### 4.7.4 环回处理
+
+重放过程中若某步产生的 file-object 已在当前分支历史中出现（违反分支对象唯一性，§7.10），LFV 暂停并提示：
+
+```
+warning: step snap_01HXYZ produces content already present in branch 'main'
+         (object blake3:abc123...)
+options:
+  [r] lfv rewind to skip this step and continue rebase/merge
+  [a] abort — restore branch to original state
+```
+
+- 选择 **rewind**：LFV 对当前步执行 rewind（将中间历史移入 `detour_*` 分支），然后**自动继续**后续重放步骤，无需用户再次确认。
+- 选择 **abort**：同 §4.7.5 的 abort 语义，分支 HEAD 恢复原始状态。
+
+### 4.8 维护
 
 | 命令 | 说明 |
 | ---- | ---- |
@@ -409,7 +550,7 @@ lfv relink f_01HA7EEE --onto f_01HA7BCD
 # -> f_01HA7EEE 退役（file_states 取消，snapshots.log 保留，不留活跃痕迹）
 ```
 
-### 5.8 全局快照（tree 层）
+### 5.8 全局快照（tree plane）
 
 ```bash
 # 编辑完当前版本的所有文件后，先确保全部 snap
@@ -473,7 +614,7 @@ A/                                   # 工作目录
   - **floor**：`size < min_bytes`（默认 **4 KiB**，4096 字节）——过小，帧开销可能使压缩后更大；
   - **ceiling**：`size >= max_bytes`（默认 **16 MiB**，16777216 字节）——避免大文件整段读入内存时的峰值；
   - **无效压缩**：尝试压缩后 `compressed_len >= original_len`（`reject_if_larger`，默认 **true**）——对已压缩二进制等无收益内容；
-- 跨文件共享：相同内容只存一份对象，节省空间。
+- 跨文件跨分支共享：相同内容只存一份对象，节省空间。
 
 #### 6.1.1 压缩默认配置（`config.yaml`）
 
@@ -610,7 +751,7 @@ Tree Object 通常很小（每个跟踪文件一行），低于 `min_bytes` 压�
 | `scan_meta` | 扫描元数据：`last_completed_at`、`.lfvignore` 与 `config.yaml` 的 mtime，供增量扫描失效判定。 | ✓ |
 | `branches` | 每个文件的分支指针缓存。真理源为 `.lfv/<file-id>/branches.yaml`。 | ✓ |
 | `tags` | 每个文件的标签缓存。真理源为 `.lfv/<file-id>/tags.yaml` 及 `.lfv/trees/tags.yaml`。 | ✓ |
-| `tree_file_refs` | tree 维度的反向引用缓存。真理源为 `.lfv/trees/snapshots.log` + `objects/`，`rebuild-index` 时重建；`lfv snap --tree` 时写入。供 `lfv log <file>` 渲染时附加 tree 关联信息。 | ✓ |
+| `tree_file_refs` | tree 维度的反向引用缓存。真理源为 `.lfv/trees/snapshots.log` + `objects/`，`rebuild-index` 时重建；`lfv snap --tree` 时写入。供 `lfv log <FS-ish>` 渲染时附加 tree 关联信息。 | ✓ |
 
 > [!note] file_states 说明
 > - **正常仅登记 LFV 可见、且工作树上当前存在的文件**（`stat` 成功且不匹配 `.lfvignore` 的路径）；
@@ -660,7 +801,7 @@ CREATE TABLE tree_file_refs (
 );
 ```
 
-**`tree_file_refs` 的写入与重建**：`lfv snap --tree` 创建 Tree Snapshot 时展开 Tree Object 清单，逐 file 插入一行；`rebuild-index` 时通过遍历所有 Tree Snapshot 重建。供 `lfv log <file>` 渲染时附加 tree 关联信息：
+**`tree_file_refs` 的写入与重建**：`lfv snap --tree` 创建 Tree Snapshot 时展开 Tree Object 清单，逐 file 插入一行；`rebuild-index` 时通过遍历所有 Tree Snapshot 重建。供 `lfv log <FS-ish>` 渲染时附加 tree 关联信息：
 
 ```
 snap_01HXYZ  M  docs/note.md   "add chapter 2"
@@ -839,7 +980,7 @@ t:release: snap_01HZZZ...
 
 ### 7.5 rename / move（lfv mv）
 
-**`lfv mv` 只做路径操作**：`<src>` 和 `<dst>` 均只允许路径，不接受 file-id。用于文件在磁盘上仍存在（或刚被 OS 移动）时的改名/移动。不允许 `<dst>` 为 file-id 的主要原因是：它会造成心智混乱——用户可能误以为保留的 file-id 是 `<dst>` 那一侧。若需要把历史续接到另一个 file-id，请使用 `lfv relink`（见 §7.7）。
+**`lfv mv` 只做路径操作**：`<src>` 和 `<dst>` 均只允许路径，不接受 file-id。用于文件在磁盘上仍存在（或刚被 OS 移动）时的改名/移动。不允许 `<dst>` 为 file-id 的主要原因是：它会造成心智混乱——用户可能误以为保留的 file-id 是 `<dst>` 那一侧。若需要把历史续接到另一个 file-id，请使用 `lfv relink`（见 §7.6）。
 
 - `lfv mv <src> <dst>`：把 src 对应的跟踪文件迁移到 dst 路径。
   - 若工作树上 src 路径仍存在且 dst 不存在，CLI 会先把文件移到 dst，再追加快照（原子语义）。
@@ -850,33 +991,33 @@ t:release: snap_01HZZZ...
   - 自动识别仅在内容哈希 **完全一致** 时生效（`rename.autodetect`，默认开启）。一旦命中，`lfv status` 直接以 `R` 行显示并自动配对。
   - 若 OS 移动文件 **并且** 内容也变了，自动识别会失败——`lfv status` 会同时显示一条 `D` 行（旧 file-id 在原路径消失）和一条 `A` 行（新路径上的新 file-id）。用户检视后用 `lfv relink <new-file> --onto <old-file>` 显式声明历史续接。
   - 自动识别也可被关闭（适用于成批改名 + 编辑的场景，避免误配对）。
-- 历史回溯：`lfv log <file>` 会以"`R` 旧路径 -> 新路径"形式渲染 rename 事件，与 `A`(add) / `M`(modify) / `D`(delete) / `R+M`(rename+modify) 并列（见 §6.2.1）。
+- 历史回溯：`lfv log <FS-ish>` 会以"`R` 旧路径 -> 新路径"形式渲染 rename 事件，与 `A`(add) / `M`(modify) / `D`(delete) / `R+M`(rename+modify) 并列（见 §6.2.1）。
 
 ### 7.6 历史续接（lfv relink）
 
-`lfv relink <f_src> --onto <f_dst>` 用于将 f_src 的历史在 f_dst 的历史结尾重新接续，同时盘上 f_src 对应文件将以后与 <f_dst> 绑定。如果 f_src 还没有历史，则 f_dst 的历史维护不变。
+`lfv relink <src-file-id> --onto <dst-file-id>` 用于将 src-file-id **当前分支**的历史在 dst-file-id **当前分支**的末尾续接，同时盘上 src-file-id 对应文件将以后与 dst-file-id 绑定。**仅操作两个 file-id 各自当前分支，不涉及其他分支，不做 4-way merge 内容合并。**
 
-它的一个典型应用场景是：扫描器无法自动配对的 rename——用户在 OS 层修改了路径和内容，LFV 将其识别为独立的 `D`（f_dst）+ `A`（f_src）两个事件，由用户手动声明"f_src 是 f_dst 的延续"。
+该命令专为"用户误操作导致 LFV 产生了新的 file-id"的场景设计（典型场景：OS 层改名+改内容导致 auto-track 分配了新 file-id），不应作为日常命令。如果 src-file-id 还没有历史，则 dst-file-id 的历史维护不变，只做 file-id 绑定转移。
 
-- **f_src**：状态 `A`/`M`，盘上存在的活文件（新 file-id，尚在跟踪中）
-- **f_dst**：状态 `D`，已从磁盘消失的文件（旧 file-id，待续接）
-- **最终保留的 file-id 是 `--onto` 的那一侧（f_dst）**，与介词方向一致
+- **src-file-id**：状态 `A`/`M`，盘上存在的活文件（新 file-id，尚在跟踪中）
+- **dst-file-id**：状态 `D`，已从磁盘消失的文件（旧 file-id，待续接）
+- **最终保留的 file-id 是 `--onto` 的那一侧（dst-file-id）**，与介词方向一致
 
-执行后 f_src 的当前路径和内容作为 f_dst 历史的下一条 Snapshot 追加；f_src 的 `file_states` 跟踪行取消，不再产生新快照。**f_src 的 `files/<f_src>/` 目录及 `snapshots.log` 完整保留**（append-only，不删除），f_src 成为"已退役"的 file-id，`lfv log f_src` 仍然有效。
+执行后 src-file-id 的当前路径和内容作为 dst-file-id 历史的下一条 Snapshot 追加；src-file-id 的 `file_states` 跟踪行取消，不再产生新快照。**src-file-id 的 `files/<src-file-id>/` 目录及 `snapshots.log` 完整保留**（append-only，不删除），src-file-id 成为"已退役"的 file-id，`lfv log src-file-id` 仍然有效。
 
-**情况一：f_src 尚无快照历史**
+**情况一：src-file-id 尚无快照历史**
 
-f_src 只有跟踪记录，未产生任何 Snapshot。执行后：将 f_src 的当前路径的文件使用 f_dst 这个 file-id。事件类型按 §6.2.1 由 f_dst 末尾快照与当前的 path/object 对比推导（通常为 `R+M` 或 `R`）。
+src-file-id 只有跟踪记录，未产生任何 Snapshot。执行后：将 src-file-id 的当前路径的文件使用 dst-file-id 这个 file-id。事件类型按 §6.2.1 由 dst-file-id 末尾快照与当前的 path/object 对比推导（通常为 `R+M` 或 `R`）。
 
-**情况二：f_src 已有快照历史**
+**情况二：src-file-id 已有快照历史**
 
-f_src 已经产生了若干 Snapshot（链为 `snap_A1 -> snap_A2 -> ... -> snap_An`）。执行后，将 f_src 的整条快照链复制并追加到 f_dst 历史末尾：
+src-file-id 已经产生了若干 Snapshot（链为 `snap_A1 -> snap_A2 -> ... -> snap_An`）。执行后，将 src-file-id 当前分支的快照链复制并追加到 dst-file-id 当前分支历史末尾：
 
 - 每条快照新生 ULID（`snap_B1 ... snap_Bn`），`digest` 对新字段重算
-- `snap_B1.parent` = f_dst 的最新快照；`snap_Bx.parent` = `snap_B(x-1)`
-- `snap_B1` 的事件类型由 f_dst 末尾快照与 `snap_B1` 的 path/object 对比推导；`snap_B2` 之后与原 f_src 内部推导结果一致，不受影响
+- `snap_B1.parent` = dst-file-id 的最新快照；`snap_Bx.parent` = `snap_B(x-1)`
+- `snap_B1` 的事件类型由 dst-file-id 末尾快照与 `snap_B1` 的 path/object 对比推导；`snap_B2` 之后与原 src-file-id 内部推导结果一致，不受影响
 - 接缝处的事件类型可能呈现为跨路径的跳变，这是用户主动声明历史续接的预期代价
-- 同样，当前盘上 f_src 对应文件将以后与 <f_dst> 绑定
+- 同样，当前盘上 src-file-id 对应文件将以后与 dst-file-id 绑定
 
 ### 7.7 lfv delete
 
@@ -897,9 +1038,9 @@ f_src 已经产生了若干 Snapshot（链为 `snap_A1 -> snap_A2 -> ... -> snap
 5. 若指定 `--tag`，向 `.lfv/trees/tags.yaml` 写入标签。
 6. 展开 Tree Object 清单，向 `index.db` 的 `tree_file_refs` 表逐 file 插入一行。
 
-### 7.9 `lfv rewind t:<tag|snap-id>`：内部执行流程
+### 7.9 `lfv rewind <TS-ish>`：内部执行流程
 
-`lfv rewind t:<tag|snap-id>` 通过 §4.5.1 的前置校验后：
+`lfv rewind <TS-ish>` 通过 §4.5.1 的前置校验后：
 
 1. 将 `.lfv/trees/HEAD` 更新为目标 Tree Snapshot 的 snap id。
 2. 读取目标 tree-snapshot 的 Tree Object，得到 `{path, file-object-hash}` 清单。
@@ -922,12 +1063,12 @@ f_src 已经产生了若干 Snapshot（链为 `snap_A1 -> snap_A2 -> ... -> snap
 
 ### 7.10 环回检测与处理
 
-为保证每个文件的历史在单条分支上呈现**无环的内容演化 DAG**，LFV 强制维护**分支对象唯一性**不变量。目前由 `lfv snap` 与 `lfv verify` 触发检测；将来引入 `lfv merge` 等操作时亦应遵循同一约束。
+为保证每个文件的历史在单条分支上呈现**无环的内容演化 DAG**，LFV 强制维护**分支对象唯一性**不变量。目前由 `lfv snap` 与 `lfv verify` 触发检测；`lfv merge` 与 `lfv rebase` 重放过程中同样遵循此约束（处理方式见 §4.7.6）。
 
 - **在任意一条分支上，同一个 `file-object-hash` 最多只能出现一次。**
-- **历史完整性优先**：绝不静默丢弃或重写中间历史，用户必须显式执行 `rewind` 才能“跳过”重复段。
+- **历史完整性优先**：绝不静默丢弃或重写中间历史，用户必须显式执行 `rewind` 才能"跳过"重复段。
 - **分支清洁**：环回会污染当前分支，必须将中间历史移到 `detour_*` 分支，用户可审阅后决定是否删除。
-- **与 `rewind` 命令语义一致**：`lfv rewind` 本身就是用于“回到过去并自动建分支”， 唯一性不变量正是为此场景设计。
+- **与 `rewind` 命令语义一致**：`lfv rewind` 本身就是用于"回到过去并自动建分支"， 唯一性不变量正是为此场景设计。
 
 #### 7.10.1 检测时机
 
@@ -957,7 +1098,7 @@ suggestion: run `lfv rewind docs/note.md snap_01HXYZ`
    - `path`、`message` 等按正常快照记录。
 3. 将 `main` 的 HEAD 指向这个新快照，工作区内容保持不变（已是新内容）。
 
-这样，原分支上的中间历史（`ancestor_snap` 之后到当前的所有快照）全部被保留在 `detour_main` 分支中，而 `main` 分支则“跳过”了那段历史，直接接续到更早的状态，且**不会在 `main` 上产生重复的 object hash**。
+这样，原分支上的中间历史（`ancestor_snap` 之后到当前的所有快照）全部被保留在 `detour_main` 分支中，而 `main` 分支则"跳过"了那段历史，直接接续到更早的状态，且**不会在 `main` 上产生重复的 object hash**。
 
 #### 7.10.3 对 `lfv verify` 的校验要求
 
@@ -1052,5 +1193,6 @@ tests/
 - **v0.1** ：`init` / `track` / `snap` / `log` / `status` / `show`。
 - **v0.2** ：`diff` / `rewind` / `branches` / `switch`。
 - **v0.3** ：`tag` 系列、`export`、`gc`、`verify`。
-- **v0.4** ：tree 层（`snap --tree` / `log --tree` / `rewind t:` / `tag --tree`）、性能优化。
+- **v0.4** ：`merge` / `rebase`、冲突处理。
+- **v0.5** ：tree plane（`snap --tree` / `log --tree` / `rewind t:` / `tag --tree`）、性能优化。
 - **v1.0** ：稳定 CLI 语义，文档完整，跨平台 CI 通过。

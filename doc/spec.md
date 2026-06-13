@@ -48,10 +48,11 @@ In order to stay "lightweight", the following are **out of scope**:
 
 - **Multi-file atomic commits**: each snapshot targets a single file; there is no "commit multiple files at once" semantics.
 - **Distributed collaboration**: no push / pull / remote / merge or other multi-user coordination semantics. Sharing `.lfv` via external sync (e.g. NAS, cloud drive) is fine, but concurrent conflicts are not resolved by LFV.
-- **Full merge algorithm**: no automatic 3-way merge for two branches of the same file; the user decides which branch to keep.
+- **Full merge algorithm**: no automatic 4-way merge for two branches of the same file; the user decides which branch to keep.
+- **Merge/rebase scope limitation**: `merge` / `rebase` operations are limited to single-file branches; no cross-file coordination.
 - **Replacing git**: source-code engineering scenarios should continue using git; LFV serves only the "file-centric" scenario.
 - **Graphical interface**: v1.0 provides CLI only; a GUI is listed as a possible future extension.
-- **Staging area**: there is no staging step — the working area is directly the subject of each snapshot.
+- **No staging area**: always "working tree as direct snapshot subject" — no intermediate staging step.
 
 ## 3. Terminology Spec
 
@@ -63,12 +64,12 @@ In order to stay "lightweight", the following are **out of scope**:
 | Working Tree | The working directory itself (excluding `.lfv`); where users actually operate on files. |
 | Tracked File | A file brought under repository management by `lfv track`. Identified internally by a `file-id` (ULID) that is **fully decoupled from its path**; the file's location in the working tree is a field on each Snapshot and can evolve over history. |
 | File Status | For paths already in LFV's view, status is `unmodified`, `modified`, or `untracked` (see §7). |
-| Object | A content-addressed storage unit for file content or global reference; deduplicated by content hash — different files may share the same object. |
+| Object | A content-addressed storage unit for file content or global reference; deduplicated by content hash — identical content across any tracked files, regardless of path and branch, is stored as a single File Object. |
 | Snapshot | A "snapshot" of a file or the global state at a point in time: content pointer + path + metadata (message, timestamp, author, parent snapshot). |
 | Branch | A chain of snapshots for a tracked file; the default branch is `main`. Branch namespaces are independent per file. |
 | HEAD | The current branch and latest snapshot pointer for a tracked file. |
 | Tag | A human-readable name for a snapshot (optional), used to stably reference a specific version. |
-| Action | Actions change the state of a file. Available actions include `track`, `snap`, and `untrack`, plus two actions with no corresponding command: `modify` (achieved by the user editing the file) and `auto-track` / `auto-delete` (applied automatically by LFV during scanning in response to OS file create/delete events; see §7). |
+| Action | Actions that change a tracked file's state. Explicit actions include `track`, `snap`, and `untrack`. Implicit actions are `modify` (user edits the file) and `auto-track` / `auto-delete` (LFV scanning in response to OS create/delete events; see §7). |
 | LFV-visible | Files remaining in the working directory after `.lfvignore` directory pruning. |
 
 ### 3.2 Storage Objects: File Object, Tree Object, File Snapshot, Tree Snapshot
@@ -133,7 +134,7 @@ Tree Snapshot is structurally symmetric to File Snapshot, but with these field d
 - The `path` field is empty (a tree does not need path localization).
 - `object` cannot be null (a tree snapshot always points to an Object — when the "entire working directory is empty", the manifest is zero bytes, the blake3 hash is computed normally, and this is a valid tree-id).
 
-The tree layer has no branch concept, so there is no `branches.yaml`.
+The tree plane has no branch concept, so there is no `branches.yaml`.
 
 Global snapshots are optional for users: a repository may have no Tree Snapshots at all.
 
@@ -148,7 +149,19 @@ LFV history has two independent topology layers (see `decisions.zh-cn.md §13, �
 - **Snapshot layer** (physical storage): always a directed tree. Each snapshot has exactly one parent pointer; the structure never changes.
 - **Content layer** (derived view): nodes are object hashes, edges come from projecting the Snapshot parent relationship onto object identity. The single-branch object hash uniqueness invariant guarantees this layer is cycle-free on any individual branch, making it a DAG overall.
 
-### 3.3 Mutable Index
+### 3.3 Snapshot Co-referent Determination and Co-referent Ancestors
+
+In LFV, different snapshots may point to the same File Object. LFV calls two such snapshots **co-referent**; many LFV operations are built on this concept.
+
+For example, rebase and merge operations require locating a co-referent ancestor: walking up each branch Snapshot chain to find the nearest node or pair of nodes that have appeared in both histories and are co-referent:
+
+- **base-snap-ours**: the Snapshot on this branch history that points to the shared file-object
+- **base-snap-theirs**: the Snapshot on the target branch history that points to the same file-object
+- **base-object**: the shared file-object (identical content, stored once)
+
+The co-referent-ancestor snaps on two branches may be the same snapshot or different ones (when both branches independently experienced identical content). Thus base-snap-ours and base-snap-theirs are often not the same snapshot. Merge operations based on this co-referent ancestor -- especially in the more general case where they differ -- are called **4-way merge** by LFV.
+
+### 3.4 Mutable Index
 
 LFV maintains a reconstructable **Mutable Index** as a working-state cache, avoiding full filesystem scans on every command; the recommended implementation is an embedded database. Storage objects (Objects) and the Snapshot chain are the repository's sole source of truth; the index can be rebuilt from them at any time. See §6.5 for details.
 
@@ -199,7 +212,7 @@ $ lfv status --include-untracked
 Tracked files (changes):
   M   f_01HA7BCD...   docs/note.md
                       content changed (12.4 KB -> 12.7 KB)
-  R   f_01HA7XYZ...   docs/photo.jpg -> docs/2026/photo.jpg
+  R   f_01HA7ACE...   docs/photo.jpg -> docs/2026/photo.jpg
                       auto-detected (identical content hash)
   D   f_01HA7DEF...   docs/old-note.md
                       file missing on disk; will be deleted on next `lfv snap`
@@ -298,7 +311,113 @@ run `lfv snap` first, or discard changes manually.
 
 User-input tag names are not allowed to contain `:` (namespace isolation).
 
-### 4.7 Maintenance
+
+### 4.7 Merge and Rebase
+
+Both merge and rebase operations target **file-plane branches only**, unrelated to the tree plane. Both use a **common ancestor** as the base point, progressively replay changes via 4-way merge, and introduce conflict handling mechanisms -- i.e., file-object in the content layer is the alignment coordinate.
+
+> [!note] Note
+> lfv merge / lfv rebase differ from lfv relink:
+> - lfv merge / lfv rebase operate on history versions of the same file.
+> - lfv relink involves no content merge — it simply appends one file's current-branch history to another file's. lfv merge / lfv rebase operate on the same file's branches via 4-way merge.
+
+**Parameter constraints**: <target> accepts only <FS-ish> (branch name or snapshot id) -- a file-object carries no history information and cannot be used as a parameter to history operations (see Section 3.2). A branch name is equivalent to the snapshot that the branch HEAD currently points to.
+
+Both lfv merge and lfv rebase must first locate a common ancestor (Section 3.3). If no common ancestor is found, an error is reported and the operation is rejected:
+
+`
+error: no common ancestor found between branch 'main' and 'feature'
+       cannot merge/rebase without a shared content base.
+`
+
+#### 4.7.1 lfv rebase <file> <FS-ish>
+
+Insert the history between the target branch's base-snap-theirs and HEAD into this branch's base-snap-ours node.
+
+**Semantics**:
+- Rewind this branch HEAD first to the snapshot base-snap-ours corresponding to the common ancestor (branch name remains unchanged; the old HEAD position is retained by a newly created 
+ebase/<target-short>/<n> branch).
+- Using the target branch's base-snap-theirs as the base point, replay each file-object change from base-snap-theirs to its HEAD via 4-way merge on this branch, producing a sequence of new file-objects and corresponding Snapshots.
+- Then replay each file-object change from after base-snap-ours to the original HEAD of this branch via 4-way merge, continuing to apply them on this branch, producing more new file-objects and Snapshots, advancing this branch HEAD to the end of the new chain.
+
+**Execution steps**:
+
+1. Locate common ancestors (Section 3.3); collect the ordered Snapshot list for the target branch from base-snap-theirs to its HEAD, as well as for this branch from after base-snap-ours to the original HEAD.
+2. Rewind this branch HEAD to base-snap-ours (retain current branch name; create a new branch pointing to the original HEAD).
+3. For each step snap_i in the target branch's sequence to apply (in chronological order):
+   - base = file-object of snap_{i-1} (first step uses base-object)
+   - ours = file-object at this branch's current landing point
+   - theirs = file-object of snap_i
+   - Execute 4-way merge, produce a new file-object, append a new Snapshot
+4. Repeat step 3 logic for the to-be-replayed sequence from after base-snap-ours on this branch, rebuilding this branch history after the target branch history.
+   - On **conflict**: pause, output conflict markers, wait for user to resolve and continue (see Section 4.7.3)
+   - On **loopback**: prompt the user to choose -- rewind to skip this step (automatically continue after acceptance), or abort rollback (see Section 4.7.4)
+
+**History preservation**: rebase produces a new Snapshot chain; no existing records at the Snapshot layer are modified; the old HEAD position is retained by the newly created branch and can be inspected at any time.
+
+#### 4.7.2 lfv merge <file> <FS-ish>
+
+Insert the history between the target branch's base-snap-theirs and HEAD into this branch's current HEAD.
+
+**Semantics**:
+- Keep this branch's current HEAD unchanged (branch name and position remain the same).
+- Using the common ancestor base-object as the baseline, replay each file-object change from the target branch's base-snap-theirs to its HEAD via 4-way merge applied on top of this branch HEAD, producing a sequence of new file-objects and corresponding Snapshots, advancing this branch HEAD to the end of the new chain.
+
+**Execution steps**:
+
+1. Locate common ancestors (Section 3.3); collect the ordered Snapshot list for the target branch from base-snap-theirs to its HEAD (sequence to apply).
+2. For each step snap_i in the sequence to apply (in chronological order):
+   - base = file-object of snap_{i-1} (first step uses base-object)
+   - ours = file-object at this branch's current landing point
+   - theirs = file-object of snap_i
+   - Execute 4-way merge, produce a new file-object, append a new Snapshot
+   - On **conflict** or **loopback**: handling is the same as Section 4.7.3 / 4.7.4
+
+#### 4.7.3 Conflict Handling
+
+When a 4-way merge produces a conflict, LFV pauses the operation and writes conflict markers into the working-tree file:
+
+`
+<<<<<<< ours (main)
+Content from this branch
+=======
+Content from the target branch
+>>>>>>> theirs (feature / snap_01HXYZ)
+`
+
+After the user manually edits to resolve the conflict, they execute:
+
+`ash
+lfv merge --continue   # or lfv rebase --continue
+`
+
+LFV treats the resolved working-tree content as a new file-object, appends a Snapshot, and continues replaying the next step.
+
+If the user abandons the operation, they execute:
+
+`ash
+lfv merge --abort   # or lfv rebase --abort
+`
+
+LFV restores this branch HEAD to its original pre-operation state, also restoring the working-tree content. All intermediate Snapshots appended during the operation are hidden via branch pointer rollback (Snapshots themselves remain in the append-only log but are no longer referenced by any branch).
+
+#### 4.7.4 Loopback Handling
+
+During replay, if a step produces a file-object that has already appeared in this branch's history (violating the single-branch object uniqueness invariant, Section 7.10), LFV pauses and prompts:
+
+`
+warning: step snap_01HXYZ produces content already present in branch 'main'
+         (object blake3:abc123...)
+options:
+  [r] lfv rewind to skip this step and continue rebase/merge
+  [a] abort -- restore branch to original state
+`
+
+- Choose **rewind**: LFV performs a rewind on the current step (moving intermediate history into a detour_* branch), then **automatically continues** subsequent replay steps without requiring further user confirmation.
+- Choose **abort**: same as Section 4.7.5 abort semantics; this branch HEAD restores to its original state.
+
+
+### 4.8 Maintenance
 
 | Command | Description |
 | --- | --- |
@@ -472,7 +591,7 @@ A/                                   # Working directory
   - **floor**: `size < min_bytes` (default **4 KiB**, 4096 bytes) — too small; frame overhead may make compressed output larger;
   - **ceiling**: `size >= max_bytes` (default **16 MiB**, 16777216 bytes) — avoid memory spikes from reading entire large files;
   - **ineffective compression**: after attempting compression, `compressed_len >= original_len` (`reject_if_larger`, default **true**) — no benefit for already-compressed binaries, etc.;
-- Cross-file sharing: identical content is stored as a single object, saving space.
+- Cross-file and cross-branch deduplication: identical content across any tracked files — even across different branches of the same file — is stored as a single File Object. For example, two branches of `docs/note.md` that both point to the same content share one File Object in `objects/`.
 
 #### 6.1.1 Default Compression Config (`config.yaml`)
 
@@ -669,7 +788,7 @@ LFV does not support detached HEAD — `rewind` always creates a new branch, so 
 
 **`.lfv/trees/HEAD`**
 
-The tree-layer current head, containing `snap_<ULID>` or empty (when the repository has no Tree Snapshot yet):
+The tree plane current head, containing `snap_<ULID>` or empty (when the repository has no Tree Snapshot yet):
 
 ```
 snap_01HABC...
@@ -702,7 +821,7 @@ stable: snap_01HWWW...
 
 **`.lfv/trees/tags.yaml`**
 
-Tree-layer tag table, key = `"t:<name>"`, value = `snap_<ULID>`; tags are globally unique and cannot be reused:
+Tree plane tag table, key = `"t:<name>"`, value = `snap_<ULID>`; tags are globally unique and cannot be reused:
 
 ```yaml
 t:v1.0: snap_01HABC...
@@ -1037,5 +1156,6 @@ Build and release:
 - **v0.1**: `init` / `track` / `snap` / `log` / `status` / `show`.
 - **v0.2**: `diff` / `rewind` / `branches` / `switch`.
 - **v0.3**: `tag` family, `export`, `gc`, `verify`.
-- **v0.4**: tree layer (`snap --tree` / `log --tree` / `rewind t:` / `tag --tree`), performance optimizations.
+- **v0.4**: `merge` / `rebase` and conflict handling.
+- **v0.5**: tree plane (`snap --tree` / `log --tree` / `rewind t:` / `tag --tree`), performance optimizations.
 - **v1.0**: stable CLI semantics, complete documentation, cross-platform CI passing.
