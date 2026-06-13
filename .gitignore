@@ -1,2 +1,15 @@
-/target
-/CLAUDE.md
+# Rust build artifacts
+/target/
+
+# Dependency directories
+/vendor/
+/node_modules/
+
+# Config / agent files
+.vscode/
+CLAUDE.md
+AGENTS.md
+.agents/
+
+# LFV per-directory version store
+.lfv/
