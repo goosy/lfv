@@ -1,6 +1,6 @@
 # LFV — Lightweight File Versioning
 
-> This is the English design document for the LFV project. For the Chinese version, see `design.zh-cn.md`.
+> This is the English design document for the LFV project. For the Chinese version, see `spec_zh-cn.md`.
 
 ---
 
@@ -33,26 +33,25 @@ Existing approaches to this scenario are generally unsatisfying:
 
 LFV (Lightweight File Versioning) aims to:
 
-1. Create a `.lfv` directory inside a designated working directory, serving as the **local version repository** for all tracked files in that directory tree.
-2. Provide an `lfv` CLI so users can, intuitively and analogously to `git`:
+1. Provide an `lfv` CLI so users can, intuitively and analogously to `git`, operate on all files in a directory (i.e. the repository):
    - Selectively track a file;
    - Create annotated snapshots of that file;
    - View the list of historical snapshots for that file;
    - Diff any two snapshots (or a snapshot against the current content);
-   - Rewind to a historical snapshot — **automatically creating a new branch** on rewind, never destroying existing history.
-3. Each file has **independent**: history chain, branch set, and tag set.
+   - Rewind to a historical snapshot — **automatically creating a new branch to preserve the old path** on rewind, never destroying existing history.
+2. Each file has **independent**: history chain, branch set, and tag set.
+3. Each branch of a file must be a single-directional **non-branchable path**, without mid-path divergence or merge.
 4. Provide good portability: the `.lfv` directory can be copied or synced together with the working directory and behaves consistently after migration.
 5. Compact data storage: content-hash deduplication and compression to avoid storage bloat from naive backups.
+6. Distributed collaboration: implement coordinated sync with local or network repositories, enabling basic push / pull / remote / merge semantics.
 
 In order to stay "lightweight", the following are **out of scope**:
 
-- **Multi-file atomic commits**: each snapshot targets a single file; there is no "commit multiple files at once" semantics.
-- **Distributed collaboration**: no push / pull / remote / merge or other multi-user coordination semantics. Sharing `.lfv` via external sync (e.g. NAS, cloud drive) is fine, but concurrent conflicts are not resolved by LFV.
-- **Full merge algorithm**: no automatic 4-way merge for two branches of the same file; the user decides which branch to keep.
+- **Distributed communication protocol**: LFV does not constrain the underlying protocol of network repositories; it only specifies the interface for obtaining the `.lfv` directory via remote references. Implementors may extend drivers to support address formats such as `ssh:uname@host:~`, `https://other.dns/somerepo.lfv`, `https://webdav.host/somerepo`, etc.
 - **Merge/rebase scope limitation**: `merge` / `rebase` operations are limited to single-file branches; no cross-file coordination.
+- **Staging area**: always "working tree as direct snapshot subject" — version separation requires rewinding and modifying a snapshot.
 - **Replacing git**: source-code engineering scenarios should continue using git; LFV serves only the "file-centric" scenario.
-- **Graphical interface**: v1.0 provides CLI only; a GUI is listed as a possible future extension.
-- **No staging area**: always "working tree as direct snapshot subject" — no intermediate staging step.
+- **Graphical interface**: CLI only; a GUI should be a separate project.
 
 ## 3. Terminology Spec
 
@@ -79,6 +78,14 @@ LFV has two **fully immutable, content-addressed** storage object types — File
 LFV snapshots are an **append-only event record layer**, addressed by ULID, recording "what happened at a certain moment". They also come in two types: File Snapshot and Tree Snapshot, with highly symmetric structures, serving **two independent views**.
 
 All snapshots are append-only; existing snapshots are never rewritten.
+
+> [!note] Immutability Principle for Snapshots and Objects
+> LFV's append-only guarantee means that "**traversable**" snapshots cannot be modified. Unreachable (dangling) snapshots are exempt from this constraint and can be safely physically deleted. File Objects and Tree Objects, as content-addressed units, have even stronger invariance — written once, never changed. This principle is the safety foundation for deletion operations like `lfv gc --purge`, see §5.9.
+
+> [!note] Relationship Between File Objects and History
+> A File Object is purely a content unit — it carries no historical information. It has no parent-child relationship, does not know which branch it belongs to, and does not know at which point in time it was produced. Historical information is entirely carried by the Snapshot chain.
+> Any operation that requires historical context (`lfv log`, `lfv merge`, `lfv rebase`) must take `<FS-ish>` (branch name or snapshot id) as its parameter — a bare file-object hash only identifies "what the content is", not "where in history it lives".
+> `<FO-ish>` — file-id, path, tag, snap-id, or branch — can all be used wherever content resolution is needed (see the preamble to §4).
 
 #### 3.2.1 File Object
 
@@ -144,10 +151,12 @@ From a Tree Snapshot, you can locate a file's content at that moment via the fil
 
 #### 3.2.5 Two Topology Layers
 
-LFV history has two independent topology layers (see `decisions.zh-cn.md §13, §18`):
+LFV history has two independent topology layers :
 
 - **Snapshot layer** (physical storage): always a directed tree. Each snapshot has exactly one parent pointer; the structure never changes.
 - **Content layer** (derived view): nodes are object hashes, edges come from projecting the Snapshot parent relationship onto object identity. The single-branch object hash uniqueness invariant guarantees this layer is cycle-free on any individual branch, making it a DAG overall.
+
+That is, objects and snapshots are decoupled: the former carries only content, the latter describes topology. A single object may be traversed by multiple snapshot timelines.
 
 ### 3.3 Snapshot Co-referent Determination and Co-referent Ancestors
 
@@ -167,7 +176,23 @@ LFV maintains a reconstructable **Mutable Index** as a working-state cache, avoi
 
 ## 4. CLI Functional Spec
 
-> Convention: `<file>` refers to a relative or absolute path of a file within the working directory; the CLI normalizes all paths internally to be relative to the repository root.
+The following parameter conventions each ultimately resolve to one of the four storage objects (File Object, Tree Object, File Snapshot, Tree Snapshot):
+
+- `<FO-ish>` resolves to a **File Object**, including:
+  - `<file>` — a relative or absolute path of a file within the working directory; the CLI normalizes all paths internally to be relative to the repository root. The unsaved working-tree version of a file is also treated as a special File Object.
+  - `<file-id>` — the file identity ULID;
+  - `<tag>` — a tag name;
+  - `<snap-id>` — a snapshot also ultimately resolves to a File Object;
+  - `<branch>` — the branch HEAD ultimately resolves to a File Object.
+- `<FS-ish>` resolves to a **File Snapshot**, including:
+  - `<snap-id>` — a snapshot identifier;
+  - `<branch>` — a branch name.
+- `<TO-ish>` resolves to a **Tree Object**, including:
+  - `<tree-id>` — the tree identity ULID;
+  - `<T:tag>` — a tree tag name;
+  - `<T:snap-id>` — the Tree Object corresponding to a tree snapshot.
+- `<TS-ish>` resolves to a **Tree Snapshot**, which only includes:
+  - `<T:snap-id>` — a tree snapshot identifier.
 
 ### 4.1 Repository Management
 
@@ -181,11 +206,11 @@ LFV maintains a reconstructable **Mutable Index** as a working-state cache, avoi
 | Command | Description |
 | --- | --- |
 | `lfv track [<file>]` | Add a file to tracking. When `<file>` is given, errors if the path matches `.lfvignore`; otherwise removes it from the `untracked` list in `config.yaml`. If the path was previously untracked (not deleted), the original `file-id` is reused and the status table is updated to `modified` (awaiting the first `lfv snap` if there is no history). With no argument, scans and tracks all trackable files not yet in the status table. |
-| `lfv untrack <file>` | Stop tracking: errors if LFV-invisible; if visible, updates the dynamic `untracked` list in `config.yaml`; if it exists on disk, records `untracked` in the status table, otherwise config only. History is preserved; re-track via `lfv track` / `lfv revive`. |
+| `lfv untrack <FO-ish>` | Stop tracking: errors if LFV-invisible; if visible, updates the dynamic `untracked` list in `config.yaml`; if it exists on disk, records `untracked` in the status table, otherwise config only. History is preserved; re-track via `lfv track` / `lfv revive`. |
 | `lfv mv <old> <new>` | Migrates the tracked file at `<old>` path to `<new>` path. Both arguments accept only paths, not `file-id`s. Whether an actual file move is performed in the working tree is governed by §7.6. The command appends a Snapshot immediately. |
-| `lfv relink <f_src> --onto <f_dst>` | Splices f_src's history onto f_dst, declaring "f_src is the continuation of f_dst." f_src's snapshots (if any) are appended to f_dst's history with new ULIDs; f_src's `file_states` tracking row is cancelled but its `snapshots.log` is fully preserved. See §7.7. |
+| `lfv relink <src-file-id> --onto <dst-file-id>` | Splices the current-branch history of src-file-id onto the end of dst-file-id's current branch, and the on-disk file becomes bound to dst-file-id; src-file-id is retired. **Operates only on each file-id's current branch**, no other branches, no 4-way merge content integration. Designed for the case where a new file-id was erroneously created; should not be used as a routine command. See §7.6. |
 | `lfv delete <file>` | Sets the file to `modified` in the status table and deletes it from disk. On a later `lfv snap`, if it is `modified` and absent from disk, LFV appends an `object = null` Snapshot, removes it from the `untracked` list in `config.yaml`, and updates the status-table cache. Its history remains complete and it can be revived at any time. |
-| `lfv revive <ref>` | Revive a deleted file. `<ref>` may be a `file-id`, the last known path, or a specific Snapshot id. Automatically creates a new branch (`revive/<...>`) and restores the content to the working tree from the selected snapshot. |
+| `lfv revive <FO-ish>` | Revive a deleted file. `<FO-ish>` accepts file-id, path (LFV resolves it to file-id internally via the Snapshot chain), snap-id, or branch name. Automatically creates a new branch (`revive/<...>`) and restores the content to the working tree from the selected snapshot. |
 | `lfv list [--deleted]` | List all tracked files with their current branch and latest snapshot summary. By default shows only active files; `--deleted` also lists files with a deletion marker. |
 
 ### 4.3 Status and Snapshots
@@ -193,10 +218,10 @@ LFV maintains a reconstructable **Mutable Index** as a working-state cache, avoi
 | Command | Description |
 | --- | --- |
 | `lfv status [<file>]` | **Without `<file>`: list all `modified` tracked files.** Runs a lazy scan per §7.3 first. Default output shows tracked changes only, each line with `file-id` (`f_*`). `--include-untracked`: see §4.3.2. `--refresh`: force a full scan-cache refresh. With `<file>`: that file only. |
-| `lfv snap [<file>] [-m <msg>]` | Create a new snapshot for a file. **Without `<file>`: batch-snapshot all `modified` tracked files.** Refuses if working content is unchanged (unless `--allow-empty`). If the single-branch object uniqueness invariant in §7.9 would be violated, refuses and prompts the user to run `lfv rewind`. `--tree` parameter: see §4.3.3. |
-| `lfv log <file>` | List the snapshot history for a file, with tree association information (from `tree_file_refs` table). Supports `--branch <name>`, `--graph`, `--limit N`. |
+| `lfv snap [<file>] [-m <msg>]` | Create a new snapshot for a file. **Without `<file>`: batch-snapshot all `modified` tracked files.** Refuses if working content is unchanged (unless `--allow-empty`). If the single-branch object uniqueness invariant in §7.10 would be violated, refuses and prompts the user to run `lfv rewind`. `--tree` parameter: see §4.3.3. |
+| `lfv log <FS-ish>` | List the history of the specified branch, or the branch containing the specified snapshot, with tree association information (from `tree_file_refs` table). When `<FS-ish>` is a branch name, shows that branch's history; when it is a snap-id, shows the history of the branch containing that snapshot. `--all`: show all branches of that file; `--graph`: render branch topology as ASCII art; `--limit N`: limit output count. |
 | `lfv log --tree` | List the tree history view: walk the Tree Snapshot chain, showing message, tags, and timestamps for each node. |
-| `lfv show <file> <snap>` | Output metadata for a specific snapshot; `--content` outputs the content; `--out <path>` exports it. |
+| `lfv show <FO-ish>` | Output metadata for a specific snapshot; `--content` outputs the content; `--out <path>` exports it. |
 
 Notes:
 - For `modified` files in `lfv status`: deleted files show as `D`; files whose path differs from the last snapshot show as `R`; files with no snapshot yet show as `A`; all others show as `M`; files with both content and path changes show as `R+M`.
@@ -267,11 +292,12 @@ lfv snap --tree --tag v1.0 -m "first edition complete"   # create tag simultaneo
 
 ### 4.4 Diffing
 
+The current working-tree content can be used as an unsaved special File Object, referenced by the literal `f_/path/to/file`.
+
 | Command | Description |
 | --- | --- |
-| `lfv diff <file>` | Working tree vs. latest snapshot. |
-| `lfv diff <file> <snap>` | Working tree vs. a specific snapshot. |
-| `lfv diff <file> <snapA> <snapB>` | Between two snapshots. |
+| `lfv diff <FO-ish>` | Working tree vs. the File Object pointed to by the given `<FO-ish>`. Equivalent to omitting the second argument `f_/path/to/file`; the path is inferred from the first argument. |
+| `lfv diff <FO-ish-A> <FO-ish-B>` | Diff between two File Objects (can be different files or different versions of the same file). |
 
 Text files use line-based diff (default 3-line context); binary files show only metadata differences (size, hash).
 
@@ -279,14 +305,14 @@ Text files use line-based diff (default 3-line context); binary files show only 
 
 | Command | Description |
 | --- | --- |
-| `lfv rewind <file> <snap>` | Restore the working-area file content to the specified snapshot. **Automatically creates a new branch** (naming pattern `rewind/<snap-short>/<n>`) and moves HEAD to the new branch. When used to resolve a loopback event (§7.9), `lfv rewind <file> <snap_ap>` will be executed, where `snap_ap` is the parent snapshot of the ancestor with the identical hash. |
-| `lfv rewind <t:tag|snap-id>` | Restore the working tree to the state of the specified Tree Snapshot. Updates `.lfv/trees/HEAD`; for each file uses the FF-priority strategy (see §4.5.1 for details). |
+| `lfv rewind <file> <FS-ish>` | Restore the working-area file content to the File Object pointed to by the specified `<FS-ish>`. **Creates a new branch pointing to the original HEAD**, and redirects the current branch HEAD to the target snapshot. When used to resolve a loopback event (§7.10), `lfv rewind <file> <base-snap-ours>` is executed, where `base-snap-ours` is the parent snapshot of the ancestor with the identical hash. |
+| `lfv rewind <TS-ish>` | Restore the working tree to the state of the specified Tree Snapshot. Updates `.lfv/trees/HEAD`; for each file uses the FF-priority strategy (see §4.5.1 for details). |
 | `lfv branches <file>` | List all branches for this file. |
 | `lfv switch <file> <branch>` | Switch the file's current branch (also updates working-area content to the head snapshot of that branch). Only targets file branches, does not operate on tree. |
 | `lfv branch-rename <file> <old> <new>` | Rename a branch. |
 | `lfv branch-delete <file> <branch>` | Delete a branch (only deletes the pointer; objects are retained in case of sharing). |
 
-#### 4.5.1 `lfv rewind t:<tag|snap-id>` Execution Flow
+#### 4.5.1 `lfv rewind <TS-ish>` Execution Flow
 
 **Pre-check**: check whether the working tree contains files that are `modified` but have no file-object yet (new, modified, or deleted but not `lfv snap`ped). If so, refuse execution:
 
@@ -295,6 +321,8 @@ error: the following files have unsaved changes (no file-object yet):
   M  docs/draft.md
 run `lfv snap` first, or discard changes manually.
 ```
+
+**Actual execution**: once the pre-check passes, for each file involved in `<TS-ish>`, execute `lfv rewind <file> <FS-ish>`, where `<file>` and `<FS-ish>` are derived from `<TS-ish>`. Simultaneously update the tree HEAD to point to `<TS-ish>`.
 
 **Effect**: restores the working tree to match the state recorded in the target Tree Snapshot. Updates the tree HEAD. For each tracked file, LFV uses an FF-priority strategy: if the target content is already reachable via an existing branch HEAD, it switches to that branch without creating a new one; otherwise it creates a new rewind branch. Files that existed after the target snapshot are removed from the working tree; files in the snapshot that are currently untracked or deleted are written back to disk and left for the next scan to process. The detailed per-file algorithm is described in §7.9.
 
@@ -414,7 +442,7 @@ options:
 ```
 
 - Choose **rewind**: LFV performs a rewind on the current step (moving intermediate history into a detour_* branch), then **automatically continues** subsequent replay steps without requiring further user confirmation.
-- Choose **abort**: same as Section 4.7.5 abort semantics; this branch HEAD restores to its original state.
+- Choose **abort**: same as §4.7.3 abort semantics; this branch HEAD restores to its original state.
 
 
 ### 4.8 Maintenance
@@ -422,6 +450,7 @@ options:
 | Command | Description |
 | --- | --- |
 | `lfv gc` | Reclaim objects not referenced by any snapshot. |
+| `lfv gc --purge` | Permanently delete all dangling snapshots and unreferenced objects (File Object + Tree Object). This is a high-risk irreversible operation — confirm explicitly before running. |
 | `lfv verify` | Verify object store integrity (recompute hashes and compare); also walk every branch of every file and report any duplicate object hash on a single branch as a data-integrity error (see §7.10.3). |
 | `lfv export <file> [--format zip\|tar] -o <out>` | Export all history for a file as a self-contained archive for migration. |
 
@@ -547,9 +576,37 @@ lfv rewind t:v1.0
 lfv rewind t:snap_01HXYZ
 ```
 
-### 5.9 Cross-device Sync
+### 5.9 Content Deletion
+
+When history contains inappropriate content (e.g., versions involving privacy, security issues, or sensitive data that is no longer needed), LFV provides a **three-step workflow** for thorough elimination. This section covers the rationale and how tree snapshots interact with this process.
+
+> [!warning] `lfv gc --purge` is an irreversible operation. Once executed, all cleaned objects and snapshots cannot be recovered. Run it only when explicitly necessary.
+
+#### 5.9.1 Three-Step Workflow
+
+For each branch containing inappropriate content, execute in order:
+
+1. **Reconstruct history**: `rewind` to the parent snapshot of the one containing inappropriate content, create a new branch. On the new branch, individually `merge --pick` subsequent snapshots from the original branch, editing to remove inappropriate content as needed, forming a new append-only snapshot chain. This entirely operates within existing primitives without violating append-only.
+2. **Delete original branch**: Delete the original branch containing inappropriate content. The snapshot chain on the original branch loses all reachable entry points and enters a dangling state.
+3. **Physical cleanup**: Execute `lfv gc --purge` to delete all dangling snapshots along with their associated File Objects and Tree Objects.
+
+When inappropriate content appears across multiple branches, apply steps 1–2 to each relevant branch separately, then execute a single unified `gc --purge` at the end.
+
+#### 5.9.2 Handling of Tree Snapshots
+
+Tree Snapshots are also bound by the append-only constraint and cannot be directly modified. However, when a File Object referenced by a Tree Snapshot is cleared:
+
+- The Tree Snapshot itself **remains** in the append-only log (still usable as a timeline node), but its referenced File Object has been physically removed — `lfv show` / `lfv diff` queries will display `[object missing]`.
+- A Tree Object that is no longer referenced by any Tree Snapshot (i.e., its corresponding working-tree snapshot was also cleaned via rewind + gc --purge) is deleted as a dangling object along with it.
+- **Recommended practice**: Before performing content deletion, move tree HEAD to a milestone that does not contain inappropriate content using `lfv rewind t:<tag>`, preventing dangling references on the tree plane. If accidental dangling references occur, `lfv verify` will report Tree Objects pointing to non-existent File Objects.
+
+By default, dangling snapshots and File/Tree Objects are retained (users may recover them later). Only `gc --purge` performs true physical deletion.
+
+### 5.10 Cross-device Sync and Collaboration
 
 Simply copy or sync the entire working directory (including `.lfv`) to another device via NAS or cloud drive. LFV itself **does not resolve concurrent write conflicts** — the sync tool is responsible for ensuring `.lfv` is not modified concurrently on multiple devices.
+
+For collaborative development with repositories at other locations, remote repositories can be used. Details are deferred; the specification will be clarified in a future revision.
 
 ## 6. Storage Design
 
@@ -720,7 +777,22 @@ This format is a valid YAML subset; external programs can read it directly with 
 
 The mutable index lives in `index.db`, recording working-directory file status and branch/tag caches. It is a reconstructable cache of current state and is not part of the immutable history objects. Storage objects are immutable and are the repository's source of truth; mutable state errors can be reconstructed (as long as Object + Snapshot remain).
 
-`index.db` stores only **reconstructable** cache data; the source of truth resides in the filesystem (Snapshot chains, yaml files). For the full table overview see §3.3 in the spec.
+`index.db` stores only **reconstructable** cache data; the source of truth resides in the filesystem (Snapshot chains, yaml files). Table overview:
+
+| Table | Description | Reconstructable |
+| ---- | ---- | ---- |
+| `file_states` | Core fields: `fullpath`, `status` (`untracked` / `modified` / `unmodified`), `file_id`. Normally only registers files that are LFV-visible and currently exist on disk. | ✓ |
+| `scan_meta` | Scan metadata: `last_completed_at`, `.lfvignore` and `config.yaml` mtimes, used for incremental scan invalidation. | ✓ |
+| `branches` | Branch pointer cache per file. Source of truth: `.lfv/<file-id>/branches.yaml`. | ✓ |
+| `tags` | Tag cache per file. Source of truth: `.lfv/<file-id>/tags.yaml` and `.lfv/trees/tags.yaml`. | ✓ |
+| `tree_file_refs` | Tree-dimension reverse reference cache. Source of truth: `.lfv/trees/snapshots.log` + `objects/`; rebuilt during `rebuild-index`; written by `lfv snap --tree`. Used by `lfv log <FS-ish>` to append tree association information when rendering. | ✓ |
+
+> [!note] Notes on `file_states`
+> - **Normally only registers files that are LFV-visible and currently exist on disk** (paths where `stat` succeeds and `.lfvignore` does not match);
+> - `untracked` rows correspond to paths in the `config.yaml` dynamic untracked list that exist on disk;
+> - When a path disappears from disk, its row is deleted (the `config.yaml` list entry may remain);
+> - **Exception**: tracked files that have disappeared from disk and are awaiting the next `lfv snap` to record the current FS state are retained as `modified`; `lfv status` renders them as `D` (§7.4).
+> - For tracked files still on disk, `fullpath → file_id` is used by the CLI to resolve paths; files that have disappeared can still be located by `file-id`.
 
 #### 6.5.1 Schema
 
@@ -828,13 +900,13 @@ t:v1.0: snap_01HABC...
 t:release: snap_01HZZZ...
 ```
 
-User-input tag names are not allowed to contain `:` (namespace isolation; see `decisions.zh-cn.md §20`); the `t:` prefix is added automatically by LFV.
+User-input tag names are not allowed to contain `:` (namespace isolation); the `t:` prefix is added automatically by LFV.
 
 ## 7. Internal Mechanism Design
 
-This section describes all actions that change a file's tracking state — including automatic scan responses by LFV and explicit commands run by the user.
+This section describes the internal mechanisms of each operation, covering three categories of topics: **scan and visibility rules** (§7.1–§7.2), **internal flow of file lifecycle operations** (§7.3–§7.7), and **snapshot/rewind operation flows and data-integrity constraints** (§7.8–§7.10).
 
-### 7.1 `.lfvignore` and `config.yaml` (Two Layers)
+### 7.1 `.lfvignore` and `config.yaml`
 
 Track-by-default would otherwise include temporary files and build artifacts. `.lfvignore` and `config.yaml` are **not** the same kind of "exclusion list":
 
@@ -1001,7 +1073,7 @@ When `lfv snap --tree` is invoked (after the precondition in §4.3.3 passes):
 5. If `--tag` is specified, write the tag to `.lfv/trees/tags.yaml`.
 6. Expand the Tree Object manifest and insert one row per file into the `tree_file_refs` table in `index.db`.
 
-### 7.9 `lfv rewind t:<tag|snap-id>`: Internal Execution
+### 7.9 `lfv rewind <TS-ish>`: Internal Execution
 
 When `lfv rewind t:<tag|snap-id>` is invoked (after the pre-check in §4.5.1 passes):
 
@@ -1159,3 +1231,4 @@ Build and release:
 - **v0.4**: `merge` / `rebase` and conflict handling.
 - **v0.5**: tree plane (`snap --tree` / `log --tree` / `rewind t:` / `tag --tree`), performance optimizations.
 - **v1.0**: stable CLI semantics, complete documentation, cross-platform CI passing.
+- **v1.1**: remote repositories, distributed collaboration support.
