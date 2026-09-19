@@ -1,56 +1,57 @@
 # LFV — Lightweight File Versioning
 
-> This is the English design document for the LFV project. For the Chinese version, see `spec_zh-cn.md`.
+> This document is the English specification (spec) of the LFV project: it defines what to build, why, and with which behaviors and constraints. For the Chinese version, see `spec.zh-cn.md`.
+> The implementation design (how to build it: storage structure, internal mechanisms, engineering structure) is in `design.md`; this document references its sections as `design §x`.
 
 ---
 
 ## 1. Background and Motivation
 
-`git` is an excellent version-control tool, but its design target is **repository-scoped** version management — best suited for a logically cohesive collection of source files where a single commit can span multiple files and branches record the holistic evolution of an entire working tree.
+`git` is an excellent version-control tool, but its design target is **repository-scoped** version management — best suited for a logically cohesive collection of source files: a single commit can span multiple files, and branches record the holistic evolution of an entire working tree.
 
-Yet daily work also contains another archetypal scenario with the following characteristics:
+Yet daily work also contains another archetypal scenario, with the following characteristics:
 
 - Each file is **logically independent**, with no coupling to any other;
 - Each file has **its own line of history**, unrelated to other files;
-- There is no semantic need to "commit multiple files at once";
 - Users care about the evolution, comparison, and rollback of **one specific file** along a timeline.
+- The semantic need to **"commit multiple files at once"** is not required;
 
 Typical examples:
 
-1. **NAS file sync systems**: each backed-up file has its own history, but cross-file atomic commits are unnecessary.
-2. **One-note-per-file repositories**: each note evolves independently; changes to note A should not "pollute" note B's history.
-3. **Design drafts / contracts / single-document archives**: each document tracked individually.
-4. **Configuration file directories**: each config file evolves independently, without affecting others.
+- **NAS file sync systems**: each backed-up file has its own history, but cross-file atomic commits are unnecessary.
+- **One-note-per-file repositories**: each note evolves independently; changes to note A should not "pollute" note B's history.
+- **Design drafts / contracts / single-document archives**: each document tracked individually.
+- **Configuration file directories**: each config file evolves independently, without affecting others.
 
 Existing approaches to this scenario are generally unsatisfying:
 
-- **Simple backup**: copies old versions only, with no way to record the purpose of each version;
+- **Simple backup**: copies old versions only, with no way to see the purpose of each version;
 - **Retain the last N versions**: lacks semantic information; no diff, no annotation;
 - **Whole-directory git repository**: mixes the evolution of unrelated files, buries individual file history, and violates the "file-centric" mental model;
 - **Cloud drive version history**: typically unusable offline, and lacks branching, comparison, or portability.
 
 ## 2. Project Goals
 
-LFV (Lightweight File Versioning) aims to:
+The goals of LFV (Lightweight File Versioning):
 
-1. Provide an `lfv` CLI so users can, intuitively and analogously to `git`, operate on all files in a directory (i.e. the repository):
+1. Provide an `lfv` CLI so users can, as intuitively as with `git`, operate on all files under a directory (i.e. the repository):
    - Selectively track a file;
    - Create annotated snapshots of that file;
-   - View the list of historical snapshots for that file;
+   - View the list of historical snapshots of that file;
    - Diff any two snapshots (or a snapshot against the current content);
-   - Rewind to a historical snapshot — **automatically creating a new branch to preserve the old path** on rewind, never destroying existing history.
-2. Each file has **independent**: history chain, branch set, and tag set.
-3. Each branch of a file must be a single-directional **non-branchable path**, without mid-path divergence or merge.
+   - Rewind to a historical snapshot — on rewind, **a new branch is created automatically to preserve the old line**, never destroying existing history.
+2. Each file has its **own independent**: branch history, branch set, and tag set.
+3. Each branch of a file must be a single-directional **non-branchable** path, without mid-path divergence or merge.
 4. Provide good portability: the `.lfv` directory can be copied or synced together with the working directory and behaves consistently after migration.
-5. Compact data storage: content-hash deduplication and compression to avoid storage bloat from naive backups.
-6. Distributed collaboration: implement coordinated sync with local or network repositories, enabling basic push / pull / remote / merge semantics.
+5. Compact data storage: content-hash deduplication and compression avoid the storage bloat of naive backups.
+6. Distributed collaboration: coordinated sync with local or network repositories, providing basic push / pull / remote / merge semantics.
 
 In order to stay "lightweight", the following are **out of scope**:
 
-- **Distributed communication protocol**: LFV does not constrain the underlying protocol of network repositories; it only specifies the interface for obtaining the `.lfv` directory via remote references. Implementors may extend drivers to support address formats such as `ssh:uname@host:~`, `https://other.dns/somerepo.lfv`, `https://webdav.host/somerepo`, etc.
-- **Merge/rebase scope limitation**: `merge` / `rebase` operations are limited to single-file branches; no cross-file coordination.
-- **Staging area**: always "working tree as direct snapshot subject" — version separation requires rewinding and modifying a snapshot.
-- **Replacing git**: source-code engineering scenarios should continue using git; LFV serves only the "file-centric" scenario.
+- **Distributed communication protocol**: LFV does not constrain the underlying protocol of network repositories; it only specifies the interface for obtaining a `.lfv` directory through a remote reference. Implementors may extend drivers to support address formats such as `ssh:uname@host:~`, `https://other.dns/somerepo.lfv`, `https://webdav.host/somerepo`, etc.
+- **Merge scope limitation**: `merge` / `rebase` operate only on the branches of a single file; there is no cross-file coordination.
+- **Staging operations**: always "the working tree is the part a snapshot applies to"; when versions must be separated, rewind and modify snapshots instead.
+- **Replacing git**: source-code engineering scenarios should continue to use git; LFV serves only the "file-centric" scenario.
 - **Graphical interface**: CLI only; a GUI should be a separate project.
 
 ## 3. Terminology Spec
@@ -58,174 +59,182 @@ In order to stay "lightweight", the following are **out of scope**:
 ### 3.1 Basic Terminology
 
 | Term | Description |
-| --- | --- |
-| Repository | The `.lfv` directory under the working directory; holds metadata and object storage for all tracked files. |
-| Working Tree | The working directory itself (excluding `.lfv`); where users actually operate on files. |
-| Tracked File | A file brought under repository management by `lfv track`. Identified internally by a `file-id` (ULID) that is **fully decoupled from its path**; the file's location in the working tree is a field on each Snapshot and can evolve over history. |
-| File Status | For paths already in LFV's view, status is `unmodified`, `modified`, or `untracked` (see §7). |
-| Object | A content-addressed storage unit for file content or global reference; deduplicated by content hash — identical content across any tracked files, regardless of path and branch, is stored as a single File Object. |
-| Snapshot | A "snapshot" of a file or the global state at a point in time: content pointer + path + metadata (message, timestamp, author, parent snapshot). |
-| Branch | A chain of snapshots for a tracked file; the default branch is `main`. Branch namespaces are independent per file. |
-| HEAD | The current branch and latest snapshot pointer for a tracked file. |
-| Tag | A human-readable name for a snapshot (optional), used to stably reference a specific version. |
-| Action | Actions that change a tracked file's state. Explicit actions include `track`, `snap`, and `untrack`. Implicit actions are `modify` (user edits the file) and `auto-track` / `auto-delete` (LFV scanning in response to OS create/delete events; see §7). |
-| LFV-visible | Files remaining in the working directory after `.lfvignore` directory pruning. |
+| ---- | ---- |
+| Repository | The `.lfv` directory under the working directory; carries the metadata and object storage of all tracked files. |
+| Working Tree | The working directory itself (excluding `.lfv`); where the files the user actually operates on live. |
+| Tracked File | A file brought under repository management by `lfv track`. Internally identified by a `file-id` (ULID) as its stable identity, fully decoupled from the path. |
+| File Status | For a path already within LFV's view, the status is `unmodified`, `modified`, or `untracked`. (see design §4.3) |
+| Object | A content-addressed storage unit for file content or for a global reference; deduplicated by content hash, so different files may share the same object. |
+| Snapshot | A photograph of one file, or of all files globally, at a moment in time: content pointer + path + metadata (message, timestamp, author, parent snapshot). |
+| Branch | A snapshot chain under one tracked file; the default branch is `main`. Each file's branch namespace is independent of the others. |
+| HEAD | The current branch name and latest snapshot pointer of a tracked file. |
+| Tag | An optional readable name for a snapshot, used to reference a version stably. |
+| Action | An operation that changes file state. Explicit actions: `track`, `snap`, `untrack`; implicit actions: `modify` (the user edits a file), `auto-track` / `auto-delete` (LFV responds to OS events automatically during a scan, see design §4.3). |
+| LFV-visible | — The files remaining in the working directory after directory pruning by `.lfvignore` matches. |
 
 ### 3.2 Storage Objects: File Object, Tree Object, File Snapshot, Tree Snapshot
 
-LFV has two **fully immutable, content-addressed** storage object types — File Object and Tree Object — stored in `.lfv/objects/`, deduplicated by content hash. Their common trait: write once, never modify. Integrity can be verified by recomputing hashes via `lfv verify`.
+LFV's storage objects consist of two **fully immutable, content-addressed** types — File Object and Tree Object — both stored in `.lfv/objects/` and deduplicated by content hash. What they have in common: written once, never modified. Integrity can be verified by recomputing the hash with `lfv verify`.
 
-LFV snapshots are an **append-only event record layer**, addressed by ULID, recording "what happened at a certain moment". They also come in two types: File Snapshot and Tree Snapshot, with highly symmetric structures, serving **two independent views**.
+LFV's snapshots are an **append-only event record layer**, addressed by ULID, recording "what happened at a certain moment". They also come in two types: File Snapshot and Tree Snapshot. Their structures are highly symmetric, and they serve **two independent views**.
 
 All snapshots are append-only; existing snapshots are never rewritten.
 
-> [!note] Immutability Principle for Snapshots and Objects
-> LFV's append-only guarantee means that "**traversable**" snapshots cannot be modified. Unreachable (dangling) snapshots are exempt from this constraint and can be safely physically deleted. File Objects and Tree Objects, as content-addressed units, have even stronger invariance — written once, never changed. This principle is the safety foundation for deletion operations like `lfv gc --purge`, see §5.9.
+> [!note] Immutability principle for snapshots and objects
+> LFV's append-only guarantee is that snapshots "**within the traversable range**" cannot be modified. Unreachable (dangling) snapshots are exempt from this constraint and can be safely physically deleted. File Objects and Tree Objects, as content-addressed units, have even stronger invariance — once written, never changed. This principle is the safety foundation for deletion operations such as `lfv gc --purge`; see §5.9.
 
-> [!note] Relationship Between File Objects and History
-> A File Object is purely a content unit — it carries no historical information. It has no parent-child relationship, does not know which branch it belongs to, and does not know at which point in time it was produced. Historical information is entirely carried by the Snapshot chain.
-> Any operation that requires historical context (`lfv log`, `lfv merge`, `lfv rebase`) must take `<FS-ish>` (branch name or snapshot id) as its parameter — a bare file-object hash only identifies "what the content is", not "where in history it lives".
-> `<FO-ish>` — file-id, path, tag, snap-id, or branch — can all be used wherever content resolution is needed (see the preamble to §4).
+> [!note] Relationship between File Objects and history
+> A File Object is only a content unit and carries no historical information — it has no parent-child relationship, does not know which branch it belongs to, and does not know at which point in time it was produced. Historical information is carried entirely by the Snapshot chain.
+> Any operation that needs historical context (`lfv log`, `lfv merge`, `lfv rebase`) must take `<FS-ish>` (a snapshot id, or a branch name / tag name with file context) as its argument, never a bare file-object hash — the latter identifies only "what the content is", not "where in history it lives".
+> All forms of `<FO-ish>` (see the preamble of §4) may be used wherever only the content is needed.
 
 #### 3.2.1 File Object
 
-A File Object is the content-addressed storage unit for a single file's raw bytes. Its identity is the `blake3` hash of the file's raw content — two files with identical content, regardless of path or history, share the same File Object. File Objects are fully immutable: written once, never modified. Storage details (compression, bucketing, deduplication) are described in §6.1.
+A File Object is the content-addressed storage unit for a single file's raw bytes. Its identity is the `blake3` hash of the file's raw content — files with different paths or histories share the same File Object if their content is identical. A File Object is fully immutable: written once, never modified. Storage details (compression, bucketing, deduplication) are described in design §3.2.
 
-`file-id` is the **stable internal identity** of a tracked file within the repository:
+`file-id` is the **stable identity** of a tracked file inside the repository:
 
-- A unique ULID is assigned **at first track**.
-- It has **no derivation relationship** with the file path and does not change on rename/move; the file-id remains valid even after deletion.
-- The "current path" of a tracked file is maintained by the mutable index (§3.3) and derived from events on the Snapshot chain — the Snapshot chain is the single source of truth, and mutable state can always be reconstructed from it.
+- A separate ULID is assigned **at first track**.
+- It has **no derivation relationship whatsoever** with the file path and does not change on rename or move; a `file-id` remains valid after the file is deleted.
+- A file's "current path" is maintained by the mutable index (§3.4) and continuously derived and updated from events on the Snapshot chain — the Snapshot chain is the single source of truth, and all mutable state can be rebuilt from it.
 
 #### 3.2.2 Tree Object
 
-For users, this is a repository snapshot. The term "repository snapshot" is used in the user interface, but this specification unifies it as "Tree Object."
+For users, this is the repository snapshot; the term "repository snapshot" is used in the user interface, while this specification unifies it as Tree Object.
 
-It stores a manifest of all valid tracked files in the working directory at a certain moment: a path-sorted list of `{path, file-object-hash}` entries, forming a canonical manifest. The tree-id is the `blake3()` of the manifest byte string, content-addressed. Two working-tree states with identical content produce the same Tree Object hash; only one copy exists in `objects/`. When the working directory has no valid tracked files, the manifest is empty — this is still a valid Tree Object.
+This object stores the content manifest of all valid tracked files in the working directory at a given moment: a list of `{path, file-object-hash}` entries in lexicographic path order, forming a canonical manifest. The tree-id is the `blake3()` of that manifest byte string, i.e. content-addressed. Two identical working-directory states produce the same Tree Object hash, and `objects/` stores only one copy. When there are no valid tracked files in the working directory the manifest is empty — this is still a valid Tree Object.
 
-Tree Objects share the same `objects/` directory with File Objects; the identity, deduplication, and storage mechanics are identical (see §6.1). Tree Objects tend to be small and are typically stored uncompressed.
+Tree Objects share the same `objects/` directory with File Objects, and their identity computation, deduplication, and storage mechanics are identical (see design §3.2). Tree Objects are usually very small and are normally stored as-is.
 
 #### 3.2.3 File Snapshot
 
-Each File Snapshot is a complete event record for a tracked file at a certain moment. Core fields:
+Each File Snapshot is a complete event record for a tracked file at a given moment. Core fields:
 
 - `id`: `snap_<ULID>`, time-ordered, globally unique, never rewritten.
 - `parent`: parent snapshot id; `null` for the first snapshot on a branch.
-- `path`: **the file's relative path in the working tree at the time this snapshot was taken** (path is a field on the snapshot, not the file's identity).
-- `object`: the blake3 hash of the referenced Object; **`null` when this snapshot is a deletion marker**.
-- `digest`: **a `blake3` hash of all fields in this snapshot record except `digest` itself, after canonical serialization**, used for tamper detection.
+- `path`: the file's relative path in the working tree at the time of this snapshot (the path is a field of the snapshot, not the identity of the file).
+- `object`: the blake3 hash of the referenced File Object; `null` when the file does not exist (a delete event).
+- `digest`: the blake3 hash of the canonical serialization of every field of this record except `digest`, used by `lfv verify` for tamper detection.
 
-Other informational fields (message, author, time, etc.) are described in §6.2.
+Additional informational fields — message, author, time, and so on — are described in design §3.3. Snapshots do not record tags; a tag is an external mutable pointer (design §3.8).
 
-File Snapshot characteristics:
+File Snapshots have the following characteristics:
 
-- **Does not explicitly store event type**.
-- **Does not record the branch it belongs to**; the snapshot only records historical facts.
-- The entire file lifecycle is the File Snapshot chain.
-- "Rename/move", "add", "content change", and "delete" are only meaningful at the UI level; they are distinguished by comparing fields with the parent snapshot. Derived on the read side from the `(parent.path, parent.object, path, object)` quadruple (add / modify / rename / rename+modify / delete / revive); see §6.2.1 for details.
-- Each File Snapshot has **exactly one parent pointer**, forming a **directed tree (forest)**: once branches diverge, they evolve independently; there is no topological merge point.
+- **The event type is not stored explicitly.**
+- **The owning branch is not recorded**; a snapshot records only a historical event.
+- The entire lifecycle of a file is its File Snapshot chain.
+- "Rename/move", "add", "content change", and "delete" are meaningful only in the user interface, and can be distinguished simply by comparing fields with the parent snapshot. They are derived on the read side from the `(parent.path, parent.object, path, object)` quadruple (add / modify / rename / rename+modify / delete / revive); see design §3.3.1 for details.
+- Each File Snapshot has only one parent pointer, so the whole forms a **directed tree (forest)**: once a branch diverges it evolves independently, and there is no topological merge point.
 
 #### 3.2.4 Tree Snapshot
 
-Each Tree Snapshot is a milestone record of the entire working directory, storing mainly:
+Each Tree Snapshot is a milestone record of the whole working directory, storing mainly:
 
-- `id`: `snap_<ULID>`, append-only, never rewritten.
-- `object`: tree-object pointer, pointing to a Tree Object (never null).
-- `parent`: parent snapshot id.
-- `digest`: a `blake3` hash of all fields except `digest` itself, after canonical serialization, for tamper detection.
+- `id`: `snap_<ULID>`, append-only, never rewritten
+- `object`: tree-object pointer, pointing to a Tree Object (never null)
+- `parent`: parent snapshot id
+- `digest`: the blake3 hash of the canonical serialization of every field of this record except `digest`, used by `lfv verify` for tamper detection.
 
-Other fields such as message, author, and time are described in §6.3.
+Other fields such as message, author, and time are described in design §3.4.
 
-Tree Snapshot is structurally symmetric to File Snapshot, but with these field differences:
+A Tree Snapshot is structurally symmetric to a File Snapshot, with these field differences:
 
-- The `path` field is empty (a tree does not need path localization).
-- `object` cannot be null (a tree snapshot always points to an Object — when the "entire working directory is empty", the manifest is zero bytes, the blake3 hash is computed normally, and this is a valid tree-id).
+- The `path` field is empty (a tree needs no path to locate).
+- `object` may not be null (a tree snapshot always points to a Tree Object).
 
-The tree plane has no branch concept, so there is no `branches.yaml`.
+The tree plane has no concept of branches, and therefore no `branches.yaml`.
 
-Global snapshots are optional for users: a repository may have no Tree Snapshots at all.
+Global snapshots are optional for the user: a repository may contain no Tree Snapshot at all.
 
-Tree Snapshot also has only one parent pointer, forming a directed tree. All Tree Snapshots are stored in a single append-only log (see §6.3 for the storage path and format).
+A Tree Snapshot likewise has only one parent pointer, forming a directed tree, and all Tree Snapshots are stored in a single append-only log (storage path and format in design §3.4).
 
-From a Tree Snapshot, you can locate a file's content at that moment via the file-object-hash in the Tree Object manifest; then search that file's Snapshot chain for an entry with a matching object hash to find the corresponding File Snapshot (the single-branch uniqueness invariant guarantees at most one candidate per branch).
+Starting from a Tree Snapshot, the file-object-hash in the Tree Object manifest locates the content of a file at that moment; searching that file's Snapshot chain for entries with a matching object hash then yields the corresponding File Snapshot (the single-branch object uniqueness invariant guarantees that matching snapshots form at most one contiguous run on a branch, of which the last entry with the same path is taken). The manifest itself contains no file-id; "which file" is answered by the tree reverse-reference cache (design §3.6).
 
-#### 3.2.5 Two Topology Layers
+#### 3.2.5 Topology Layers
 
-LFV history has two independent topology layers :
+LFV history has two independent topology layers:
 
-- **Snapshot layer** (physical storage): always a directed tree. Each snapshot has exactly one parent pointer; the structure never changes.
-- **Content layer** (derived view): nodes are object hashes, edges come from projecting the Snapshot parent relationship onto object identity. The single-branch object hash uniqueness invariant guarantees this layer is cycle-free on any individual branch, making it a DAG overall.
+- **Snapshot topology layer** (physical storage): always a directed tree; each Snapshot has exactly one parent pointer, and the structure never changes.
+- **Content topology layer** (derived view): a DAG whose nodes are object hashes and whose edges come from projecting the Snapshot parent relationship onto object identity (consecutive snapshots pointing at the same object collapse into a single node). Single-branch object uniqueness guarantees that this layer has no cycle on any individual branch.
 
-That is, objects and snapshots are decoupled: the former carries only content, the latter describes topology. A single object may be traversed by multiple snapshot timelines.
+That is, objects and snapshots are decoupled: the former carries only content, the latter describes topology, and one object may be traversed by multiple snapshot timelines.
 
-### 3.3 Snapshot Co-referent Determination and Co-referent Ancestors
+### 3.3 Snapshot Co-reference Determination and Co-referent Ancestors
 
-In LFV, different snapshots may point to the same File Object. LFV calls two such snapshots **co-referent**; many LFV operations are built on this concept.
+In LFV, different snapshots may point to the same File Object. LFV calls two such snapshots **co-referent**, and many LFV operations are built on co-reference.
 
-For example, rebase and merge operations require locating a co-referent ancestor: walking up each branch Snapshot chain to find the nearest node or pair of nodes that have appeared in both histories and are co-referent:
+Rebase and merge operations, for instance, need to locate the co-referent ancestor: walking up the Snapshot chains of the two branches to find the nearest node, or pair of nodes, that appeared in both histories and are co-referent:
 
-- **base-snap-ours**: the Snapshot on this branch history that points to the shared file-object
-- **base-snap-theirs**: the Snapshot on the target branch history that points to the same file-object
-- **base-object**: the shared file-object (identical content, stored once)
+- **base-snap-ours**: the Snapshot in this branch's history that points to the shared file-object
+- **base-snap-theirs**: the Snapshot in the target branch's history that points to the same file-object
+- **base-object**: the file-object both point to (identical content, stored once)
 
-The co-referent-ancestor snaps on two branches may be the same snapshot or different ones (when both branches independently experienced identical content). Thus base-snap-ours and base-snap-theirs are often not the same snapshot. Merge operations based on this co-referent ancestor -- especially in the more general case where they differ -- are called **4-way merge** by LFV.
+The co-referent ancestor snaps of two branches may be the same snapshot, or different ones (when the two branches independently went through identical content), so base-snap-ours and base-snap-theirs are frequently not the same snapshot. A merge operation based on such a co-referent ancestor — especially in the more general case where the co-referent ancestors are not the same snapshot — is what LFV calls a **4-way merge**.
 
 ### 3.4 Mutable Index
 
-LFV maintains a reconstructable **Mutable Index** as a working-state cache, avoiding full filesystem scans on every command; the recommended implementation is an embedded database. Storage objects (Objects) and the Snapshot chain are the repository's sole source of truth; the index can be rebuilt from them at any time. See §6.5 for details.
+LFV maintains a rebuildable **Mutable Index** as a cache of working-area state, so that no command has to scan the whole filesystem; the recommended implementation is an embedded database. Storage objects (Objects) and the Snapshot chain are the repository's single source of truth, so a corrupted index can be rebuilt from the source of truth at any time (`lfv rebuild-index`, §4.8). See design §3.6 for details.
 
 ## 4. CLI Functional Spec
 
-The following parameter conventions each ultimately resolve to one of the four storage objects (File Object, Tree Object, File Snapshot, Tree Snapshot):
+The parameter conventions below all ultimately resolve to one of the four storage objects (File Object, Tree Object, File Snapshot, Tree Snapshot). Branch names and tag names live in **a namespace that is independent per file** (§2, goal 2), so they may not appear on their own and must always carry file context.
 
-- `<FO-ish>` resolves to a **File Object**, including:
-  - `<file>` — a relative or absolute path of a file within the working directory; the CLI normalizes all paths internally to be relative to the repository root. The unsaved working-tree version of a file is also treated as a special File Object.
-  - `<file-id>` — the file identity ULID;
-  - `<tag>` — a tag name;
-  - `<snap-id>` — a snapshot also ultimately resolves to a File Object;
-  - `<branch>` — the branch HEAD ultimately resolves to a File Object.
-- `<FS-ish>` resolves to a **File Snapshot**, including:
-  - `<snap-id>` — a snapshot identifier;
-  - `<branch>` — a branch name.
-- `<TO-ish>` resolves to a **Tree Object**, including:
-  - `<tree-id>` — the tree identity ULID;
-  - `<T:tag>` — a tree tag name;
-  - `<T:snap-id>` — the Tree Object corresponding to a tree snapshot.
-- `<TS-ish>` resolves to a **Tree Snapshot**, which only includes:
-  - `<T:snap-id>` — a tree snapshot identifier.
+- `<file>` locates a tracked file (not one of its versions), in two spellings:
+  - a relative or absolute path of a file inside the working directory, which the CLI normalizes internally to a path relative to the repository root; a path that has disappeared from disk resolves to the file-id that last held that path in history;
+  - `<file-id>`, i.e. `f_<ULID>`.
+- `<FS-ish>` is an argument that resolves to a File Snapshot, including:
+  - `<snap-id>`: a snapshot identifier `snap_<ULID>`, globally unique and carrying its own file affiliation;
+  - `<file>`: the HEAD snapshot of that file's current branch;
+  - `<file>@<branch>`: the HEAD snapshot of one branch of that file;
+  - `<file>@<tag>`: the snapshot that a tag of that file points to.
+  In commands that already take a `<file>` argument (such as `lfv rewind <file> <FS-ish>`), `<FS-ish>` may omit the `<file>@` part and be written directly as a branch name, tag name, or snap-id.
+- `<FO-ish>` is an argument that resolves to a File Object, including:
+  - any `<FS-ish>`: resolves to that snapshot's `object`;
+  - `f_/<path>`: the current working-area content, treated as a special unsaved File Object. What follows `f_/` must be a path (a ULID contains no `/`), so there is no ambiguity with `f_<ULID>`.
+- `<TO-ish>` is an argument that resolves to a Tree Object, including:
+  - `<tree-id>`: the content hash of a Tree Object (`blake3:...`);
+  - `t:<tag>`: a tree tag name;
+  - `t:<snap-id>`: the Tree Object corresponding to a tree snapshot.
+- `<TS-ish>` is an argument that resolves to a Tree Snapshot, including:
+  - `t:<snap-id>`: a tree snapshot identifier;
+  - `t:<tag>`: the tree snapshot that a tree tag points to.
 
 ### 4.1 Repository Management
 
 | Command | Description |
-| --- | --- |
+| ---- | ---- |
 | `lfv init` | Create `.lfv/` in the current directory. Errors if it already exists. |
 | `lfv config <key> [value]` | Read or write repository configuration (e.g. `user.name`). |
 
 ### 4.2 File Tracking
 
 | Command | Description |
-| --- | --- |
-| `lfv track [<file>]` | Add a file to tracking. When `<file>` is given, errors if the path matches `.lfvignore`; otherwise removes it from the `untracked` list in `config.yaml`. If the path was previously untracked (not deleted), the original `file-id` is reused and the status table is updated to `modified` (awaiting the first `lfv snap` if there is no history). With no argument, scans and tracks all trackable files not yet in the status table. |
-| `lfv untrack <FO-ish>` | Stop tracking: errors if LFV-invisible; if visible, updates the dynamic `untracked` list in `config.yaml`; if it exists on disk, records `untracked` in the status table, otherwise config only. History is preserved; re-track via `lfv track` / `lfv revive`. |
-| `lfv mv <old> <new>` | Migrates the tracked file at `<old>` path to `<new>` path. Both arguments accept only paths, not `file-id`s. Whether an actual file move is performed in the working tree is governed by §7.6. The command appends a Snapshot immediately. |
-| `lfv relink <src-file-id> --onto <dst-file-id>` | Splices the current-branch history of src-file-id onto the end of dst-file-id's current branch, and the on-disk file becomes bound to dst-file-id; src-file-id is retired. **Operates only on each file-id's current branch**, no other branches, no 4-way merge content integration. Designed for the case where a new file-id was erroneously created; should not be used as a routine command. See §7.6. |
-| `lfv delete <file>` | Sets the file to `modified` in the status table and deletes it from disk. On a later `lfv snap`, if it is `modified` and absent from disk, LFV appends an `object = null` Snapshot, removes it from the `untracked` list in `config.yaml`, and updates the status-table cache. Its history remains complete and it can be revived at any time. |
-| `lfv revive <FO-ish>` | Revive a deleted file. `<FO-ish>` accepts file-id, path (LFV resolves it to file-id internally via the Snapshot chain), snap-id, or branch name. Automatically creates a new branch (`revive/<...>`) and restores the content to the working tree from the selected snapshot. |
-| `lfv list [--deleted]` | List all tracked files with their current branch and latest snapshot summary. By default shows only active files; `--deleted` also lists files with a deletion marker. |
+| ---- | ---- |
+| `lfv track [<file>]` | Add a file to tracking. When `<file>` is given, errors if the path matches `.lfvignore`; otherwise removes it from the untracked list in `config.yaml`. If that path was previously untracked rather than deleted, the original `file-id` is reused and the status table is updated to `modified` (awaiting the first `lfv snap` when there is no snapshot history). With no file argument, automatically scans all trackable files not yet in the status table and adds them to tracking. |
+| `lfv untrack <file>` | Stop tracking: errors if the file is LFV-invisible; if visible, updates the dynamic untracked list in `config.yaml`; if the file exists on disk, records `untracked` in the status table (keeping its file-id so `lfv track` can reuse it), otherwise only config is touched. History is preserved and can be resumed with `lfv track` / `lfv revive`. |
+| `lfv mv <old-file> <new-file>` | Migrate the tracked file at the `<old-file>` path to the `<new-file>` path. Both `<old-file>` and `<new-file>` accept paths only, not file-ids. Whether the actual file move is performed in the working tree is governed by design §4.6. |
+| `lfv relink <src-file-id> --onto <dst-file-id>` | Splice the history of src-file-id's current branch onto the end of dst-file-id's current branch; the on-disk file becomes identified by dst-file-id and src-file-id is retired. **Operates only on the current branch of each of the two file-ids**, touches no other branch, and performs no 4-way merge content integration. Designed for the case where a new file was created by mistake; not intended as a routine command. See design §4.7. |
+| `lfv delete <file>` | Set the file to modified in the status table and delete the file itself. When a later `lfv snap` detects that it is modified and absent from disk, it appends an `object = null` Snapshot and removes it from the untracked list in `config.yaml`, updating the cached state in the status table. Its history is preserved in full and it can be revived at any time with `lfv revive`. |
+| `lfv revive <file> [<FS-ish>]` | Revive a deleted file. The default restore point is the last snapshot on the current branch with `object != null`; another snapshot can be selected with `<FS-ish>`. Implemented as a rewind (§4.5): the branch name is unchanged, HEAD moves to the restore point, and the original HEAD containing the delete event is preserved by an automatically created `revive/<anchor-short>/<n>` branch; the content is written back to the last known path in the working tree. A new file with the same name that should continue the old history does not go through revive — use `lfv relink` (§5.7). |
+| `lfv list [--deleted] [--all]` | List all tracked files; each record includes the path, current branch, latest snapshot id, and summary. By default lists active files only; `--deleted` also lists files whose latest Snapshot has `object = null`; `--all` additionally lists retired file-ids (relink sources) and file-ids that are untracked but still have history. |
+
+**Path rules**: a trackable path must be valid UTF-8 and must not contain `"`, `\`, or control characters; paths that fail this are rejected by both `lfv track` and auto-track, with a hint to add them to `.lfvignore`. Paths are stored with `/` as the separator and compared byte by byte (on case-insensitive filesystems, a change of case alone still counts as a rename). Symbolic links are neither followed nor tracked; empty directories are not tracked.
 
 ### 4.3 Status and Snapshots
 
 | Command | Description |
-| --- | --- |
-| `lfv status [<file>]` | **Without `<file>`: list all `modified` tracked files.** Runs a lazy scan per §7.3 first. Default output shows tracked changes only, each line with `file-id` (`f_*`). `--include-untracked`: see §4.3.2. `--refresh`: force a full scan-cache refresh. With `<file>`: that file only. |
-| `lfv snap [<file>] [-m <msg>]` | Create a new snapshot for a file. **Without `<file>`: batch-snapshot all `modified` tracked files.** Refuses if working content is unchanged (unless `--allow-empty`). If the single-branch object uniqueness invariant in §7.10 would be violated, refuses and prompts the user to run `lfv rewind`. `--tree` parameter: see §4.3.3. |
-| `lfv log <FS-ish>` | List the history of the specified branch, or the branch containing the specified snapshot, with tree association information (from `tree_file_refs` table). When `<FS-ish>` is a branch name, shows that branch's history; when it is a snap-id, shows the history of the branch containing that snapshot. `--all`: show all branches of that file; `--graph`: render branch topology as ASCII art; `--limit N`: limit output count. |
-| `lfv log --tree` | List the tree history view: walk the Tree Snapshot chain, showing message, tags, and timestamps for each node. |
-| `lfv show <FO-ish>` | Output metadata for a specific snapshot; `--content` outputs the content; `--out <path>` exports it. |
+| ---- | ---- |
+| `lfv status [<file>]` | **Without `<file>`, lists all `modified` tracked files**; a lazy scan per design §4.3 runs first. Default output contains tracked changes only, with a `file-id` (`f_*`) on each line. For `--include-untracked` see §4.3.2. `--refresh` forces a full refresh of the scan cache. With `<file>`, only that file is shown. |
+| `lfv snap [<file>] [-m <msg>]` | Create a new snapshot for a file. **Without `<file>`, batch-snapshots every tracked file in `modified` state.** Refuses if both the working-area content and the path are identical to the HEAD snapshot. If single-branch object uniqueness would be violated (design §4.13), refuses to create the snapshot and prompts the user to run `lfv rewind`. For the `--tree` parameter see §4.3.3. |
+| `lfv log <FS-ish>` | List the history of the branch the snapshot is on, together with tree association information (from the tree reverse-reference cache). When `<FS-ish>` is `<file>`, shows its current branch; when it is `<file>@<branch>`, shows that branch; when it is a snap-id, shows the branch containing that snapshot — preferring the current branch, otherwise the first branch containing it in branch-name order. `--all` shows the history of all branches of that file; `--graph` renders the branch topology as ASCII art; `--limit N` limits the number of entries. |
+| `lfv log --tree` | List the history view of the tree plane: walk the Tree Snapshot chain, showing message, tags, and timestamp for each node. |
+| `lfv show <FS-ish>` | Output the metadata of that snapshot; `--content` also outputs the object content; `--out <path>` exports the content to a file. `lfv show <FO-ish> --content` / `--out` outputs object content only, with no metadata. |
 
 Notes:
-- For `modified` files in `lfv status`: deleted files show as `D`; files whose path differs from the last snapshot show as `R`; files with no snapshot yet show as `A`; all others show as `M`; files with both content and path changes show as `R+M`.
-- During `lfv snap`: each target modified file is checked against the current filesystem state. If the file exists, LFV writes or reuses an Object and appends a content Snapshot; if it does not exist, LFV appends a Snapshot with `object = null`; `unmodified` files are skipped. A lazy scan per §7.3 runs first; when `<file>` is specified, only that file is processed.
+- In `lfv status`, among `modified` files, a deleted file shows as `D`, a file whose path differs from its last snapshot shows as `R`, a file with no snapshot shows as `A`, anything else shows as `M`, and a file with both content and path changes shows as `R+M`.
+- During `lfv snap`, each target modified file is checked against its current filesystem state: if the file exists, an Object is written or reused and a content Snapshot is appended; if the file does not exist, a Snapshot with `object = null` is appended; `unmodified` files are skipped. A lazy scan per design §4.3 runs first; when `<file>` is given, only that file is processed (for an auto-detected rename still pending, both the old and the new path resolve to the same file).
+- When a file has no snapshot yet (`A`) and has already disappeared from disk, `lfv snap` produces no snapshot and merely cancels its tracking.
+- A batch `lfv snap` processes files independently: the failure of one file (a loopback, for instance) does not affect the others.
 
 #### 4.3.1 `lfv status` Output Format (Tracked Files)
 
@@ -239,239 +248,251 @@ Tracked files (changes):
                       content changed (12.4 KB -> 12.7 KB)
   R   f_01HA7ACE...   docs/photo.jpg -> docs/2026/photo.jpg
                       auto-detected (identical content hash)
-  D   f_01HA7DEF...   docs/old-note.md
+  D   f_01HA7DEF...   docs/removed_note.md
                       file missing on disk; will be deleted on next `lfv snap`
                       or run `lfv mv f_01HA7DEF <new-path>` if it was moved
   M   f_01HA7EEE...   docs/old-note.md  [newly tracked]
-                      note: this path previously existed as f_01HA7BCD (deleted)
+                      note: this path previously existed as f_023BHCA1 (deleted)
                       to continue its history instead, run:
-                        lfv relink f_01HA7EEE --onto f_01HA7BCD
+                        lfv relink f_01HA7EEE --onto f_023BHCA1
 
 Untracked (config.yaml):
   ~   drafts/local.md                  (2.1 KB)
 ```
 
-**Status flags:**
+**Status flags**:
 
 - `A` = add (newly tracked, no snapshot yet)
-- `M` = modified (includes newly tracked files not yet snapshotted)
-- `R` = rename (auto-detected pending rename; explicit `lfv mv` appends a Snapshot immediately)
-- `D` = suspected delete (**tracked** file missing from disk; confirmed as deletion marker on next `lfv snap`)
-- `~` = dynamic untracked (`status = untracked`, config policy + file exists on disk)
+- `M` = modified (includes a newly tracked file that has not been snapped yet)
+- `R` = rename (an auto-detected rename still pending; an explicit `lfv mv` appends a Snapshot immediately)
+- `D` = suspected delete (a **tracked** file in `modified` state that has disappeared from disk; the next `lfv snap` appends an `object = null` Snapshot according to the current filesystem state)
+- `~` = dynamic untracked (`status = untracked`, config policy + the file exists on disk)
 
-**The `file-id` column:**
+**The `file-id` column**:
 
-Displays `f_*` (ULID with `f_` prefix), abbreviated to the first 10 characters by default; `--long` shows the full length. Assigned at track time and persists through the file's entire lifecycle — it is the only stable reference token at the CLI level.
+Displays `f_*` (a ULID with the `f_` prefix), abbreviated to the first 10 characters by default; `--long` shows the full length. The value is assigned at track time, spans the file's entire lifecycle, and is the only stable reference token at the CLI level.
 
-**Any command that accepts `<file>` also accepts either a path or `f_*` as its argument:**
+**Any command that accepts `<file>` normally accepts either a path or an `f_*` as its argument**:
 
-- `lfv relink f_01HA7EEE --onto f_01HA7BCD` — splices f_01HA7EEE (new `file-id`, exists on disk) onto f_01HA7BCD (old `file-id`, disappeared); f_01HA7BCD continues as the active `file-id`, f_01HA7EEE is retired but preserved.
-- `lfv mv docs/old-note.md docs/notes/new.md` — path rename; stages a rename snapshot.
-- `lfv delete f_01HA7DEF` — can explicitly register a deletion by `file-id` even when the file is no longer in the working tree.
+- `lfv relink f_01HA7EEE --onto f_01HA7BCD` — splices the history of f_01HA7EEE (the new file-id, present on disk) onto f_01HA7BCD (the old file-id, which has disappeared); f_01HA7BCD continues as the active file-id, while f_01HA7EEE is retired but preserved.
+- `lfv mv docs/old-note.md docs/notes/new.md` — a path rename.
+- `lfv delete f_01HA7DEF` — a deletion can still be registered explicitly by file-id even when the file is no longer in the working tree.
 
 #### 4.3.2 `--include-untracked` (Display Dynamic Untracked)
 
-Separate from the working-tree scan in §7.3: this flag **only changes output** — no extra full-tree walk.
+This is an **independent** topic from the working-tree scan (design §4.3): the flag **only changes output** and triggers no extra full-tree walk.
 
-- **Single source**: rows with `file_states.status = untracked` (all already confirmed by scanning to exist on disk; §7.3.1).
-- LFV-visible only: paths matching `.lfvignore` never appear (§7.2). `.lfvignore` is a static exclusion rule; `lfv status` does not list LFV-invisible files.
-- After the tracked-files block in §4.3.1, append an **Untracked** section as `~` lines (no `file-id`); `stat` for size. Paths that disappeared from disk have no status-table row, so there is no `~` line.
+- **Single data source**: the `untracked` rows in the status table (all of which have been confirmed by scanning to exist on disk).
+- Only LFV-visible files appear, i.e. paths matching `.lfvignore` do not (design §4.2); `.lfvignore` holds static exclusion rules, and `lfv status` never lists LFV-invisible files.
+- An **Untracked** block is appended after the tracked-files block, listing entries with `~` (no `file-id`) and taking the size from `stat`; a path that has disappeared from disk has no status-table row and therefore no `~` line.
 
-See the §4.3.1 example; `~` meaning is in that section's status flags.
+For an output example see §4.3.1; for the meaning of `~` see the status flags in that section.
 
 #### 4.3.3 `lfv snap --tree`: Creating Tree Snapshots
 
 ```bash
 lfv snap --tree -m "chapter 3 complete"
-lfv snap --tree --tag v1.0 -m "first edition complete"   # create tag simultaneously
+lfv snap --tree --tag v1.0 -m "first edition complete"   # tag it at creation time
+lfv snap --snap-all -m "first edition complete"   # snap every modified file one by one with the same message
 ```
 
-**Precondition**: all tracked files must have no `modified` status; if any exist, the command errors and prompts the user to run `lfv snap` first.
+**Precondition**: no tracked file is in `modified` state; otherwise the command errors and prompts the user to run `lfv snap` first.
 
-**Effect**: captures a content-addressed snapshot of the entire working directory (all tracked files at their current HEAD objects), appends it to the Tree Snapshot chain, and advances the tree HEAD. If `--tag` is specified, the tag is recorded simultaneously. The internal execution steps are described in §7.10.
+The `--snap-all` parameter can be used to clear `modified` beforehand: LFV runs one `lfv snap` for each `modified` file with the same `<msg>` (equivalent to the user doing it manually one by one, with each file getting its own independent snapshot in its history). The failure of one file's snap (a loopback, for instance) does not affect the snaps of the others. `modified` must be cleared before a tree snapshot is created; `--snap-all` and `--tree` cannot be used together.
+
+**Effect**: captures the content of all tracked files in the current working directory (the file-object at each file's HEAD) as one content-addressed global snapshot, appends it to the Tree Snapshot chain, and advances the tree HEAD. If `--tag` is given, the tag is written at the same time. Internal execution steps are in design §4.11.
 
 ### 4.4 Diffing
 
-The current working-tree content can be used as an unsaved special File Object, referenced by the literal `f_/path/to/file`.
+The current working-area content can serve as a special unsaved `File Object`, referenced with the literal `f_/<path>` (preamble of §4).
 
 | Command | Description |
-| --- | --- |
-| `lfv diff <FO-ish>` | Working tree vs. the File Object pointed to by the given `<FO-ish>`. Equivalent to omitting the second argument `f_/path/to/file`; the path is inferred from the first argument. |
-| `lfv diff <FO-ish-A> <FO-ish-B>` | Diff between two File Objects (can be different files or different versions of the same file). |
+| ---- | ---- |
+| `lfv diff <FO-ish>` | The File Object pointed to by the given FO-ish vs. the current working-area content. This amounts to omitting the second argument `f_/<path>`, whose path is inferred from the current path of the file the first argument belongs to. A bare path as `<FO-ish>` resolves to the object at that file's current HEAD, so `lfv diff docs/note.md` is HEAD vs. the working area. |
+| `lfv diff <FO-ish-A> <FO-ish-B>` | A comparison between two File Objects. (They may belong to different files, or be different versions of the same file.) |
 
-Text files use line-based diff (default 3-line context); binary files show only metadata differences (size, hash).
+Text files use a line-based diff (3 lines of context by default); binary files show metadata differences only (size, hash).
 
 ### 4.5 Rewind and Branches
 
 | Command | Description |
-| --- | --- |
-| `lfv rewind <file> <FS-ish>` | Restore the working-area file content to the File Object pointed to by the specified `<FS-ish>`. **Creates a new branch pointing to the original HEAD**, and redirects the current branch HEAD to the target snapshot. When used to resolve a loopback event (§7.10), `lfv rewind <file> <base-snap-ours>` is executed, where `base-snap-ours` is the parent snapshot of the ancestor with the identical hash. |
-| `lfv rewind <TS-ish>` | Restore the working tree to the state of the specified Tree Snapshot. Updates `.lfv/trees/HEAD`; for each file uses the FF-priority strategy (see §4.5.1 for details). |
-| `lfv branches <file>` | List all branches for this file. |
-| `lfv switch <file> <branch>` | Switch the file's current branch (also updates working-area content to the head snapshot of that branch). Only targets file branches, does not operate on tree. |
+| ---- | ---- |
+| `lfv rewind <file> <FS-ish>` | Restore the working-area file content to the File Object of the snapshot that `<FS-ish>` points to (content only, the path is not changed; when the HEAD snapshot path differs from the on-disk path, the next `lfv snap` records an `R`). **The branch name is unchanged**: a preserving branch `rewind/<anchor-short>/<n>` pointing at the original HEAD is created automatically first, then the current branch's HEAD is moved to the target snapshot. Refuses to run while the file is in `modified` state (run `lfv snap` first, or discard the changes yourself), except in loopback mode. When used to resolve a loopback event, the user passes the matched ancestor snapshot itself, and LFV splices according to the rules in design §4.13. |
+| `lfv rewind <TS-ish>` | Restore the working area to the state of the specified Tree Snapshot. Updates `.lfv/trees/HEAD`; applies an FF-priority strategy per file (details in §4.5.1). |
+| `lfv branches <file>` | List all branches of that file. |
+| `lfv switch <file> <branch>` | Switch that file's current branch (also updating the working-area content to that branch's head snapshot). File plane only; the tree plane is not touched. Refuses while the file is in `modified` state. When the target branch's HEAD has `object = null` (the file is deleted on that branch), the file is removed from the working tree, after which it can only be referenced by file-id. |
 | `lfv branch-rename <file> <old> <new>` | Rename a branch. |
-| `lfv branch-delete <file> <branch>` | Delete a branch (only deletes the pointer; objects are retained in case of sharing). |
+| `lfv branch-delete <file> <branch>` | Delete a branch (only the pointer is deleted; snapshots and objects are retained so they can be shared and recovered). |
+
+**Preserved-branch naming rules**: branches created automatically by rewind-style operations are uniformly named `<kind>/<anchor-short>/<n>`. `kind ∈ {rewind, detour, rebase, revive}` states the originating operation (respectively the rewind in this section, loopback handling in design §4.13, §4.7.1, and revive in §4.2); `anchor-short` is the last 8 characters of the ULID of the preserved old HEAD snapshot; `n` increments from 1 to avoid name collisions.
 
 #### 4.5.1 `lfv rewind <TS-ish>` Execution Flow
 
-**Pre-check**: check whether the working tree contains files that are `modified` but have no file-object yet (new, modified, or deleted but not `lfv snap`ped). If so, refuse execution:
+**Pre-check**: check whether the working area contains any tracked file in `modified` state (including `A` / `M` / `R` / `D`). If so, refuse to run:
 
 ```
-error: the following files have unsaved changes (no file-object yet):
+error: the following files have unsaved changes:
   M  docs/draft.md
 run `lfv snap` first, or discard changes manually.
 ```
 
-**Actual execution**: once the pre-check passes, for each file involved in `<TS-ish>`, execute `lfv rewind <file> <FS-ish>`, where `<file>` and `<FS-ish>` are derived from `<TS-ish>`. Simultaneously update the tree HEAD to point to `<TS-ish>`.
+**Actual execution**: once the precondition is met, if the current tree HEAD has no tag at all and is not an ancestor of the target Tree Snapshot, it is first tagged automatically as `t:detour/<head-short>` (the tree plane has no branches, so this is the only way to keep the tip being left behind reachable). Then, for every file involved in `<TS-ish>`, `lfv rewind <file> <FS-ish>` is executed, with `<file>` and `<FS-ish>` derived from `<TS-ish>` (manifest entries are mapped to file-ids through the tree reverse references). The tree HEAD is pointed at `<TS-ish>` at the same time.
 
-**Effect**: restores the working tree to match the state recorded in the target Tree Snapshot. Updates the tree HEAD. For each tracked file, LFV uses an FF-priority strategy: if the target content is already reachable via an existing branch HEAD, it switches to that branch without creating a new one; otherwise it creates a new rewind branch. Files that existed after the target snapshot are removed from the working tree; files in the snapshot that are currently untracked or deleted are written back to disk and left for the next scan to process. The detailed per-file algorithm is described in §7.9.
+**Effect**: restores the whole working tree to the state recorded by the target Tree Snapshot and advances the tree HEAD. Each tracked file uses an FF-priority strategy: if the target content is already reachable through the HEAD of some existing branch, that branch is switched to and no new branch is created; otherwise a new branch is created to preserve where the original branch pointed, and the original branch is directed to the target snapshot. When a file's current path differs from the manifest path, the on-disk file is moved back to the manifest path as well. Files added after the target snapshot are deleted from the working area; files present in the snapshot but currently untracked or deleted have their bytes written back to disk and are handed over to the next scan. The detailed per-file algorithm is in design §4.12.
 
 ### 4.6 Tags
 
 | Command | Description |
-| --- | --- |
-| `lfv tag <file> <snap> <name>` | Tag a snapshot with a name. |
-| `lfv tags <file>` | List all tags for this file. |
-| `lfv tag-delete <file> <name>` | Delete a tag. |
+| ---- | ---- |
+| `lfv tag <file> <snap> <name>` | Tag a snapshot of a file. |
+| `lfv tags <file>` | List all tags of that file. |
+| `lfv tag-delete <file> <name>` | Delete a file tag. |
 | `lfv tag --tree <snap> <name>` | Tag a Tree Snapshot (stored as `t:<name>`). |
 | `lfv tags --tree` | List all tree tags. |
 | `lfv tag-delete --tree <name>` | Delete a tree tag. |
 
-User-input tag names are not allowed to contain `:` (namespace isolation).
-
+User-input tag names may not contain `:` (namespace isolation). Once created, a tag's target cannot be changed; after deletion, the same name can be created again.
 
 ### 4.7 Merge and Rebase
 
-Both merge and rebase operations target **file-plane branches only**, unrelated to the tree plane. Both use a **common ancestor** as the base point, progressively replay changes via 4-way merge, and introduce conflict handling mechanisms -- i.e., file-object in the content layer is the alignment coordinate.
+Merge and rebase operations both target **file-plane branches only** and have nothing to do with the tree plane. Both take the **co-referent ancestor** as their base point, replay changes step by step through 4-way merge, and introduce a conflict-handling mechanism. In other words, the file-object in the content layer is the coordinate along which things are aligned.
 
 > [!note] Note
-> lfv merge / lfv rebase differ from lfv relink:
-> - lfv merge / lfv rebase operate on history versions of the same file.
-> - lfv relink involves no content merge — it simply appends one file's current-branch history to another file's. lfv merge / lfv rebase operate on the same file's branches via 4-way merge.
+> `lfv merge` and `lfv rebase` differ from `lfv relink`:
+> - `lfv merge` and `lfv rebase` operate on historical versions of the same file and perform a 4-way merge.
+> - `lfv relink` merges two file IDs into one and involves no three-way content merge; it simply attaches the current-branch history of one file to the end of the current-branch history of another.
 
-**Parameter constraints**: <target> accepts only <FS-ish> (branch name or snapshot id) -- a file-object carries no history information and cannot be used as a parameter to history operations (see Section 3.2). A branch name is equivalent to the snapshot that the branch HEAD currently points to.
+**Parameter constraints**: `<target>` accepts only `<FS-ish>` (a branch name or snapshot id) — a file-object carries no historical information and cannot be an argument to a history operation (see §3.2). A branch name is equivalent to the snapshot its HEAD currently points to.
 
-Both lfv merge and lfv rebase must first locate a common ancestor (Section 3.3). If no common ancestor is found, an error is reported and the operation is rejected:
+Both `lfv merge` and `lfv rebase` must first locate the co-referent ancestor (§3.3). If no co-referent ancestor can be found, the operation is rejected with an error:
 
-`
+```
 error: no common ancestor found between branch 'main' and 'feature'
        cannot merge/rebase without a shared content base.
-`
+```
 
-#### 4.7.1 lfv rebase <file> <FS-ish>
+#### 4.7.1 `lfv rebase <file> <FS-ish>`
 
-Insert the history between the target branch's base-snap-theirs and HEAD into this branch's base-snap-ours node.
+Insert the history between the target branch's base-snap-theirs and its HEAD at this branch's base-snap-ours node.
 
 **Semantics**:
-- Rewind this branch HEAD first to the snapshot base-snap-ours corresponding to the common ancestor (branch name remains unchanged; the old HEAD position is retained by a newly created 
-ebase/<target-short>/<n> branch).
-- Using the target branch's base-snap-theirs as the base point, replay each file-object change from base-snap-theirs to its HEAD via 4-way merge on this branch, producing a sequence of new file-objects and corresponding Snapshots.
-- Then replay each file-object change from after base-snap-ours to the original HEAD of this branch via 4-way merge, continuing to apply them on this branch, producing more new file-objects and Snapshots, advancing this branch HEAD to the end of the new chain.
+- First rewind this branch's HEAD to base-snap-ours, the snapshot corresponding to the co-referent ancestor (the branch name stays the same; the old HEAD position is preserved by a newly created `rebase/<anchor-short>/<n>` branch, naming rules in §4.5)
+- Then, taking the target branch's base-snap-theirs as the base point, rebuild each file-object change from after base-snap-theirs up to that branch's HEAD on this branch, one at a time via 4-way merge, producing a series of new file-objects and corresponding Snapshots
+- Finally, apply each file-object change this branch originally had from after base-snap-ours up to its original HEAD, again one at a time via 4-way merge, producing a series of new file-objects and corresponding Snapshots, with this branch's HEAD advancing to the end of the new chain
 
 **Execution steps**:
 
-1. Locate common ancestors (Section 3.3); collect the ordered Snapshot list for the target branch from base-snap-theirs to its HEAD, as well as for this branch from after base-snap-ours to the original HEAD.
-2. Rewind this branch HEAD to base-snap-ours (retain current branch name; create a new branch pointing to the original HEAD).
-3. For each step snap_i in the target branch's sequence to apply (in chronological order):
-   - base = file-object of snap_{i-1} (first step uses base-object)
-   - ours = file-object at this branch's current landing point
-   - theirs = file-object of snap_i
-   - Execute 4-way merge, produce a new file-object, append a new Snapshot
-4. Repeat step 3 logic for the to-be-replayed sequence from after base-snap-ours on this branch, rebuilding this branch history after the target branch history.
-   - On **conflict**: pause, output conflict markers, wait for user to resolve and continue (see Section 4.7.3)
-   - On **loopback**: prompt the user to choose -- rewind to skip this step (automatically continue after acceptance), or abort rollback (see Section 4.7.4)
+1. Locate the co-referent ancestor (§3.3); collect the ordered Snapshot lists for the target branch from after base-snap-theirs to its HEAD, and for this branch from after base-snap-ours to its original HEAD.
+2. Rewind this branch's HEAD to base-snap-ours (keeping the current branch name, creating a new branch that points at the original HEAD).
+3. For each step `snap_i` in the target branch's sequence to apply (in chronological order):
+   - base = the file-object of `snap_{i-1}` (the first step uses base-object)
+   - ours = the file-object at this branch's current landing point
+   - theirs = the file-object of `snap_i`
+   - Perform a 4-way merge, produce a new file-object, and append a new Snapshot
+4. Repeat the logic of step 3 for this branch's own replay sequence from after base-snap-ours, rebuilding this branch's history after the target branch's history.
+   - On a **conflict**: pause, output conflict markers, and wait for the user to resolve them before continuing (see §4.7.3)
+   - On a **loopback**: prompt the user to choose one of two options — rewind to skip that step (continuing automatically once accepted), or abort and roll back (see §4.7.4)
 
-**History preservation**: rebase produces a new Snapshot chain; no existing records at the Snapshot layer are modified; the old HEAD position is retained by the newly created branch and can be inspected at any time.
+**History preservation**: a rebase produces a new Snapshot chain and modifies no existing record at the Snapshot layer; the original HEAD position is preserved by the newly created branch and can be inspected at any time.
 
-#### 4.7.2 lfv merge <file> <FS-ish>
+#### 4.7.2 `lfv merge <file> <FS-ish>`
 
-Insert the history between the target branch's base-snap-theirs and HEAD into this branch's current HEAD.
+Insert the history between the target branch's base-snap-theirs and its HEAD at this branch's current HEAD.
 
 **Semantics**:
-- Keep this branch's current HEAD unchanged (branch name and position remain the same).
-- Using the common ancestor base-object as the baseline, replay each file-object change from the target branch's base-snap-theirs to its HEAD via 4-way merge applied on top of this branch HEAD, producing a sequence of new file-objects and corresponding Snapshots, advancing this branch HEAD to the end of the new chain.
+- Keep this branch's current HEAD where it is (both branch name and position unchanged)
+- Taking the co-referent ancestor's base-object as the baseline, apply each file-object change from after the target branch's base-snap-theirs up to its HEAD on top of this branch's HEAD, one at a time via 4-way merge, producing a series of new file-objects and corresponding Snapshots, with this branch's HEAD advancing to the end of the new chain
 
 **Execution steps**:
 
-1. Locate common ancestors (Section 3.3); collect the ordered Snapshot list for the target branch from base-snap-theirs to its HEAD (sequence to apply).
-2. For each step snap_i in the sequence to apply (in chronological order):
-   - base = file-object of snap_{i-1} (first step uses base-object)
-   - ours = file-object at this branch's current landing point
-   - theirs = file-object of snap_i
-   - Execute 4-way merge, produce a new file-object, append a new Snapshot
-   - On **conflict** or **loopback**: handling is the same as Section 4.7.3 / 4.7.4
+1. Locate the co-referent ancestor (§3.3); collect the ordered Snapshot list for the target branch from after base-snap-theirs to its HEAD (the sequence to apply).
+2. For each step `snap_i` in the sequence to apply (in chronological order):
+   - base = the file-object of `snap_{i-1}` (the first step uses base-object)
+   - ours = the file-object at this branch's current landing point
+   - theirs = the file-object of `snap_i`
+   - Perform a 4-way merge, produce a new file-object, and append a new Snapshot
+   - On a **conflict** or a **loopback**: handled as in §4.7.3 / §4.7.4
 
 #### 4.7.3 Conflict Handling
 
-When a 4-way merge produces a conflict, LFV pauses the operation and writes conflict markers into the working-tree file:
+When a 4-way merge produces a conflict, LFV pauses the operation and writes conflict markers into the working-area file:
 
 ```diff
  <<<<<<< ours (main)
- Content from this branch
+ content from this branch
  =======
- Content from the target branch
+ content from the target branch
  >>>>>>> theirs (feature / snap_01HXYZ)
 ```
 
-After the user manually edits to resolve the conflict, they execute:
+Note: every line in this example carries a leading space so that version-control tooling does not treat it as a real conflict. There is no such leading space in actual use.
+
+Conflict markers cannot be written into a binary file: LFV pauses just the same, and the user continues by choosing one side with `--continue --ours` or `--continue --theirs`, or gives up with `--abort`.
+
+After the user has resolved the conflict by editing manually, they run:
 
 ```bash
 lfv merge --continue   # or lfv rebase --continue
 ```
 
-LFV treats the resolved working-tree content as a new file-object, appends a Snapshot, and continues replaying the next step.
+LFV takes the resolved working-area content as a new file-object, appends a Snapshot, and continues with the next replay step.
 
-If the user abandons the operation, they execute:
+If the user gives up, they run:
 
 ```bash
 lfv merge --abort   # or lfv rebase --abort
 ```
 
-LFV restores this branch HEAD to its original pre-operation state, also restoring the working-tree content. All intermediate Snapshots appended during the operation are hidden via branch pointer rollback (Snapshots themselves remain in the append-only log but are no longer referenced by any branch).
+LFV restores the branch HEAD to its original pre-operation state and restores the working-area content with it; all intermediate Snapshots already appended are hidden by rolling the branch pointer back (the Snapshots themselves remain in the append-only log but are no longer referenced by any branch).
 
 #### 4.7.4 Loopback Handling
 
-During replay, if a step produces a file-object that has already appeared in this branch's history (violating the single-branch object uniqueness invariant, Section 7.10), LFV pauses and prompts:
+If some step of the replay produces a file-object that already appears in the current branch's history (violating single-branch object uniqueness, design §4.13), LFV pauses and prompts:
 
 ```
 warning: step snap_01HXYZ produces content already present in branch 'main'
          (object blake3:abc123...)
 options:
   [r] lfv rewind to skip this step and continue rebase/merge
-  [a] abort -- restore branch to original state
+  [a] abort — restore branch to original state
 ```
 
-- Choose **rewind**: LFV performs a rewind on the current step (moving intermediate history into a detour_* branch), then **automatically continues** subsequent replay steps without requiring further user confirmation.
-- Choose **abort**: same as §4.7.3 abort semantics; this branch HEAD restores to its original state.
+- Choosing **rewind**: LFV performs a rewind for the current step (moving the intermediate history into a `detour/<anchor-short>/<n>` branch), then **continues automatically** with the remaining replay steps without asking the user again.
+- Choosing **abort**: the abort semantics of §4.7.3; the branch HEAD is restored to its original state.
 
+#### 4.7.5 `lfv merge --pick <file> <snap-id>`
+
+Replay the change of a single snapshot as one step on top of the current branch's HEAD (the equivalent of git cherry-pick): base = the object of that snapshot's parent (empty content when the parent is `null` or the parent's object is `null`), theirs = the object of that snapshot, ours = the object at the current HEAD; one 4-way merge is performed, producing a new file-object and appending a Snapshot. Conflicts and loopbacks are handled as in §4.7.3 / §4.7.4. `<snap-id>` must belong to the same file. The content-deletion workflow in §5.9 depends on this command.
 
 ### 4.8 Maintenance
 
 | Command | Description |
-| --- | --- |
+| ---- | ---- |
 | `lfv gc` | Reclaim objects not referenced by any snapshot. |
-| `lfv gc --purge` | Permanently delete all dangling snapshots and unreferenced objects (File Object + Tree Object). This is a high-risk irreversible operation — confirm explicitly before running. |
-| `lfv verify` | Verify object store integrity (recompute hashes and compare); also walk every branch of every file and report any duplicate object hash on a single branch as a data-integrity error (see §7.10.3). |
-| `lfv export <file> [--format zip\|tar] -o <out>` | Export all history for a file as a self-contained archive for migration. |
+| `lfv gc --purge` | Reclaim unreferenced snapshots along with objects not referenced by any snapshot, warning that this is a high-risk operation from which data cannot be recovered. Reachability is defined in design §3.11. |
+| `lfv verify` | Verify the integrity of the object store (recompute hashes and compare); recompute each snapshot's `digest` line by line; walk every branch of every file and check single-branch object uniqueness (design §4.13), reporting a violation as a data-integrity error; check that the objects referenced by Tree Objects exist. |
+| `lfv rebuild-index` | Discard `index.db` and rebuild it from the source of truth (objects/, snapshots.log, the yaml files) (design §3.10). Does not touch HEAD, branches, tags, or config. |
+| `lfv export <file> [--format zip\|tar] -o <out>` | Export the whole history of a file as a self-contained archive for migration. The archive contains that file-id's directory and the File Objects reachable from it, with the same directory structure as `.lfv`. |
+| `lfv import <archive>` | Import an archive produced by `lfv export`: merge its file-id directory (`meta.yaml`, `HEAD`, branch/tag tables, `snapshots.log`) and the reachable File Objects into the current repository, keeping the file-id unchanged and merging objects by content hash. Every snapshot `digest` is verified before importing; a corrupted archive is rejected with an error and nothing is partially imported. Errors if that file-id already exists in the current repository (which should not happen normally, as ULIDs are globally unique). **After an import the working tree is not modified and no status-table row is registered** — the file history enters the repository in an "inactive" state and must be restored to the working tree on demand with `lfv revive <file-id>`. Internal execution steps are in design §4.16. |
 
 ## 5. Typical Workflows (Spec)
 
-LFV adopts a **track-by-default** policy: files in the working directory should, under normal circumstances, all be in a tracked state. To this end, relevant commands run a **lazy working-tree scan** before executing, automatically responding to OS-level create and delete events — no background daemon required.
+LFV adopts a "**track everything by default**" policy: files under the working directory should normally all be in a tracked state. To that end, relevant commands run a **lazy scan** of the working tree before executing, responding automatically to OS-level create and delete events with no background daemon.
 
 ### 5.1 First Use
 
 ```bash
 cd /path/to/A
 lfv init
-# Optional: create .lfvignore to statically exclude paths
+# Optional: create .lfvignore to statically exclude paths from tracking
 echo "node_modules/" >> .lfvignore
 echo "*.tmp" >> .lfvignore
 
 lfv status
-# -> Lazy scan (§7.3): trackable new files are auto-tracked (tracking flag set, no Snapshot yet).
-#    All files show the `A` flag and have `modified` status in the status table.
+# -> Lazy scan (design §4.3): trackable new files are auto-tracked (tracking flag set, no Snapshot)
+#    All files show the `A` flag and are in modified state in the status table
 
-lfv snap -m "initial snapshot"   # Batch-snapshot all modified files; produces first Snapshot
+lfv snap -m "initial snapshot"   # Batch-snapshot all modified files, producing the first Snapshot
 ```
 
 ### 5.2 Day-to-day Editing
@@ -495,25 +516,26 @@ lfv diff docs/note.md snap_01HXYZ
 ```bash
 lfv log docs/note.md
 lfv rewind docs/note.md snap_01HXY0
-# -> Automatically creates branch rewind/01HXY0/1 and switches the working area to it.
-#    Subsequent snaps land on this new branch; the original main branch history is fully preserved.
+# -> First automatically creates branch rewind/7RQ2M9KA/1 pointing at main's previous HEAD (history fully preserved)
+# -> Then moves main's HEAD to snap_01HXY0, and the working-area content follows
+# Subsequent snaps keep landing on main; the old line can be revisited any time with `lfv switch docs/note.md rewind/7RQ2M9KA/1`
 ```
 
 ### 5.5 Rename / Move
 
 ```bash
-# Scenario A: rename via LFV (recommended, atomic)
+# Scenario A: rename through LFV (recommended, atomic)
 lfv mv docs/note.md docs/notes/2026-05/note.md
-# -> Appends a rename snapshot; path changes from old to new, object unchanged.
+# -> Appends a rename snapshot; path changes from old to new, object unchanged
 
-# Scenario B: renamed by OS, content unchanged — auto-detection handles it
+# Scenario B: renamed with the OS first, content unchanged — auto-detection is enough
 mv docs/note.md docs/notes/2026-05/note.md
 lfv status
 #   R   f_01HA7BCD   docs/note.md -> docs/notes/2026-05/note.md
 #                    auto-detected (identical content hash)
-lfv snap                        # Commit all auto-detected changes
+lfv snap                        # Commit all detected changes together
 
-# Scenario C: renamed by OS and content also changed — auto-detection fails, manually declare history continuation
+# Scenario C: renamed with the OS and content changed too — auto-detection fails, continue history manually
 mv docs/note.md docs/notes/2026-05/note-v2.md
 $EDITOR docs/notes/2026-05/note-v2.md
 lfv status
@@ -522,24 +544,25 @@ lfv status
 #   M   f_01HA7EEE   docs/notes/2026-05/note-v2.md  [newly tracked]
 lfv relink f_01HA7EEE --onto f_01HA7BCD
 # -> f_01HA7EEE's content (current path + object) is appended as the next Snapshot on f_01HA7BCD's history
-# -> Event type derived by comparing f_01HA7BCD's last snapshot with the new Snapshot (typically R+M)
-# -> f_01HA7EEE is retired (file_states cancelled, snapshots.log preserved)
+# -> The event type is derived by comparing f_01HA7BCD's last snapshot with the new Snapshot (typically R+M)
+# -> f_01HA7EEE is retired (its status-table row is cancelled, snapshots.log is preserved)
 ```
 
 ### 5.6 Delete and Revive
 
 ```bash
-lfv delete docs/old-note.md     # Mark modified and remove from disk; snap appends deletion marker
-lfv snap -m "remove old note"   # Commit deletion marker (or leave it for the next no-arg `lfv snap`)
+lfv delete docs/old-note.md     # Deletes the working-tree file and marks the status table as modified
+lfv snap -m "remove old note"   # Appends an object = null Snapshot (or leave it to the next no-arg lfv snap batch)
 lfv log docs/old-note.md        # History is still fully queryable
-lfv revive docs/old-note.md     # Automatically creates a revive/<...> branch and restores content to working tree
+lfv revive docs/old-note.md     # main's HEAD returns to the snapshot before the deletion and the content is restored to the working tree;
+                                # the delete event is preserved by the automatically created revive/<anchor-short>/1 branch
 ```
 
-### 5.7 Continuing Old History at the Same Path
+### 5.7 Continuing Old History with a New File of the Same Name
 
 ```bash
-# Scenario: docs/old-note.md was previously deleted (has a deletion marker);
-#           a new file has been created at the same path.
+# Scenario: docs/old-note.md was deleted earlier (that file-id's latest Snapshot has object = null),
+#           and a new file has now been created at the same path
 
 lfv status
 #   M   f_01HA7EEE...   docs/old-note.md  [newly tracked]
@@ -547,688 +570,89 @@ lfv status
 #                       to continue its history instead, run:
 #                         lfv relink f_01HA7EEE --onto f_01HA7BCD
 
-# Option A: treat the new file as independent, unrelated to old history — snap directly
+# Option A: the new file is simply a new file, unrelated to the old history — snap directly
 lfv snap docs/old-note.md -m "new document"
 
-# Option B: the new file is a continuation of the old one — resume old history
+# Option B: the new file continues the old one — resume the old history
 lfv relink f_01HA7EEE --onto f_01HA7BCD
-# -> f_01HA7EEE's content is appended as the next Snapshot on f_01HA7BCD's history (revive event)
-# -> f_01HA7EEE is retired (file_states cancelled, snapshots.log preserved, no active trace)
+# -> f_01HA7EEE's content is appended as the next Snapshot on f_01HA7BCD's history (a revive event)
+# -> f_01HA7EEE is retired (its status-table row is cancelled, snapshots.log is preserved, no active trace remains)
 ```
 
-### 5.8 Tree Snapshots (Global View)
+### 5.8 Global Snapshots (tree plane)
 
 ```bash
-# After editing all files for the current version, ensure everything is snapped first
+# After editing all files of the current version, make sure everything is snapped first
 lfv snap -m "finish chapter 3"
 
 # Create a tree-snapshot to mark a milestone
 lfv snap --tree -m "chapter 3 complete"
-lfv snap --tree --tag v1.0 -m "first edition complete"   # also tag it
+lfv snap --tree --tag v1.0 -m "first edition complete"   # tag it at the same time
 
 # View tree history
 lfv log --tree
 # snap_01HABC  2026-05-30 10:00  "first edition complete" [t:v1.0]
 # snap_01HXYZ  2026-05-17 09:21  "chapter 3 complete"
 
-# Revert to a tree-snapshot (restore working tree content globally)
+# Return to a tree-snapshot (the whole working-area content is restored)
 lfv rewind t:v1.0
 lfv rewind t:snap_01HXYZ
 ```
 
 ### 5.9 Content Deletion
 
-When history contains inappropriate content (e.g., versions involving privacy, security issues, or sensitive data that is no longer needed), LFV provides a **three-step workflow** for thorough elimination. This section covers the rationale and how tree snapshots interact with this process.
+When history contains inappropriate content (privacy or security issues, or sensitive versions that are no longer needed), LFV provides a **three-step workflow** for thorough elimination. This section explains the reasoning and how tree snapshots interact with that flow.
 
-> [!warning] `lfv gc --purge` is an irreversible operation. Once executed, all cleaned objects and snapshots cannot be recovered. Run it only when explicitly necessary.
+> [!warning] `lfv gc --purge` is irreversible. Once it has run, none of the cleaned objects and snapshots can be recovered; run it only when it is clearly needed.
 
 #### 5.9.1 Three-Step Workflow
 
 For each branch containing inappropriate content, execute in order:
 
-1. **Reconstruct history**: `rewind` to the parent snapshot of the one containing inappropriate content, create a new branch. On the new branch, individually `merge --pick` subsequent snapshots from the original branch, editing to remove inappropriate content as needed, forming a new append-only snapshot chain. This entirely operates within existing primitives without violating append-only.
-2. **Delete original branch**: Delete the original branch containing inappropriate content. The snapshot chain on the original branch loses all reachable entry points and enters a dangling state.
-3. **Physical cleanup**: Execute `lfv gc --purge` to delete all dangling snapshots along with their associated File Objects and Tree Objects.
+1. **Reconstruct history**: `rewind` to the parent snapshot of the one containing inappropriate content, create a new branch. On the new branch, individually `merge --pick` subsequent snapshots from the original branch, editing to remove inappropriate content as needed, forming a new append-only snapshot chain. This entire process operates within existing primitives without violating append-only.
+2. **Delete the original branch**: delete the original branch containing the inappropriate content. The snapshot chain on that branch loses all reachable entry points and enters a dangling state.
+3. **Physical purge**: run `lfv gc --purge` to delete all dangling snapshots along with their associated File Objects and Tree Objects.
 
-When inappropriate content appears across multiple branches, apply steps 1–2 to each relevant branch separately, then execute a single unified `gc --purge` at the end.
+When inappropriate content appears on several branches, apply steps 1–2 to each relevant branch separately, then run a single unified `gc --purge` at the end.
 
 #### 5.9.2 Handling of Tree Snapshots
 
-Tree Snapshots are also bound by the append-only constraint and cannot be directly modified. However, when a File Object referenced by a Tree Snapshot is cleared:
+Tree Snapshots are also bound by the append-only constraint and cannot be modified directly. But once a File Object referenced by a Tree Object has been purged:
 
-- The Tree Snapshot itself **remains** in the append-only log (still usable as a timeline node), but its referenced File Object has been physically removed — `lfv show` / `lfv diff` queries will display `[object missing]`.
-- A Tree Object that is no longer referenced by any Tree Snapshot (i.e., its corresponding working-tree snapshot was also cleaned via rewind + gc --purge) is deleted as a dangling object along with it.
-- **Recommended practice**: Before performing content deletion, move tree HEAD to a milestone that does not contain inappropriate content using `lfv rewind t:<tag>`, preventing dangling references on the tree plane. If accidental dangling references occur, `lfv verify` will report Tree Objects pointing to non-existent File Objects.
+- The Tree Snapshot itself **remains** in the append-only log (it can still serve as a timeline node), but the File Object it references is physically gone, so `lfv show` / `lfv diff` queries display `[object missing]`.
+- A Tree Object that is no longer referenced by any Tree Snapshot (i.e. the working-directory snapshot it corresponds to was also cleaned through rewind + gc --purge) is deleted along with the other dangling objects.
+- **Recommended practice**: before performing a content deletion, move the tree HEAD to a milestone free of the inappropriate content with `lfv rewind t:<tag>`, to avoid leaving broken references on the tree plane. If a broken reference is created inadvertently, `lfv verify` reports the Tree Object pointing at a non-existent File Object.
 
-By default, dangling snapshots and File/Tree Objects are retained (users may recover them later). Only `gc --purge` performs true physical deletion.
+Dangling snapshots and File/Tree Objects are retained by default (the user may want to recover them later); only `gc --purge` performs true physical deletion.
 
 ### 5.10 Cross-device Sync and Collaboration
 
-Simply copy or sync the entire working directory (including `.lfv`) to another device via NAS or cloud drive. LFV itself **does not resolve concurrent write conflicts** — the sync tool is responsible for ensuring `.lfv` is not modified concurrently on multiple devices.
+Simply copy or sync the entire working directory (including `.lfv`) to another device through a NAS or cloud drive. LFV itself **does not resolve concurrent write conflicts** — it is the sync tool's responsibility to ensure `.lfv` is not modified simultaneously.
 
-For collaborative development with repositories at other locations, remote repositories can be used. Details are deferred; the specification will be clarified in a future revision.
+For collaborative work with repositories in other locations, remote repositories can be used. The details are omitted here; the specification will be settled later.
 
-## 6. Storage Design
-
-```
-A/                                   # Working directory
-├── docs/note.md                     # Example tracked file
-├── photos/2025/sunset.jpg
-└── .lfv/
-    ├── config.yaml                  # Repository-level config (strict YAML)
-    ├── index.db                     # Reconstructable status/branch/tag/tree_file_refs cache (SQLite)
-    ├── objects/                     # Content-addressed object store (File Objects + Tree Objects)
-    │   ├── ab/
-    │   │   ├── cdef0123...zstd      # zstd-compressed File Object
-    │   │   └── cdef0123...raw       # raw File Object (too small/large/incompressible)
-    │   ├── 7f/
-    │   │   └── a3bc9d12...raw       # Tree Object (manifest YAML, usually small → .raw)
-    │   └── ...
-    ├── files/                       # Per-tracked-file metadata
-    │   ├── <file-id>/
-    │   │   ├── meta.yaml            # File-level metadata (creation time, optional attributes)
-    │   │   ├── HEAD                 # Current branch name
-    │   │   ├── branches.yaml        # Branch table for this file
-    │   │   ├── tags.yaml            # Tag table for this file
-    │   │   └── snapshots.log        # Append-only file snapshot records (JSON Lines)
-    │   └── ...
-    ├── trees/                       # Global metadata
-    │   ├── snapshots.log            # Append-only global snapshot records (JSON Lines)
-    │   ├── tags.yaml                # Tree tag table
-    │   └── HEAD                     # Current tree-head, stores snap_<ULID> or empty
-    └── logs/                        # CLI operation logs (optional, for debugging)
-```
-
-### 6.1 Object Store
-
-- Content-addressed: object identity = `blake3(raw bytes)`; the hash prefix in the bucket path is derived from raw content, independent of whether the object is compressed;
-- Bucketing: first 2 hex characters used as directory name to avoid excessive files in a single directory;
-- Compression: raw bytes are compressed with `zstd` (default level **3**) and stored with a `.zstd` extension; decompression is performed in memory on read;
-- Raw storage (`.raw` extension): store uncompressed when **any** of the following holds:
-  - **floor**: `size < min_bytes` (default **4 KiB**, 4096 bytes) — too small; frame overhead may make compressed output larger;
-  - **ceiling**: `size >= max_bytes` (default **16 MiB**, 16777216 bytes) — avoid memory spikes from reading entire large files;
-  - **ineffective compression**: after attempting compression, `compressed_len >= original_len` (`reject_if_larger`, default **true**) — no benefit for already-compressed binaries, etc.;
-- Cross-file and cross-branch deduplication: identical content across any tracked files — even across different branches of the same file — is stored as a single File Object. For example, two branches of `docs/note.md` that both point to the same content share one File Object in `objects/`.
-
-#### 6.1.1 Default Compression Config (`config.yaml`)
-
-```yaml
-compression:
-  enabled: true
-  algorithm: zstd
-  level: 3              # zstd 1..=22
-  min_bytes: 4096       # floor: size < min → .raw
-  max_bytes: 16777216   # ceiling: size >= max → .raw
-  reject_if_larger: true
-```
-
-### 6.2 Snapshot Record Format
-
-`snapshots.log` is one JSON object per line (JSON Lines):
-
-```json
-{
-  "id": "snap_01HXYZ...",
-  "parent": "snap_01HXYY...",
-  "path": "docs/note.md",
-  "object": "blake3:abcdef0123...",
-  "size": 12345,
-  "created_at": "2026-05-17T09:21:33Z",
-  "author": "goosy",
-  "message": "fix typo in title",
-  "tags": [],
-  "digest": "blake3:fedcba9876..."
-}
-```
-
-Field descriptions:
-
-- `id`: a monotonically sortable, human-readable snapshot identifier using [ULID](https://github.com/ulid/spec) with a `snap_` prefix. ULIDs embed a timestamp prefix and random suffix, making time-ordered sorting in `log` output easy and paste-friendly in a terminal.
-- `parent`: parent snapshot id; `null` for the first snapshot on a branch.
-- `path`: **the file's relative path in the working tree at the time this snapshot was taken**. A rename/move event is expressed as this field differing from `parent.path`; a deletion event retains the pre-deletion path (for readable `log` output).
-- `object`: the blake3 hash of the referenced Object (prefixed with `blake3:` to allow future algorithm migration); **`null` when this snapshot is a deletion marker**.
-- `size`: byte count of the corresponding Object; `0` for deletion events.
-- `digest`: **a `blake3` hash of all fields in this snapshot record except `digest` itself, after canonical serialization**, used for tamper detection. `lfv verify` recomputes and checks this for every line.
-- All other fields are self-explanatory.
-
-Snapshots do not record which branch they belong to — branches are external mutable pointers (`branches.yaml`), and snapshots are merely historical facts. A single snapshot can simultaneously belong to multiple branch history paths; deleting a branch does not affect the snapshot itself.
-
-Designed to be append-only, facilitating incremental backup and auditing.
-
-#### 6.2.1 Deriving the Event Type
-
-LFV does not store an explicit "event type" field in a Snapshot. Instead, the event type is **derived** from the `(parent.path, parent.object, path, object)` quadruple relative to the parent snapshot:
-
-| Parent path | Parent object | Current path | Current object | Event type | Rendered in `log` |
-| --- | --- | --- | --- | --- | --- |
-| — (first) | — | P | O | **add** (first snap) | `A  P` |
-| P0 | O0 | P0 | O1 | **modify** | `M  P0` |
-| P0 | O0 | P1 | O0 | **rename** | `R  P0 -> P1` |
-| P0 | O0 | P1 | O1 | **rename + modify** | `R+M  P0 -> P1` |
-| P0 | O0 | P0 | **null** | **delete** | `D  P0` |
-| P0 | **null** | P1 | O1 | **revive** | `+  P1` |
-
-> The `track` action only registers a `file-id` and the tracking flag; **it does not produce a Snapshot**. The first entry on the Snapshot chain is produced explicitly by the user running `lfv snap`, and its event type is derived as `add` (`parent=null`, `object≠null`). `track` and the first `snap` are two distinct steps; the same applies to auto-track.
-
-> The benefit of not storing an explicit event type: every Snapshot is a complete "what the file looks like at this moment" record; adding new event types in the future requires no new fields or migration of old records. The trade-off: event type must be derived on the read side, so the rendering logic must have unit test coverage for all combinations.
-
-> **Why Snapshot ids use ULID rather than content hash**:
-> Git uses the content hash of a commit as its id, giving natural tamper-resistance but non-human-readable, non-time-sortable ids. LFV uses ULID because:
-> 1. In a single-file scenario, users frequently need to visually select snapshots by time from `log` output; ULIDs are far more readable than raw hashes;
-> 2. Tamper-resistance is delegated to the dedicated `digest` field, giving clean semantics and enabling targeted verification by `lfv verify`;
-> 3. Decoupling id from digest means adding or removing metadata fields in the future will not cause id drift.
-
-### 6.3 Tree Snapshot Format
-
-**Tree Snapshot** (`.lfv/trees/snapshots.log`, one JSON object per line):
-
-```json
-{
-  "id": "snap_01HABC...",
-  "parent": "snap_01HABZ...",
-  "path": null,
-  "object": "blake3:7fa3bc9d...",
-  "created_at": "2026-05-17T10:00:00Z",
-  "author": "goosy",
-  "message": "chapter 3 complete",
-  "tags": [],
-  "digest": "blake3:fedcba98..."
-}
-```
-
-Differences from File Snapshot:
-- The `path` field is empty (a tree does not need path localization).
-- `object` cannot be null (a tree snapshot always points to an Object — when the "entire working directory is empty", the manifest is zero bytes, the blake3 hash is computed normally, and this is a valid tree-id).
-
-### 6.4 Tree Object Format
-
-**Tree Object** (stored in `objects/`, content-addressed) uses YAML block sequence format, one entry per line:
-
-```yaml
-- "docs/ch1.md": blake3:abc123...
-- "docs/ch2.md": blake3:def456...
-- "docs/ch3.md": blake3:ghi789...
-```
-
-#### 6.4.1 Format Specification
-
-- **Structure**: YAML block sequence, one single-key mapping per line.
-- **Key** (path): Always double-quoted. Paths contain only Unix separator `/`, no `\`; the only character requiring escaping within the key is `"` (escaped as `\"`), which rarely appears in actual paths.
-- **Value** (hash): `blake3:` prefix + lowercase hex, no quotes (contains no YAML special characters).
-- **Sorting**: Entries are sorted by path in strict lexicographic (UTF-8 byte) ascending order; duplicate paths are not allowed.
-- **Empty manifest**: When there are no valid tracked files in the working directory, the Tree Object content is an empty byte string (zero bytes); its blake3 hash is computed normally, and this is a valid tree-id.
-- **No extraneous content**: No comments, no blank lines, no BOM; file ends with exactly one newline (`\n`); an empty manifest is zero bytes with no newline.
-
-#### 6.4.2 Canonicalization and tree-id
-
-`blake3` directly digests the above byte string to produce the Tree Object's identity (tree-id). Because the format is fully deterministic (quotes, sorting, newlines), the same working-directory content necessarily produces byte-for-byte identical serialization, and thus the same tree-id — no additional canonicalization step is needed; the storage format is the canonical format.
-
-Two working-tree states that have identical content at every tracked path — regardless of when or how they were reached — produce the same Tree Object hash; only one copy exists in `objects/`.
-
-#### 6.4.3 Storage and Compatibility
-
-Tree Objects tend to be small (one line per tracked file) and fall below the `min_bytes` compression floor; they are stored as `.raw` without compression.
-
-This format is a valid YAML subset; external programs can read it directly with standard YAML parsers without knowing LFV internal conventions. LFV itself can also parse it line-by-line using the regex `/^- "(.+)": (\S+)$/`, without depending on a full parser.
-
-**Diffing two Tree Snapshots**: compare their Tree Object manifests entry by entry. Entries with the same `path` and same `object` hash are unchanged. Entries with same `path` but different `object` hash are modified. Entries present in one manifest but absent in the other are added or removed.
-
-### 6.5 Mutable Index and `index.db` Schema
-
-The mutable index lives in `index.db`, recording working-directory file status and branch/tag caches. It is a reconstructable cache of current state and is not part of the immutable history objects. Storage objects are immutable and are the repository's source of truth; mutable state errors can be reconstructed (as long as Object + Snapshot remain).
-
-`index.db` stores only **reconstructable** cache data; the source of truth resides in the filesystem (Snapshot chains, yaml files). Table overview:
-
-| Table | Description | Reconstructable |
-| ---- | ---- | ---- |
-| `file_states` | Core fields: `fullpath`, `status` (`untracked` / `modified` / `unmodified`), `file_id`. Normally only registers files that are LFV-visible and currently exist on disk. | ✓ |
-| `scan_meta` | Scan metadata: `last_completed_at`, `.lfvignore` and `config.yaml` mtimes, used for incremental scan invalidation. | ✓ |
-| `branches` | Branch pointer cache per file. Source of truth: `.lfv/<file-id>/branches.yaml`. | ✓ |
-| `tags` | Tag cache per file. Source of truth: `.lfv/<file-id>/tags.yaml` and `.lfv/trees/tags.yaml`. | ✓ |
-| `tree_file_refs` | Tree-dimension reverse reference cache. Source of truth: `.lfv/trees/snapshots.log` + `objects/`; rebuilt during `rebuild-index`; written by `lfv snap --tree`. Used by `lfv log <FS-ish>` to append tree association information when rendering. | ✓ |
-
-> [!note] Notes on `file_states`
-> - **Normally only registers files that are LFV-visible and currently exist on disk** (paths where `stat` succeeds and `.lfvignore` does not match);
-> - `untracked` rows correspond to paths in the `config.yaml` dynamic untracked list that exist on disk;
-> - When a path disappears from disk, its row is deleted (the `config.yaml` list entry may remain);
-> - **Exception**: tracked files that have disappeared from disk and are awaiting the next `lfv snap` to record the current FS state are retained as `modified`; `lfv status` renders them as `D` (§7.4).
-> - For tracked files still on disk, `fullpath → file_id` is used by the CLI to resolve paths; files that have disappeared can still be located by `file-id`.
-
-#### 6.5.1 Schema
-
-```sql
--- Working tree file status cache
-CREATE TABLE file_states (
-    fullpath   TEXT PRIMARY KEY,  -- Path relative to repo root
-    file_id    TEXT,              -- f_<ULID>; null when untracked
-    status     TEXT NOT NULL      -- 'untracked' | 'modified' | 'unmodified'
-);
-
--- Scan metadata
-CREATE TABLE scan_meta (
-    key        TEXT PRIMARY KEY,  -- 'last_completed_at' | 'lfvignore_mtime' | 'config_mtime'
-    value      TEXT NOT NULL
-);
-
--- Branch pointer cache (source of truth: .lfv/<file-id>/branches.yaml)
-CREATE TABLE branches (
-    file_id    TEXT NOT NULL,     -- f_<ULID>
-    name       TEXT NOT NULL,     -- Branch name
-    snap_id    TEXT NOT NULL,     -- snap_<ULID> of this branch's HEAD
-    PRIMARY KEY (file_id, name)
-);
-
--- File tag cache (source of truth: .lfv/<file-id>/tags.yaml)
-CREATE TABLE tags (
-    file_id    TEXT NOT NULL,     -- f_<ULID>
-    name       TEXT NOT NULL,     -- Tag name
-    snap_id    TEXT NOT NULL,     -- snap_<ULID>
-    PRIMARY KEY (file_id, name)
-);
-
--- Tree-dimension reverse reference cache (source of truth: tree/snapshots.log + objects/)
-CREATE TABLE tree_file_refs (
-    tree_snap_id  TEXT NOT NULL,  -- snap_<ULID>
-    file_id       TEXT NOT NULL,  -- f_<ULID>
-    file_object   TEXT NOT NULL,  -- blake3:...
-    PRIMARY KEY (tree_snap_id, file_id)
-);
-```
-
-**Writing and rebuilding `tree_file_refs`**: when `lfv snap --tree` creates a Tree Snapshot, it expands the Tree Object manifest and inserts one row per file; during `rebuild-index`, it is rebuilt by traversing all Tree Snapshots. Used by `lfv log <file>` to append tree association information when rendering:
-
-```
-snap_01HXYZ  M  docs/note.md   "add chapter 2"
-             └─ tree: "chapter 3 complete" [t:v1.0]
-snap_01HWWW  M  docs/note.md   "fix typo"
-             └─ tree: "daily archive 2026-05-30"
-```
-
-### 6.6 Non-Reconstructable State Files
-
-The following files record **user intent** and cannot be mechanically derived from the Snapshot chain; `rebuild-index` does not overwrite them:
-
-**`.lfv/<file-id>/HEAD`**
-
-One per tracked file, containing the current branch name (plain text, one line):
-
-```
-main
-```
-
-LFV does not support detached HEAD — `rewind` always creates a new branch, so HEAD always points to a named branch, never a bare snap_id.
-
-**`.lfv/trees/HEAD`**
-
-The tree plane current head, containing `snap_<ULID>` or empty (when the repository has no Tree Snapshot yet):
-
-```
-snap_01HABC...
-```
-
-### 6.7 Branch and Tag Files (Source of Truth)
-
-The following yaml files are the source of truth for branches/tags; the `branches` and `tags` tables in `index.db` are their reconstructable caches.
-
-**`.lfv/<file-id>/branches.yaml`**
-
-Key = branch name, value = the `snap_<ULID>` of that branch's current HEAD:
-
-```yaml
-main: snap_01HXYZ...
-rewind/01HXY0/1: snap_01HABC...
-```
-
-- Written when a branch is first created; updated by `lfv snap` when a new snapshot is produced on the current branch.
-- `lfv branch-delete` removes the corresponding key; the snapshot itself is unaffected (append-only).
-
-**`.lfv/<file-id>/tags.yaml`**
-
-Key = tag name, value = `snap_<ULID>`; append-only (tags cannot be reused):
-
-```yaml
-v1.0: snap_01HXYZ...
-stable: snap_01HWWW...
-```
-
-**`.lfv/trees/tags.yaml`**
-
-Tree plane tag table, key = `"t:<name>"`, value = `snap_<ULID>`; tags are globally unique and cannot be reused:
-
-```yaml
-t:v1.0: snap_01HABC...
-t:release: snap_01HZZZ...
-```
-
-User-input tag names are not allowed to contain `:` (namespace isolation); the `t:` prefix is added automatically by LFV.
-
-## 7. Internal Mechanism Design
-
-This section describes the internal mechanisms of each operation, covering three categories of topics: **scan and visibility rules** (§7.1–§7.2), **internal flow of file lifecycle operations** (§7.3–§7.7), and **snapshot/rewind operation flows and data-integrity constraints** (§7.8–§7.10).
-
-### 7.1 `.lfvignore` and `config.yaml`
-
-Track-by-default would otherwise include temporary files and build artifacts. `.lfvignore` and `config.yaml` are **not** the same kind of "exclusion list":
-
-| | `.lfvignore` | `config.yaml` (dynamic `untracked`) |
-| --- | --- | --- |
-| Nature | Static, repo-wide, **highest priority** | Dynamic policy via `lfv untrack` / `lfv track` |
-| Status table | **Not stored** in `file_states` | Stored as `untracked` when it **exists** on disk; when it disappears from disk, the status-table row is **deleted** (`config.yaml` list entry may remain) |
-| Working-tree scan | **Invisible**: pruned/skipped; no OS create/delete detection | **Visible**: participates in §7.3; status-table rows are maintained only for paths that exist on disk |
-| `lfv track <file>` | **Error** if matched; edit `.lfvignore` | Remove from `untracked` list and track |
-| `lfv untrack <file>` | **Error** if matched | Write config; if it exists on disk, record `untracked` |
-| `lfv status --include-untracked` | **Never listed** | **Only source** (`untracked` rows in the status table, all from config) |
-
-Additional rules:
-
-- `.lfv/` is always implicitly treated like `.lfvignore` and is not stored in the status table;
-- paths matching `.lfvignore` **do not exist** for LFV: no auto-track, no untrack listing, not in `--include-untracked`;
-- on `rebuild-index`, `untracked` rows = dynamic `config.yaml` list ∩ LFV-visible paths ∩ paths that **exist on disk**.
-
-### 7.2 Working-Tree Scan (Lazy Scan)
-
-Several commands (`lfv status`, `lfv track`, `lfv snap`, etc.) trigger a working-tree scan beforehand, comparing disk against `index.db`, updating `file_states`, and driving the automatic actions in §7.4–§7.8.
-
-#### 7.2.1 Scan Actions
-
-Definitions:
-
-- Dynamic untracked: a path is in the dynamic `untracked` list in `config.yaml`.
-- Trackable candidate: a path is not in the dynamic `untracked` list in `config.yaml`.
-- Status update:
-  - If LFV-visible and dynamic untracked: set status to `untracked`;
-  - If LFV-visible and already has a tracked status row: compare mtime/size → compare hash → set `modified` or `unmodified`; the chain does not necessarily need to run to completion before a result is known;
-  - If LFV-visible, unregistered, and a trackable candidate: auto-track (§7.4);
-  - If LFV-invisible: delete the corresponding status-table row, keep `config.yaml` and historical Snapshots unchanged, and do not produce `D`;
-- Dynamic untracked: a path in the dynamic `untracked` list in `config.yaml`.
-
-| Layer | Scope | Behavior |
-| --- | --- | --- |
-| **A. Registered paths** | Rows in `file_states` with an existing `fullpath` | For each row, first decide whether LFV visibility must be rechecked based on `.lfvignore` mtime. If invisible, delete the status-table row; if visible, update status. Cost O(registered paths). |
-| **B. Discover new paths** | LFV-visible paths seen during traversal that are not yet registered | Dynamic untracked files are set to `untracked`; trackable candidates are auto-tracked (§7.2). |
-
-All scan actions update the status table. In addition, `lfv track` and `lfv untrack` update both `config.yaml` and `file_states` (`untracked`).
-
-#### 7.2.2 Incremental Scan and Invalidation
-
-`scan_meta` records the last scan completion time and rule-file mtimes. Scans are **incremental by default** to avoid fully recursing the working tree on every command:
-
-- **Invalidate** (any triggers a controlled full walk for layer B):
-  - `scan_meta` is empty (first scan or after `rebuild-index`);
-  - `.lfvignore` mtime is newer than recorded (walk/prune boundaries change; **does not** write ignore paths into the status table);
-  - `config.yaml` mtime is newer (reconcile the dynamic `untracked` list with LFV-visible paths: register `untracked` rows for paths that exist, delete rows for paths that do not);
-  - user runs `lfv status --refresh` (or equivalent forced refresh).
-- **Otherwise (incremental)**:
-  - **Directories**: if dir mtime ≤ `last_completed_at` and the directory is already registered as scanned → do not descend; combined with `.lfvignore` **directory pruning** (pruned trees are invisible to LFV);
-  - **Files**: if already in `file_states` and file mtime ≤ `last_completed_at` → skip layer-B "new path" handling (layer A still `stat`s).
-- **Scan end**: update `last_completed_at` (recommended: scan start time) and `.lfvignore` / `config.yaml` mtimes.
-
-> **Note**: mtime-based incrementality may miss changes when copies do not preserve timestamps or on coarse-grained filesystems; use `--refresh` as a fallback.
-
-#### 7.2.3 When Scans Run
-
-| Command / scenario | Scan |
-| --- | --- |
-| `lfv status` | Default incremental scan (§7.2.2) |
-| `lfv status --refresh` | Scan after forced invalidation |
-| `lfv track` (no args), `lfv snap` (no args) | Scan before batch track / snap |
-| `lfv status --include-untracked` | Does **not** add or alter scanning; output only (§4.3.2) |
-
-### 7.3 Auto-track (New Files)
-
-When a scan finds a path that is **LFV-visible** and not yet in the status table:
-
-- If it matches `.lfvignore` -> **ignore** it (no registration; §7.2);
-- If it is on the dynamic `untracked` list in `config.yaml` -> register it as `untracked` (§7.2);
-- Otherwise -> treat it as an OS-created file, auto-`track` it, assign a `file-id`, and set status to `modified`.
-
-No Snapshot is appended immediately; the first Snapshot is written by a later `lfv snap`.
-
-Auto-track is triggered by: `lfv status` (applied immediately during scan), `lfv track` (with no arguments), and `lfv snap` (before batch-snapshotting with no arguments).
-
-**Cancelling tracking**: `lfv untrack <file>` writes the path into the dynamic `untracked` list in `config.yaml`; when the path exists on disk, it synchronously records `untracked` in the status table. Files with existing history are guaranteed not to produce new Snapshots. Auto-tracked files with no history only have their tracking cache removed, ensuring no Snapshot is appended.
-
-When a path is in config `untracked` and exists on disk, scans will not auto-track it. If it disappears from disk, the status-table row is deleted (§7.3); when it reappears, it is registered as `untracked` again per §7.3.
-
-**Friendly hint for same-path new files**: if a path previously had a deleted `file-id` (i.e. a deletion marker was appended for that path), and auto-track assigns a new `file-id` at the same path, `lfv status` will append a hint below that file's entry:
-
-```
-  M   f_01HA7EEE...   docs/old-note.md  [newly tracked]
-                      note: this path previously existed as f_01HA7BCD (deleted)
-                      to continue its history instead, run:
-                        lfv relink f_01HA7EEE --onto f_01HA7BCD
-```
-
-This hint appears only when auto-track has assigned a new `file-id`; once the new `file-id` records its first Snapshot, it stands as an independent file and the hint disappears.
-
-For `untracked` files that still have history, because their latest Snapshot still points to an Object, running `lfv track <file>` again first removes the entry from the dynamic `untracked` list in `config.yaml`, then resumes tracking under the original `file-id` and updates the corresponding status-table row to tracked state as a cache. Note that this differs from tracking a deleted file: after delete, `lfv track <file>` creates a new `file-id` by default unless the user explicitly runs `lfv revive`.
-
-### 7.4 Auto-delete (OS-deleted Files)
-
-When a scan finds that a **tracked file's** path has disappeared from the working tree, and there is no evidence of a rename (i.e. rename auto-detection could not pair it), the file is treated as "OS-deleted."
-
-LFV does **not** immediately append a deletion-marker Snapshot; instead it marks the file as `modified`. Because the current path does not exist in the filesystem, `lfv status` renders it as `D`.
-
-The next `lfv snap` records the state update. Subsequent processing is described in §7.8.
-
-This design gives the user a window before `lfv snap`: while a file is still in `D` status, they can still run `lfv mv f_old <new-path>` to reclassify it as a rename, avoiding accidental deletion.
-
-### 7.5 Rename / Move (`lfv mv`)
-
-**`lfv mv` performs path operations only**: both `<src>` and `<dst>` accept only paths, not `file-id`s. It is used when the file still exists on disk (or was just moved by the OS). Accepting a `file-id` as `<dst>` is intentionally disallowed — it would cause mental confusion, as users might assume the surviving `file-id` is the one on the `<dst>` side. To splice history onto another `file-id`, use `lfv relink` (see §7.7).
-
-- `lfv mv <src> <dst>`: migrates the tracked file at `src` to the `dst` path.
-  - If `src` still exists in the working tree and `dst` does not, the CLI first moves the file to `dst` on disk, then appends a Snapshot (atomic semantics).
-  - If `src` no longer exists (already moved by the OS or editor) and `dst` already contains the file, `lfv mv` only records the Snapshot and does not touch the disk.
-  - The new Snapshot's `object` is determined by the hash of `dst`'s current content: if it matches the parent snapshot's object, the event renders as pure `R`; otherwise as `R+M`.
-  - The default `message` is `rename: <old-path> -> <new-path>`.
-- **Auto-detection vs. manual registration**:
-  - Auto-detection applies only when content hashes are **exactly equal** (`rename.autodetect`, enabled by default). When a match is found, `lfv status` displays an `R` line and automatically pairs the files.
-  - If the OS moves a file **and** its content changes, auto-detection fails — `lfv status` will display both a `D` line (old `file-id` missing from its original path) and an `A` line (new file at the new path with a new `file-id`). The user reviews and explicitly declares history continuation with `lfv relink <new-file> --onto <old-file>`.
-  - Auto-detection can also be disabled (useful for bulk rename + edit scenarios to avoid mispairing).
-- History display: `lfv log <file>` renders rename events as "`R` old-path -> new-path", alongside `A`(add) / `M`(modify) / `D`(delete) / `R+M`(rename+modify) (see §6.2.1).
-
-### 7.6 History Continuation (`lfv relink`)
-
-`lfv relink <f_src> --onto <f_dst>` splices the history of `f_src` onto the end of `f_dst`'s history, declaring that "f_src is the continuation of f_dst." At the same time, the on-disk file previously associated with f_src becomes bound to f_dst going forward. If f_src has no snapshot history yet, f_dst's history remains unchanged.
-
-A typical use case: a rename the scanner cannot auto-pair — the user changed both path and content at the OS level, so LFV sees an independent `D` event (f_dst) and an `A` event (f_src). The user manually declares "f_src is f_dst continued."
-
-- **f_src**: status `A`/`M`, a live file that exists on disk (new `file-id`, still being tracked)
-- **f_dst**: status `D`, a file that has disappeared from disk (old `file-id`, awaiting continuation)
-- **The surviving `file-id` is the `--onto` side (f_dst)**, consistent with the preposition's direction
-
-After execution, f_src's current path and content are appended as the next Snapshot on f_dst's history; f_src's `file_states` tracking row is cancelled and it produces no further snapshots. **f_src's `files/<f_src>/` directory and `snapshots.log` are fully preserved** (append-only; not deleted). f_src becomes a "retired" `file-id`: `lfv log f_src` remains valid.
-
-**Case 1: f_src has no snapshot history**
-
-f_src has only a tracking record and no Snapshots yet. After execution: the file at f_src's current path is associated with f_dst's `file-id`. The event type is derived per §6.2.1 by comparing f_dst's last snapshot with the current path/object (typically `R+M` or `R`).
-
-**Case 2: f_src already has snapshot history**
-
-f_src has produced a chain of Snapshots (`snap_A1 -> snap_A2 -> ... -> snap_An`). After execution, the entire chain is copied and appended to f_dst's history:
-
-- Each snapshot is assigned a new ULID (`snap_B1 ... snap_Bn`); `digest` is recomputed for the new fields.
-- `snap_B1.parent` = f_dst's latest snapshot; `snap_Bx.parent` = `snap_B(x-1)`.
-- `snap_B1`'s event type is derived by comparing f_dst's last snapshot with `snap_B1`'s path/object; `snap_B2` onward is consistent with f_src's internal derivation and is unaffected.
-- The event type at the seam may appear as a cross-path jump — this is the expected trade-off of explicitly declaring history continuation.
-- Likewise, the on-disk file previously associated with f_src becomes bound to f_dst going forward.
-
-### 7.7 `lfv delete`
-
-`lfv delete <file>`: sets the file to `modified` in the status table and deletes it from disk. On the next `lfv snap`, LFV checks the target file's current filesystem state: if the file does not exist, it appends a Snapshot with `object = null` and removes the corresponding `file-id` from the current-path index in the status table.
-
-After this, the `file-id` can no longer be resolved via the current path, but the last known path is preserved in that Snapshot; `lfv list --deleted` can still display it by path.
-
-**Complete history is preserved**: the file can still be queried via `lfv log` / `lfv show` / `lfv diff`; to "revive" it, use `lfv revive` (see §4.2) or `lfv rewind <snap>` — both automatically create a new branch (without disturbing the existing deletion event).
-
-### 7.8 `lfv snap --tree`: Internal Execution
-
-When `lfv snap --tree` is invoked (after the precondition in §4.3.3 passes):
-
-1. Read all tracked files' current valid file-object-hashes at HEAD, build the Tree Object manifest (sorted by path).
-2. After canonical serialization, compute the blake3 hash to get the tree-id; reuse if the object already exists in `objects/`, otherwise write it.
-3. Append a Tree Snapshot record to `.lfv/trees/snapshots.log`, with parent pointing to the current tree HEAD (or null if empty).
-4. Update `.lfv/trees/HEAD` to the new Tree Snapshot's id.
-5. If `--tag` is specified, write the tag to `.lfv/trees/tags.yaml`.
-6. Expand the Tree Object manifest and insert one row per file into the `tree_file_refs` table in `index.db`.
-
-### 7.9 `lfv rewind <TS-ish>`: Internal Execution
-
-When `lfv rewind t:<tag|snap-id>` is invoked (after the pre-check in §4.5.1 passes):
-
-1. Update `.lfv/trees/HEAD` to the target Tree Snapshot's snap id.
-2. Read the target tree-snapshot's Tree Object to get the `{path, file-object-hash}` manifest.
-3. Process all files in the following three categories:
-
-**Category A: files in the manifest (need content restoration)**, for each file with `target_hash` as the target, execute FF-priority rewind:
-  - **FF path**: if some branch's HEAD object hash == `target_hash` → prefer current branch; if not, choose the most recently created matching branch → directly `switch`, no new branch created. Message: `[FF] docs/note.md → branch main`
-  - **rewind path**: otherwise → execute standard rewind, automatically creating a new branch. Message: `[rewind] docs/note.md → new branch rewind/01HXYZ/1`
-
-**Category B: files not in the manifest but with existing file-object in the repo** (files added and snapshotted after the tree-snapshot):
-  → Only delete the working tree file, do not touch `config.yaml`. Subsequent scanning (§7.4) automatically marks as `D`. Message: `[deleted] docs/new-chapter.md`
-
-**Category C: files in the manifest but currently untracked or deleted historical files**:
-  → Only write file bytes back to the working tree, do not modify any status table or config. Subsequent scanning takes over:
-  - Original file-id is deleted: follows §7.3 same-path friendly hint, user can `lfv relink` to continue history.
-  - Original file-id is untracked: after scanning shows `~`, user decides whether to `lfv track`.
-  Message: `[restored] docs/old-chapter.md`
-
-4. Output summary.
-
-### 7.10 Loopback Detection and Handling
-
-To ensure that each file's history presents an **acyclic content-evolution DAG** on any single branch, LFV enforces the **single-branch object-hash uniqueness invariant** at `lfv snap` time:
-
-- **On any single branch, the same `file-object-hash` may appear at most once.**
-- **History integrity first**: LFV never silently discards or rewrites intermediate history; the user must explicitly run `rewind` to "skip" a duplicate segment.
-- **Branch hygiene**: a loopback pollutes the current branch, so the intermediate history must be moved to a `detour_*` branch, where the user can review it before deciding whether to delete it.
-- **Consistent with `rewind` semantics**: `lfv rewind` is designed for "going back in time and automatically creating a branch"; the uniqueness invariant is precisely the safeguard that makes this scenario work.
-
-#### 7.10.1 Detection Timing
-
-**`lfv snap` trigger**: when executing `lfv snap <file>` (or processing an individual file during a batch `lfv snap`), after the new snapshot's `object` field is computed but **before** it is written to `snapshots.log`, LFV walks **up the current branch's parent chain** to check whether any ancestor snapshot has the same `object` as the new snapshot.
-
-- If no matching `object` is found → append the new snapshot normally.
-- If a matching `object` is found (call it `ancestor_snap`) → a **loopback event** is triggered, the current `lfv snap` is rejected, and a hint is printed.
-
-#### 7.10.2 Handling a Loopback Event (User Side)
-
-LFV does not rewrite history automatically; instead it prompts the user to use `lfv rewind` to perform the rewind while preserving all intermediate history:
-
-```
-warning: content of docs/note.md matches ancestor snap_01HXYZ on branch main
-         (object hash blake3:abc123...)
-suggestion: run `lfv rewind docs/note.md snap_01HXYZ`
-            this will create a new branch anchored before the duplicate,
-            preserving all intermediate history as a detour branch.
-```
-
-After the user runs `lfv rewind docs/note.md snap_01HXYZ`, LFV:
-
-1. Renames the current branch (e.g. `main`) to `detour_main` (appending a numeric suffix if the name already exists).
-2. Creates a **new snapshot** on `main` whose:
-   - `parent` points to the **parent of `ancestor_snap`** (not `ancestor_snap` itself);
-   - `object` equals the new file content (the `object` that triggered the loopback);
-   - `path`, `message`, etc. are recorded normally.
-3. Points `main`'s HEAD to this new snapshot; working-directory content is unchanged (it already matches the new content).
-
-This way, the intermediate history on the original branch (everything after `ancestor_snap` up to the present) is fully preserved in `detour_main`, while `main` "skips" that segment and continues from the earlier state, **without ever producing a duplicate object hash on `main`**.
-
-#### 7.10.3 Verification Requirements for `lfv verify`
-
-The `lfv verify` command must walk every branch of every file and check whether the same `object` appears twice on a single branch. If it does, this is reported as a **data-integrity error** (not a warning), because under normal operation loopback events are rejected and the user is guided to use `rewind`.
-
-```bash
-error: branch 'main' of file 'docs/note.md' contains duplicate object hash:
-       snap_01HXYZ (object blake3:abc123...)
-       snap_02HABC (object blake3:abc123...)
-       This violates the single-branch object uniqueness invariant.
-       Run `lfv repair --rebase` to fix (destructive).
-```
-
-## 8. Technology Choices Design
+## 6. Technology Choices Design
 
 - **Language**: Rust 2024 edition.
-- **CLI framework**: `clap` v4, using the derive-style command tree definition.
-- **Error handling**: `thiserror` (library-level error type definitions) + `anyhow` (top-level CLI error aggregation).
+- **CLI framework**: `clap` v4, defining the command tree in derive style.
+- **Error handling**: `thiserror` (error types at library level) + `anyhow` (top-level wrap-up in the CLI).
 - **Hashing**: `blake3` (fast and strong enough).
-- **Compression**: `zstd` level 3; defaults `min_bytes` 4 KiB, `max_bytes` 16 MiB, `reject_if_larger: true` (see §6.1).
-- **Metadata serialization**: `serde` + strict YAML (human-readable config/metadata) + `serde_json` (JSON Lines row format for `snapshots.log`). All config and metadata files under `.lfv/` use the `.yaml` extension. "Strict YAML" means LFV only writes and accepts a restricted subset: mappings, sequences, strings, numbers, booleans, and null — no anchors, aliases, complex tags, or implicit type coercion.
-- **Index storage**: `rusqlite` (embedded SQLite, single-file `index.db`).
-- **Text diff**: `similar` (line/word-level diff, unified format output).
-- **Time**: `time` or `jiff` (TBD; leaning toward `jiff` for its more modern API).
-- **Logging**: `tracing` + `tracing-subscriber`; CLI verbosity controlled by `-v/-vv`.
-- **Testing**: `assert_cmd` + `predicates` + `tempfile` for integration tests; unit tests co-located in `mod` blocks.
+- **Compression**: `zstd` level 3; defaults `min_bytes` 4 KiB, `max_bytes` 16 MiB, `reject_if_larger: true` (details in design §3.2).
+- **Metadata serialization**: `serde` + strict YAML (human-readable config/metadata) + `serde_json` (the line format of snapshots.log). All config and metadata files under `.lfv` uniformly use the `.yaml` extension; strict YAML means LFV writes and accepts only a restricted subset — mappings, sequences, strings, numbers, booleans, and null — relying on no anchors, aliases, complex tags, or implicit type inference.
+- **Index storage**: `rusqlite` (embedded SQLite, a single `index.db` file).
+- **Text diff and three-way merge**: `diffy` (Myers diff, unified format, `merge` three-way merge with conflict markers).
+- **Time**: `time` or `jiff` (to be evaluated; leaning towards `jiff` for its more modern API).
+- **Logging**: `tracing` + `tracing-subscriber`, with the level controlled by `-v/-vv` on the CLI.
+- **Testing**: `assert_cmd` + `predicates` + `tempfile` for integration tests; unit tests live next to the code in their module.
 
-> Selection principle: prefer libraries broadly validated by the Rust ecosystem; avoid unmaintained crates. All dependencies reviewed quarterly until v1.0.
+> Selection principle: prefer libraries already widely proven in the Rust ecosystem and avoid unmaintained crates. All dependencies are reviewed once per quarter before 1.0.
 
-## 9. Engineering Overview
-
-Module layout:
-
-```
-src/
-├── main.rs                # CLI entry point: argument parsing and dispatch only
-├── cli/                   # clap command definitions and subcommand entry points
-│   ├── mod.rs
-│   ├── init.rs
-│   ├── track.rs
-│   ├── snap.rs
-│   ├── log.rs
-│   ├── diff.rs
-│   ├── rewind.rs
-│   └── ...
-├── repo/                  # Repository abstraction: open, close, path resolution, config
-│   ├── mod.rs
-│   ├── config.rs
-│   └── layout.rs
-├── index/                 # SQLite index access layer
-│   └── mod.rs
-├── object/                # Object store: write, read, compress, GC
-│   └── mod.rs
-├── snapshot/              # Snapshot entity, serialization, append-write to snapshots.log
-│   └── mod.rs
-├── branch/                # Branch management
-│   └── mod.rs
-├── tag/                   # Tag management
-│   └── mod.rs
-├── diff/                  # Diff algorithm wrapper
-│   └── mod.rs
-└── util/                  # General utilities: paths, time, strings
-    └── mod.rs
-```
-
-Test directory:
-
-```
-tests/
-├── cli_init.rs
-├── cli_track.rs
-├── cli_snap.rs
-├── cli_rewind.rs
-└── ...
-```
-
-Build and release:
-
-- **Build**: `cargo build` / `cargo build --release`.
-- **Test**: `cargo test` (unit tests and integration tests).
-- **Formatting**: `cargo fmt`; CI checks with `cargo fmt -- --check`.
-- **Static analysis**: `cargo clippy --all-targets -- -D warnings`.
-- **Target platforms**:
-  - Windows x86_64 (primary development platform);
-  - Linux x86_64 (GNU and musl release artifacts);
-  - macOS (aarch64 / x86_64) best-effort, not primary test target.
-- **Release artifact**: single executable `lfv(.exe)` distributed via GitHub Releases.
-- **Versioning**: SemVer. All public command semantics may change before v1.0, but breaking changes must be declared explicitly in the CHANGELOG.
-
-## 10. Roadmap (rough)
+## 7. Roadmap (rough)
 
 - **v0.1**: `init` / `track` / `snap` / `log` / `status` / `show`.
 - **v0.2**: `diff` / `branches` / `rewind` / `switch`.
-- **v0.3**: `tag` family, `export`, `gc`, `verify`.
-- **v0.4**: `merge` / `rebase` and conflict handling.
-- **v0.5**: tree plane (`snap --tree` / `log --tree` / `rewind t:` / `tag --tree`), performance optimizations.
+- **v0.3**: the `tag` family, `export` / `import`, `gc`, `verify`.
+- **v0.4**: `merge` / `rebase`, conflict handling.
+- **v0.5**: tree plane (`snap --tree` / `log --tree` / `rewind t:` / `tag --tree`), performance tuning.
 - **v1.0**: stable CLI semantics, complete documentation, cross-platform CI passing.
-- **v1.1**: remote repositories, distributed collaboration support.
+- **v1.1**: remote repositories, completing the collaboration work.
