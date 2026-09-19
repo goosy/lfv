@@ -54,7 +54,7 @@ LFV 的心智模型是"我有一个目录，其中每个文件都有版本历史
 
 Snapshot 为版本记录，大体对应 GIT 的 commmit。
 
-Snapshot id 采用 ULID 以保证可读性与时间排序；防篡改职责交由独立的 `digest` 字段承担，由 `lfv verify` 校验（详见 `design.md §5.2`）。
+Snapshot id 采用 ULID 以保证可读性与时间排序；防篡改职责交由独立的 `digest` 字段承担，由 `lfv verify` 校验（详见 `design.zh-cn.md §3.3`）。
 
 内容寻址 id（如 Git 的 SHA 哈希）将身份与防篡改耦合在一起，被迫在"不透明哈希（体验差）"和"可读字符串（无法作为完整性证明）"之间取舍。LFV 将这两个关注点分离：ULID id 便于粘贴、时间有序、内容无关；`digest` 字段提供独立的防篡改检测。`lfv verify` 可以在不触碰 id 的情况下校验每条 Snapshot。
 
@@ -66,7 +66,7 @@ Snapshot id 采用 ULID 以保证可读性与时间排序；防篡改职责交�
 
 `lfv delete` 把文件从磁盘删除，把状态表的文件标记为 `modified`。`lfv snap` 时检查目标文件的 FS 状态，文件不存在就追加一条 `object = null` 的 Snapshot，并从状态表删除该文件记录。所有历史 Snapshot 完整保留，随时可 `lfv revive`。
 
-LFV 的删除是**状态转移**，不是擦除。擦除历史违反 append-only 保证（决策 3），使 `lfv revive` 无从实现。将删除视为 `object=null` 的 Snapshot 在结构上与模型其他部分完全一致——存储层无需特殊处理。
+LFV 的删除是**状态转移**，不是擦除。擦除历史违反 append-only 保证（决策 2），使 `lfv revive` 无从实现。将删除视为 `object=null` 的 Snapshot 在结构上与模型其他部分完全一致——存储层无需特殊处理。
 
 两步设计（标记 `modified` → 在 `lfv snap` 时确认）给用户一个修正窗口：文件仍处于 `D` 状态时，可运行 `lfv mv` 将其重新归类为改名，避免误删。
 
@@ -78,27 +78,29 @@ Tree Object 是内容寻址的 YAML 清单——按路径排序的 `{path: file-
 
 Tree Snapshot 存放于 `.lfv/trees/snapshots.log`，拥有独立的标签集合，通过现有命令的 `--tree` 变体管理（`lfv log --tree` 等）。仓库内可以不存在任何 Tree Snapshot；tree 面完全可选。
 
-`lfv snap --tree` 要求所有 modified 跟踪文件必须已经完成快照（先执行 `lfv snap`，或加 `--snap-all` 参数）。这确保 Tree Object 是从每个文件的当前 HEAD 构建的，不会静默地产生过期的 tree 快照。
+`lfv snap --tree` 要求所有 modified 跟踪文件必须已经完成快照（先执行 `lfv snap`）。这确保 Tree Object 是从每个文件的当前 HEAD 构建的，不会静默地产生过期的 tree 快照。
 
-**为什么不在 `lfv snap --tree` 内部自动 snap 文件**：将文件快照与 tree 快照分开，保持用户意图的明确性。Tree Snapshot 是刻意标记的里程碑；把可能很多个文件的快照作为副作用自动触发，会用无意的快照条目遮蔽各文件的独立历史。
+**为什么不在 `lfv snap --tree` 内部静默 snap 文件**：将文件快照与 tree 快照分开，保持用户意图的明确性。Tree Snapshot 是刻意标记的里程碑；把可能很多个文件的快照作为副作用自动触发，会用无意的快照条目遮蔽各文件的独立历史。`--snap-all` 参数是用户**显式**要求"先用同一 message 逐个 snap 所有 modified 文件，再建树快照"——它只是省去手工逐个执行，各文件历史上仍各得一条独立、可见的快照，不是静默副作用。
 
 ## 8. 分支对象唯一性与防止回环
 
-**对象唯一性**：在某个文件历史的任意单条分支上，同一个 file-object-hash 最多出现一次。
+**对象唯一性**：在某个文件历史的任意单条分支上，同一个 file-object-hash 只能构成**一段连续的快照 run**，不允许非连续地再次出现。连续同 object 的快照（纯改名 `R`、路径改回等）在内容层折叠为同一节点，不构成回环；禁止的是回到更早的 object。
 
 若无此约束，某条分支可能回访之前出现过的内容状态，在内容层图中产生反向边（环路）。环路使内容层的渲染产生歧义：同一个节点在时间线上出现两次，其注释（message、时间戳）变得不明确。
 
-**机制**：`lfv snap` 计算新内容 hash 时，若发现它与当前分支某个祖先的 object hash 相同，则拒绝追加快照，改为输出提示：
+**机制**：`lfv snap` 计算新内容 hash 时，先跳过与新 hash 相同的连续祖先段（同一 run），若更早的祖先仍有相同 object hash，则拒绝追加快照，改为输出提示：
 
 ```
 warning: content of docs/note.md matches ancestor snap_2 on branch B
 suggestion: run `lfv rewind docs/note.md snap_2` to re-anchor
-            this will preserve the intermediate history as branch detour_B
+            this will preserve the intermediate history as branch detour/<anchor-short>/1
 ```
 
 用户执行 `lfv rewind` 后：
-1. 当前分支重命名为 `detour_<原分支名>`——中间历史完整保留。
-2. 在原分支名上新建一条快照，其 parent 指向**匹配祖先的父快照**（而非祖先本身），使新快照与祖先在 Snapshot 链上是两个独立节点，尽管它们的 object hash 相同。
+1. 新建分支 `detour/<anchor-short>/<n>` 指向原 HEAD（命名规则见 spec §4.5）——中间历史完整保留，分支名本身不动。
+2. 在当前分支上新建一条快照，其 parent 指向**匹配祖先所在 run 的首条快照的父快照**（而非祖先本身），object 为新内容，使新快照与祖先在 Snapshot 链上是两个独立节点，尽管它们的 object hash 相同。
+
+同一约束也决定了两条派生规则：`lfv snap` 不提供 `--allow-empty`（与父快照 object、path 全同的快照无法区分，见下）；`lfv revive` 实现为 rewind 而非追加"复活"快照——把删除前的内容作为新快照追加到删除事件之后，恰好就是回到更早 object 的回环。
 
 **为什么指向祖先的父，而非祖先本身**：若新快照的 parent 是该祖先，则两者 object hash 相同、parent 也相同——在 Snapshot 链中无法区分，渲染时无法表达两者之间的有效边。
 
@@ -194,7 +196,7 @@ Tree Snapshot 链没有分支集合，只有：标签（`t:` 前缀，全局唯�
 
 `config.yaml`、分支和状态表属于 `track`/`untrack`/`delete`/`revive` 命令的职责边界。tree rewind 越过这个边界直接操作，会使用户难以预测哪些命令会对 config 产生副作用，破坏命令职责的清晰性。
 
-字节操作之后，现有的惰性扫描机制（§6.8）会在下次 `lfv status` 或 `lfv snap` 时自然感知变化并驱动状态更新。tree rewind 产生的"新增文件"和"消失文件"与 OS 直接操作文件产生的效果完全等同，用户的心智模型无需特殊化。
+字节操作之后，现有的惰性扫描机制（`design.zh-cn.md §4.3`）会在下次 `lfv status` 或 `lfv snap` 时自然感知变化并驱动状态更新。tree rewind 产生的"新增文件"和"消失文件"与 OS 直接操作文件产生的效果完全等同，用户的心智模型无需特殊化。
 
 ### 11.4 tree rewind 对每个 file 采用 FF 优先策略
 
@@ -225,7 +227,7 @@ Tree Object 清单采用 YAML 块序列格式（`- "path": hash`），而非 JSO
 
 ## 12. 存储对象仅两类
 
-仓库内真正不可变的存储对象分为 **Object** 与 **Snapshot** 两大类，每类各有两种子类型。其余概念均为可变索引（详见 `design.zh-cn.md §4.2`）。
+仓库内真正不可变的存储对象分为 **Object** 与 **Snapshot** 两大类，每类各有两种子类型。其余概念均为可变索引（详见 spec §3.4、`design.zh-cn.md §3.6`）。
 
 | 大类 | 子类型 | 内容 | 寻址方式 |
 | --- | --- | --- | --- |
@@ -244,7 +246,7 @@ Tree Object 清单采用 YAML 块序列格式（`- "path": hash`），而非 JSO
 
 ## 13. 对象压缩双阈值
 
-`min_bytes`（floor，默认 4 KiB）与 `max_bytes`（ceiling，默认 16 MiB）分别处理过小与过大的文件；`blake3` 始终对原始字节计算；跳过或无效压缩的对象以 `.raw` 存储，压缩对象为 `.zstd`（详见 `design.md §5.1`）。
+`min_bytes`（floor，默认 4 KiB）与 `max_bytes`（ceiling，默认 16 MiB）分别处理过小与过大的文件；`blake3` 始终对原始字节计算；跳过或无效压缩的对象以 `.raw` 存储，压缩对象为 `.zstd`（详见 `design.zh-cn.md §3.2`）。
 
 单一阈值无法同时处理两个边界情况。过小的文件压缩后可能因帧开销反而变大；过大的文件在压缩时会产生内存峰值（需要将整个文件读入内存）。双阈值明确区分这两种情况，`reject_if_larger` 则兜底处理已压缩的二进制（如图片）等无压缩收益的情形。`blake3` 始终对原始字节计算，确保 hash 与存储格式无关。
 
@@ -266,7 +268,7 @@ Tree Object 清单采用 YAML 块序列格式（`- "path": hash`），而非 JSO
 
 ## 16. 文件的树索引使用 `tree_file_refs` DB 表
 
-每个 file 在哪些 Tree Snapshot 中出现的反向引用存入 `index.db` 的 `tree_file_refs` 表，而非每个 file-id 目录下的独立文件。字段：`tree_snap_id`（`snap_<ULID>`）、`file_id`、`file_object`（blake3 hash）。真理源为 `.lfv/trees/snapshots.log` + `.lfv/objects/`，`rebuild-index` 时重建。
+每个 file 在哪些 Tree Snapshot 中出现的反向引用存入 `index.db` 的 `tree_file_refs` 表，而非每个 file-id 目录下的独立文件。字段：`tree_snap_id`（`snap_<ULID>`）、`file_id`、`file_object`（blake3 hash）。真理源为 `.lfv/trees/snapshots.log` + `.lfv/objects/`，`rebuild-index` 时重建（清单不含 file-id，重建时按"最晚一条 `(path, object)` 匹配且早于树快照时间的文件快照"归属，见 `design.zh-cn.md §3.10`）。
 
 **被否决的替代方案**：每个 file-id 目录下维护一个 YAML 文件（`.lfv/trees/.yaml`），key = `snap_<ULID>`，value = file-object-hash。此方案在文件数量多时会产生大量小文件写入，且没有事务保证（写入中崩溃会产生不一致）。
 
@@ -276,7 +278,7 @@ Tree Object 清单采用 YAML 块序列格式（`- "path": hash`），而非 JSO
 
 ## 17. 命名空间隔离：用户输入不允许包含 `:`
 
-tree 标签以 `t:` 为前缀（内部管理），file 有隐式 `f:` 命名空间（通常不显示）。**用户在输入分支名、标签名时不允许包含 `:`**，由此实现命名空间隔离，避免用户输入与内部前缀冲突。
+tree 标签以 `t:` 为前缀（内部管理）；file-id 以 `f_` 为前缀，工作区字面量以 `f_/` 开头（ULID 不含 `/`，二者无歧义）。**用户在输入分支名、标签名时不允许包含 `:`**，由此实现命名空间隔离，避免用户输入与内部前缀冲突。
 
 **为什么**：如果允许用户输入 `t:foo`，CLI 无法区分这是用户有意引用 tree 标签，还是用户真的想创建一个名为 `t:foo` 的 file 标签。通过禁止 `:` 出现在用户输入中，命名空间的所有权边界清晰：带前缀的引用总是内部生成的，不带前缀的引用总是用户输入的。
 
@@ -286,6 +288,14 @@ CLI 子命令清晰、可组合、可脚本化；不为图形化或服务化做�
 
 LFV 面向自动化、shell 脚本和与其他工具的集成（同步脚本、编辑器、CI）。优先保持干净的 CLI 约定使工具可组合。GUI 或守护层可以构建在稳定的 CLI 之上；反过来则很痛苦。。
 
+## 19. diff / 三路合并选用 `diffy`
+
+spec §4.7 需要带冲突标记的三路合并，因此选型的关键不是 diff 本身，而是 crate 是否自带三路合并。
+
+- **`diffy`（采用）**：Myers diff、unified patch 生成与应用、`merge(base, ours, theirs)` 三路合并（冲突标记可选 merge / diff3 风格）。一个 crate 同时覆盖 diff 与 merge 两个需求。冲突标记标签固定为 `ours` / `theirs`，而 spec §4.7.3 要求 `ours (main)` / `theirs (feature / snap_…)`，由 `merge` 模块对输出做一次行首替换即可。
+- **`imara-diff`（否决）**：gitoxide 使用，速度最好，但没有三路合并。
+- **`similar` + 自写 diff3（否决）**：工作量最大，收益仅在词级高亮，LFV 用不到。
+
 ## 未来可能的扩展
 
 - 简单HTML5界面，可视化某文件的分支树。
@@ -293,10 +303,3 @@ LFV 面向自动化、shell 脚本和与其他工具的集成（同步脚本、�
 - 跨仓库的对象池共享。
 - 与 git LFS / NAS 厂商 API 的桥接。
 
-## 待决问题（Open Questions）
-
-下列问题会在开发过程中根据实际反馈决定：
-
-1. **改名自动识别阈值**（`rename.autodetect`）：仅在内容哈希完全一致时识别，还是允许"相似度 ≥ N%"的近似匹配？后者复杂度高，目前只做精确匹配。
-2. **`lfv revive` 默认恢复点**：从最新的 `object != null` 快照恢复，还是要求用户显式指定 `<snap>`？倾向前者作为默认，并允许用户覆盖。
-3. **同名新文件续接历史**：`lfv revive` 与同名新文件续接历史时，是否需要额外的安全确认或 `--force`，以避免用户把语义无关的新文件误接到旧历史上。
