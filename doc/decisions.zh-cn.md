@@ -33,7 +33,7 @@ LFV 把仓库快照当成用户可选，而单个文件的快照是必须。
 
 `file-id` 在 track 时分配，贯穿文件整个生命周期（含删除后），是文件消失、路径变更后唯一仍然有效的引用手段。文件删除或改名后，路径不再可解析。用户和脚本需要一个稳定的句柄来查询历史（`lfv log`）、恢复内容（`lfv revive`）或续接历史（`lfv relink`）。
 
-路径是常规场景下的便利别名，所有接受 `<file>` 的命令同时接受路径或 `f_*`。两者在所有命令中均被接受，用户在日常操作中无需被迫查询 `file-id`。
+路径是常规场景下的便利别名，所有接受 `<file>` 的命令同时接受路径或 `file:*`。两者在所有命令中均被接受，用户在日常操作中无需被迫查询 `file-id`。
 
 ## 4. 跟踪策略
 
@@ -91,8 +91,8 @@ Tree Snapshot 存放于 `.lfv/trees/snapshots.log`，拥有独立的标签集合
 **机制**：`lfv snap` 计算新内容 hash 时，先跳过与新 hash 相同的连续祖先段（同一 run），若更早的祖先仍有相同 object hash，则拒绝追加快照，改为输出提示：
 
 ```
-warning: content of docs/note.md matches ancestor snap_2 on branch B
-suggestion: run `lfv rewind docs/note.md snap_2` to re-anchor
+warning: content of docs/note.md matches ancestor snap:2 on branch B
+suggestion: run `lfv rewind docs/note.md snap:2` to re-anchor
             this will preserve the intermediate history as branch detour/<anchor-short>/1
 ```
 
@@ -182,17 +182,17 @@ tree-id（Tree Object 的身份标识）采用 `blake3(规范化清单字节串)
 
 ### 11.2 Tree 没有分支，只有标签和 HEAD
 
-Tree Snapshot 链没有分支集合，只有：标签（`t:` 前缀，全局唯一）、单条 HEAD 指针（当前所在的 Tree Snapshot）。
+Tree Snapshot 链没有分支集合，只有：标签（`tree:` 前缀，全局唯一）、单条 HEAD 指针（当前所在的 Tree Snapshot）。
 
 分支的核心价值在于支持"同一文件的多条独立演化线"——这是 file 面的典型需求（用户需要在不同分支上实验不同内容）。Tree 是里程碑式的仓库快照，其使用模式是线性推进，不需要也不应该有多条并行演化线。引入 tree 分支只会增加心智负担，而不带来实质好处。
 
 **tree HEAD 存储在单独文件 `.lfv/trees/HEAD` 中**：tree HEAD 是不可从 Snapshot 链重建的当前状态（它记录"用户当前位于 tree 历史的哪个节点"，而非哪条 Snapshot 是最新的）。`index.db` 里的其他状态（分支指针、file HEAD）在 `rebuild-index` 时可以从 Snapshot 链派生重建；tree HEAD 一旦丢失无法重建，因此应独立于可重建的 `index.db`，以单独文件持久化，避免在 `rebuild-index` 时被意外覆盖。
 
-`lfv switch <branch>` 只针对 file 分支，不提供 tree 的切换操作（因为 tree 没有分支）。tree 的位置变更只通过 `lfv rewind t:<tag|snap-id>` 操作。
+`lfv switch <branch>` 只针对 file 分支，不提供 tree 的切换操作（因为 tree 没有分支）。tree 的位置变更只通过 `lfv rewind <TS-ish>` 操作。
 
 ### 11.3 tree rewind 不直接操作 config、分支或状态表
 
-`lfv rewind t:<tag|snap-id>` 执行时，只做两件事：更新 `.lfv/trees/HEAD`，以及对工作区文件执行字节级操作（写入或删除）。它不直接调用 `track`/`untrack`/`revive` 命令，不修改 `config.yaml` 动态 untracked 列表，不修改任何分支指针或状态表。
+`lfv rewind <TS-ish>` 执行时，只做两件事：更新 `.lfv/trees/HEAD`，以及对工作区文件执行字节级操作（写入或删除）。它不直接调用 `track`/`untrack`/`revive` 命令，不修改 `config.yaml` 动态 untracked 列表，不修改任何分支指针或状态表。
 
 `config.yaml`、分支和状态表属于 `track`/`untrack`/`delete`/`revive` 命令的职责边界。tree rewind 越过这个边界直接操作，会使用户难以预测哪些命令会对 config 产生副作用，破坏命令职责的清晰性。
 
@@ -200,7 +200,7 @@ Tree Snapshot 链没有分支集合，只有：标签（`t:` 前缀，全局唯�
 
 ### 11.4 tree rewind 对每个 file 采用 FF 优先策略
 
-`lfv rewind t:<tag|snap-id>` 对每个需要还原的 file，不直接执行 rewind（会产生新分支），而是先检查是否存在 Fast-Forward 路径：
+`lfv rewind <TS-ish>` 对每个需要还原的 file，不直接执行 rewind（会产生新分支），而是先检查是否存在 Fast-Forward 路径：
 
 - **FF 路径**：若某条分支的当前 HEAD 的 object hash 等于目标 hash，直接 `switch` 到该分支，不新建分支。优先选当前分支（无切换成本）；若当前分支不匹配，选最近创建的匹配分支。
 - **rewind 路径**：否则执行标准 rewind，自动新建分支（`rewind/<snap-short>/<n>`）。
@@ -233,11 +233,11 @@ Tree Object 清单采用 YAML 块序列格式（`- "path": hash`），而非 JSO
 | --- | --- | --- | --- |
 | Object | **File Object** | 文件原始字节（压缩后） | `blake3(原始字节)` |
 | Object | **Tree Object** | 按路径排序的 `{path: file-object-hash}` 清单（YAML） | `blake3(规范化清单字节串)` |
-| Snapshot | **File Snapshot** | 单个文件的事件记录 | `snap_<ULID>` |
-| Snapshot | **Tree Snapshot** | 工作目录整体状态的事件记录 | `snap_<ULID>` |
+| Snapshot | **File Snapshot** | 单个文件的事件记录 | `snap:<ULID>` |
+| Snapshot | **Tree Snapshot** | 工作目录整体状态的事件记录 | `snap:<ULID>` |
 
 两种 Object 子类型均存放于同一个 `objects/` 目录，按内容 hash 去重，完全不可变。两种 Snapshot 子类型均为 append-only，格式相同（JSON Lines），但分别存放于不同目录：
-- File Snapshot: `.lfv/files/<file-id>/snapshots.log`
+- File Snapshot: `.lfv/files/<ULID>/snapshots.log`
 - Tree Snapshot: `.lfv/trees/snapshots.log`
 
 **为什么现在需要 Tree Object**：LFV 的应用场景包括对整个工作目录进行里程碑式快照（例如"这本书的某个完整版本"）。Tree Object 使这成为一等操作，同时保持核心不变量——内容身份由 hash 决定，而非快照 id。两次内容完全相同的工作目录状态产生相同的 Tree Object hash，`objects/` 里只有一份，与两个文件内容相同时共享同一 File Object 的机制完全一致。
@@ -268,19 +268,38 @@ Tree Object 清单采用 YAML 块序列格式（`- "path": hash`），而非 JSO
 
 ## 16. 文件的树索引使用 `tree_file_refs` DB 表
 
-每个 file 在哪些 Tree Snapshot 中出现的反向引用存入 `index.db` 的 `tree_file_refs` 表，而非每个 file-id 目录下的独立文件。字段：`tree_snap_id`（`snap_<ULID>`）、`file_id`、`file_object`（blake3 hash）。真理源为 `.lfv/trees/snapshots.log` + `.lfv/objects/`，`rebuild-index` 时重建（清单不含 file-id，重建时按"最晚一条 `(path, object)` 匹配且早于树快照时间的文件快照"归属，见 `design.zh-cn.md §3.10`）。
+每个 file 在哪些 Tree Snapshot 中出现的反向引用存入 `index.db` 的 `tree_file_refs` 表，而非每个 file-id 目录下的独立文件。字段：`tree_snap_id`（`snap:<ULID>`）、`file_id`、`file_object`（blake3 hash）。真理源为 `.lfv/trees/snapshots.log` + `.lfv/objects/`，`rebuild-index` 时重建（清单不含 file-id，重建时按"最晚一条 `(path, object)` 匹配且早于树快照时间的文件快照"归属，见 `design.zh-cn.md §3.10`）。
 
-**被否决的替代方案**：每个 file-id 目录下维护一个 YAML 文件（`.lfv/trees/.yaml`），key = `snap_<ULID>`，value = file-object-hash。此方案在文件数量多时会产生大量小文件写入，且没有事务保证（写入中崩溃会产生不一致）。
+**被否决的替代方案**：每个 file-id 目录下维护一个 YAML 文件（`.lfv/trees/.yaml`），key = `snap:<ULID>`，value = file-object-hash。此方案在文件数量多时会产生大量小文件写入，且没有事务保证（写入中崩溃会产生不一致）。
 
 **采用 db 表的理由**：`index.db` 提供 ACID 事务，单表查询效率高，且 `tree_file_refs` 本就是纯缓存性质（真理源在 `.lfv/trees/snapshots.log` + `objects/`），放入 db 与其他可重建索引语义一致，`rebuild-index` 时统一重建，不会出现某个 file 的反向引用漏写的情况。
 
 **snap_id 作为主键（而非标签名）的理由**：每个 Tree Snapshot 都有 message，即使没有标签也有意义。snap_id 作为主键保证所有 Tree Snapshot 都被反向引用，渲染时再去 `.lfv/trees/snapshots.log` 动态查询标签：有标签则显示标签名，无标签则显示 message，二者都有意义。"打不打标签"只影响展示，不影响历史的完整性。
 
-## 17. 命名空间隔离：用户输入不允许包含 `:`
+## 17. 命名空间与引用写法
 
-tree 标签以 `t:` 为前缀（内部管理）；file-id 以 `f_` 为前缀，工作区字面量以 `f_/` 开头（ULID 不含 `/`，二者无歧义）。**用户在输入分支名、标签名时不允许包含 `:`**，由此实现命名空间隔离，避免用户输入与内部前缀冲突。
+CLI 上的所有特殊引用都用多字母命名空间前缀表示，与路径永不重叠：
 
-**为什么**：如果允许用户输入 `t:foo`，CLI 无法区分这是用户有意引用 tree 标签，还是用户真的想创建一个名为 `t:foo` 的 file 标签。通过禁止 `:` 出现在用户输入中，命名空间的所有权边界清晰：带前缀的引用总是内部生成的，不带前缀的引用总是用户输入的。
+| 前缀 | 含义 |
+| ---- | ---- |
+| `file:<ULID>` | file-id |
+| `snap:<ULID>` | snap-id（文件面与树面共用，全局唯一） |
+| `tree:<tag>` | 树标签 |
+| `work:<path>` | 工作区当前内容（未保存的特殊 File Object） |
+| `blake3:<hex>` | 对象 hash / tree-id |
+
+带历史版本的文件引用写作 `<ref>:<file>`（`<ref>` 为分支名或标签名），与 git 的 `<rev>:<path>` 一致。分支名与标签名不得包含 `:`，也不得是命名空间名称 `file`、`snap`、`tree`、`work`、`blake3`；文件名不受这一限制。
+
+**为什么**：
+
+- 早期的 `f_<ULID>`、`snap_<ULID>`、`f_/<path>` 前缀与合法文件名重叠（如 `snap_notes.md`），解析必须附加"余下是否为 ULID"之类的条件，仍有漏洞。改为以 `:` 结尾的命名空间后，由于可跟踪路径不含 `:`（§20），前缀与路径在语法上就不可能重叠，参数解析可以纯按语法完成，不需要查索引。
+- 前缀用多个字母：单字母前缀（如早期的 `t:`）与 Windows 盘符写法冲突（`t:foo` 是 T 盘的相对路径）。
+- 保留 `blake3:` 而不是改名为 `object:`：前缀里带算法名，将来切换 hash 算法时旧数据仍可辨认；磁盘格式与 CLI 写法保持一致。
+- `work:` 与 `file:` 分开：工作区字面量指工作区此刻的内容，file-id 指文件本身，两者语义不同，不共用前缀。
+- 取消 `tree:<snap-id>`：snap-id 全局唯一，归属平面由索引给出，`<TS-ish>` / `<TO-ish>` 位置直接写 snap-id 即可。
+- `files/` 下的目录名只用 ULID：Windows 文件名不允许 `:`，文本形式的 `file:<ULID>` 不能直接作目录名。
+- `<file>@<ref>` 被否决：`@` 是合法文件名字符（如 `icon@2x.png`），解析时必须先把整个 token 当路径查索引，查不到再拆分，两种读法都成立时只能报歧义。`<ref>:<file>` 靠 `:` 切分，在语法层面就没有歧义。
+- 分支名与标签名禁止使用命名空间名称，否则 `tree:v1.0` 既可能是树标签，也可能是"分支 `tree` 上的文件 `v1.0`"。
 
 ## 18. 小工具优先
 
@@ -292,9 +311,72 @@ LFV 面向自动化、shell 脚本和与其他工具的集成（同步脚本、�
 
 spec §4.7 需要带冲突标记的三路合并，因此选型的关键不是 diff 本身，而是 crate 是否自带三路合并。
 
-- **`diffy`（采用）**：Myers diff、unified patch 生成与应用、`merge(base, ours, theirs)` 三路合并（冲突标记可选 merge / diff3 风格）。一个 crate 同时覆盖 diff 与 merge 两个需求。冲突标记标签固定为 `ours` / `theirs`，而 spec §4.7.3 要求 `ours (main)` / `theirs (feature / snap_…)`，由 `merge` 模块对输出做一次行首替换即可。
+- **`diffy`（采用）**：Myers diff、unified patch 生成与应用、`merge(base, ours, theirs)` 三路合并（冲突标记可选 merge / diff3 风格）。一个 crate 同时覆盖 diff 与 merge 两个需求。冲突标记标签固定为 `ours` / `theirs`，而 spec §4.7.3 要求 `ours (main)` / `theirs (feature / snap:…)`，由 `merge` 模块对输出做一次行首替换即可。
 - **`imara-diff`（否决）**：gitoxide 使用，速度最好，但没有三路合并。
 - **`similar` + 自写 diff3（否决）**：工作量最大，收益仅在词级高亮，LFV 用不到。
+
+## 20. 可跟踪路径采用 Windows 文件名规则
+
+可跟踪路径不含控制字符与 `< > : " \ | ? *`，路径分量不以 `.` 或空格结尾，也不是 Windows 保留名（`CON`、`NUL`、`COM1` 等）。Linux 与 macOS 禁止的字符（`/` 与 NUL）是 Windows 的子集，因此这条规则对三个平台都成立，无需另外补充。
+
+**为什么**：历史需要能在任一平台还原（跨设备同步）。只要允许记录某个平台不能创建的文件名，到了该平台上 rewind / revive 就会失败，而且只能在失败时才发现。按最严格的平台统一规定，从源头上杜绝这类记录。顺带的效果是路径不含 `:`，命名空间前缀（§17）与路径永不重叠。
+
+**违规路径的处理**：自动 track 不登记，只给出警告并提示加入 `.lfvignore`，扫描照常继续；显式 `lfv track <file>` 报错，因为用户明确要求的操作无法完成。
+
+## 21. 路径参数的写法
+
+`a`、`./a`、`../a` 相对当前工作目录；以 `/` 开头的 `/a/b` 是以仓库根为根的仓库内绝对路径；操作系统绝对路径与盘符一律不接受。所有写法最终规范化为相对仓库根的路径，越出仓库则报错。输入中 `\` 视同 `/`，但输出与提示只用 `/`。MinGW / Git Bash 下写 `//a/b` 以避开 MSYS 的路径改写。
+
+**为什么**：保留当前目录语义符合命令行习惯（Tab 补全给出的就是相对路径）；仓库内绝对路径让同一条命令在任意子目录、任意平台上写法相同；拒绝盘符和操作系统绝对路径，使路径写法与平台无关，同时也不再需要为盘符里的 `:` 消歧。`\` 不可能出现在可跟踪路径中（§20），所以接受它作为分隔符不会产生歧义，只是为了照顾 PowerShell 的补全结果，并不鼓励使用。
+
+## 22. 平台差异交给用户处理，LFV 只检测和报错
+
+- **仅大小写不同的路径**：在大小写不敏感的文件系统上，若仓库记录中有两个仅大小写不同的活跃路径，或一次操作会同时写出这样两个路径，LFV 报错并提示用户为相关目录开启大小写敏感；没有这种情况时照常运行。
+- **路径长度**：Windows 的路径长度限制由用户处理；LFV 只在文件系统操作因路径过长失败时报错说明原因。
+
+**为什么**：这两类问题都依赖用户的系统设置，LFV 无法替用户做出正确的选择；自动改名或截断路径会破坏"路径是历史事实"这一前提。
+
+## 23. `null` 快照打断对象 run
+
+分支对象唯一性（§8）中，`null` 不参与唯一性，但会打断 run：`O1 → null → O1` 属于 O1 非连续地再次出现。
+
+**为什么**：删除后要回到 O1，正确的做法是 rewind / revive 到删除前的快照，而不是在 `null` 之后再追加一条 O1。`null` 快照总是停在某条分支的末尾，后续从它的父节点接续。唯一会在 `null` 之后追加快照的是 relink 接缝；若接缝内容恰好等于删除前的对象，按环回拒绝，引导用户改用 `lfv revive`。
+
+## 24. `--continue` / `--abort` 的 `<file>` 可省略
+
+建议带上 `<file>`。省略时，LFV 查找进行中的 merge / rebase：恰好一个文件处于进行中则作用于它；多个或零个时报错。
+
+**为什么**：`REPLAY.yaml` 按文件存放，不同文件可以同时处于 merge / rebase 中。强制带 `<file>` 最清晰，但单文件场景下很啰嗦；全仓库只允许一个进行中操作则限制过严。"唯一则省略、多个则报错"兼顾两者，出错时也不会作用到错误的文件上。
+
+## 25. 同路径旧 file-id 提示每次重查
+
+`lfv status` 对新 track 的文件提示"该路径此前属于某个已删除的 file-id"时，不在 `tracked` 表中缓存旧 file-id，而是每次按日志重新查找。
+
+**为什么**：这类 `A` 状态的文件很少，且在首次 snap 后提示即消失，重查的开销可以忽略；加缓存列则需要改 schema，并在 `rebuild-index` 中增加重算规则，不值得。
+
+## 26. `lfv mv` 的源可以是 file-id
+
+`lfv mv <old-file> <new-file>` 中，`<old-file>` 接受路径或 file-id，`<new-file>` 只接受路径。
+
+**为什么**：file-id 一定对应一个路径（当前路径或 HEAD 快照中的路径），用它指定源不会有歧义，而且对 `D` 行这类盘上已消失的文件更方便。目标仍只允许路径，理由不变：若目标可写 file-id，用户容易误以为保留下来的是目标一侧的身份（续接历史应使用 `lfv relink`）。
+
+## 27. 路径统一为 NFC，磁盘规范形自动探查
+
+`RepoPath` 一律以 Unicode NFC 形式记录与比较。访问磁盘时逐个路径分量依次尝试 NFC、NFD，都不存在再列目录比较；不维护持久的"`RepoPath` → 磁盘名"映射。仅规范形不同的两个磁盘文件名报错，交用户处理。规范化与大小写冲突检测都放在 `scan` 的工作区访问层。
+
+**为什么**：同一个名字在 macOS（NFD）与 Windows / Linux（通常为 NFC）上字节不同，不统一规范形，跨设备后同一文件会被当成改名或新文件。持久映射记录的是某台机器上的磁盘名，而 `.lfv` 要跨设备复制，换一台机器映射就失效了；按分量探查不需要任何持久状态，只在本进程内缓存。大小写冲突检测同样依赖磁盘实际行为，与规范形探查放在同一层最自然。
+
+## 28. 分支名与标签名禁止控制字符
+
+分支名与标签名不得包含控制字符，不符合的名称在创建时直接拒绝。HEAD 文件因此始终是"一行纯分支名"，不需要转义。
+
+**为什么**：控制字符会破坏 HEAD 的单行格式和按行组织的 CLI 输出，还可能向终端注入转义序列；在命令行上也难以输入。与文件名不同，分支名和标签名都由 LFV 创建，拒绝不合规的名称不会像限制 OS 文件名那样影响用户已有的数据；分支名与标签名已经有保留字限制，再禁止控制字符几乎没有额外代价。
+
+## 29. anchor-short 取 ULID 末 8 位，与 file-id 缩写取前 8 位不同
+
+保留分支命名（`<kind>/<anchor-short>/<n>`，spec §4.5）里的 `anchor-short`，取被保留快照 ULID 的**末 8 位**；`lfv status` 里 `file-id` 的展示缩写（spec §4.3.1）取的是**前 8 位**。两者刻意不同，不是笔误。
+
+ULID 用 Crockford Base32 编码，26 个字符里前约 10 个字符是 48 bit 时间戳，后约 16 个字符是 80 bit 随机数。file-id 缩写取前 8 位，落在时间戳段：同一时间段内创建的文件其 file-id 前缀相近，方便用户在 `log`/`status` 输出里按时间顺序阅读、用短前缀手动输入，是面向人的展示优化。anchor-short 取末 8 位，落在随机数段：短时间内连续发生多次 rewind / detour / rebase / revive（例如一次 `lfv rewind <TS-ish>` 批量操作数十个文件）时，若取时间戳段，各次操作生成的前缀会高度雷同，几乎全靠末尾 `<n>` 递增消歧；取随机数段则天然低碰撞，减少对 `<n>` 的依赖。
 
 ## 未来可能的扩展
 

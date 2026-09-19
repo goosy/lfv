@@ -36,17 +36,17 @@ src/
 ├── object/        ObjectStore: hash, compression policy, bucketed write/read, enumerate/remove (gc); TreeManifest (Tree Object codec)
 ├── snapshot/      Snapshot records, canonical digest form, SnapshotLog (append / full read / tail truncation), event-type derivation, ancestor traversal
 ├── reftable/      name -> snap_id YAML tables (branches.yaml / tags.yaml / trees/tags.yaml share one format)
-├── tracked/       handle for the files/<file-id>/ directory: meta.yaml, HEAD, branch table, tag table, log; file-id allocation and retirement
-├── tree/          handle for the trees/ directory: log, HEAD, t: tags; Tree Object construction
+├── tracked/       handle for the files/<ULID>/ directory: meta.yaml, HEAD, branch table, tag table, log; file-id allocation and retirement
+├── tree/          handle for the trees/ directory: log, HEAD, tree: tags; Tree Object construction
 ├── index/         SQLite: schema, migration, queries, rebuild
-├── scan/          working-tree scan: .lfvignore, incremental invalidation, auto-track / auto-delete, automatic rename detection, status-flag derivation
+├── scan/          working-tree scan: .lfvignore, incremental invalidation, auto-track / auto-delete, automatic rename detection, status-flag derivation; working-area access layer (Unicode normalization, locating, case-collision detection)
 ├── resolve/       CLI argument resolution: <file> <FO-ish> <FS-ish> <TO-ish> <TS-ish> -> strongly typed targets
 ├── diff/          unified diff of two byte strings (text) / metadata diff (binary)
 ├── merge/         three-way text merge, conflict markers, replay engine, in-progress state (merge/rebase --continue/--abort)
 └── util/          path normalization, time, ULID, atomic write (tmp + rename), small filesystem helpers
 ```
 
-Branches and tags have no module of their own: both use the same `name: snap_<ULID>` YAML format and differ only in behavior ("a tag is only added, never repointed"), which one generic table in `reftable` plus each plane's handle covers.
+Branches and tags have no module of their own: both use the same `name: snap:<ULID>` YAML format and differ only in behavior ("a tag is only added, never repointed"), which one generic table in `reftable` plus each plane's handle covers.
 
 ### 1.3 Dependency direction (downward only)
 
@@ -74,6 +74,7 @@ cli → ops → { scan, resolve, merge, diff }
 | Time | `jiff` | — |
 | ID | `ulid` | — |
 | ignore rules | `ignore` (ripgrep's gitignore implementation) | see §4.2 |
+| Unicode normalization | `unicode-normalization` | working-area access layer only, see §4.2.1 |
 | Logging | `tracing` + `tracing-subscriber` | — |
 | Testing | `assert_cmd` + `predicates` + `tempfile` | — |
 
@@ -110,13 +111,33 @@ tests/
 
 | Type | Text form | Notes |
 | --- | --- | --- |
-| `FileId` | `f_<ULID 26>` | the prefix is part of the id: directory names, DB, and CLI all carry it |
-| `SnapId` | `snap_<ULID 26>` | the same format on both the file and tree planes, globally unique |
+| `FileId` | `file:<ULID 26>` | the text form (DB, YAML, logs, CLI) carries the `file:` prefix; directory names under `files/` are the bare `<ULID>` (Windows file names cannot contain `:`) |
+| `SnapId` | `snap:<ULID 26>` | the same format on both the file and tree planes, globally unique |
 | `ObjectHash` | `blake3:<64 hex>` | `[u8; 32]` internally; File Object and Tree Object share one type, and **the storage layer does not distinguish them** |
 | `TreeId` | = `ObjectHash` | a content hash, with no identity of its own |
-| `BranchName` / `TagName` | contains no `:`; non-empty; does not start or end with `/` | tree tags are stored internally as `t:<name>`, with `TreeTag` as a separate type |
-| `RepoPath` | relative to the repo root, `/`-separated, UTF-8, containing no `"`, `\`, or control characters | spec §4.2 path rules |
-| `WorktreeRef` | `f_/<path>` | the literal for the special working-area File Object |
+| `BranchName` / `TagName` | contains no `:` or control characters; contains no YAML indicator characters or leading/trailing whitespace (full rules in §2.1.1); non-empty; does not start or end with `/`; is not a namespace keyword `file` / `snap` / `tree` / `work` / `blake3` | tree tags are stored internally as `tree:<name>`, with `TreeTag` as a separate type |
+| `RepoPath` | relative to the repo root after normalization (CLI input may be relative to cwd, or start with `/` for a repository-absolute path), `/`-separated, UTF-8, following the Windows file-name rules (no `<>:"\|?*` or control characters, no component ending in `.` or a space, no reserved names) | spec §4.2 path rules |
+| `WorktreeRef` | `work:<path>` | the literal for the special working-area File Object |
+
+### 2.1.1 Serialization rules for metadata strings (corresponds to spec §3.5)
+
+Strings written into these YAML files fall into three categories by how controllable they are, handled differently:
+
+**User-controlled** (`RepoPath`, `config.yaml`'s `user.name`, a snapshot's `author`) — always double-quoted on serialization, escaped inside the quotes by the standard YAML double-quoted-string rules, reusing the same escaping implementation as digest canonicalization (§3.3.2) (only `"`, `\`, and control characters are escaped; non-ASCII is raw UTF-8). `RepoPath` already forbids `"` and `\` (spec §4.2), so this rule needs no real escaping for it in practice — a scan to the next `"` is the whole value; `user.name`/`author` have no character restriction and do need full escaping under this rule.
+
+**User-proposed, LFV-approved** (`BranchName`, `TagName`) — not quoted on serialization; the price for that is that creation-time validation must reject anything that would create ambiguity in a bare YAML scalar:
+
+| Forbidden | Why |
+| --- | --- |
+| control characters, `:` | existing rule in §2.1 (`BranchName`/`TagName`) |
+| `#?,[]{}&*!\|>'"%@` and the backtick itself | YAML indicator characters (c-indicator), which carry special syntactic meaning in specific positions of a bare scalar |
+| `\` | keeps the value escape-free should it ever need to appear somewhere that requires escaping |
+| leading or trailing whitespace | a bare YAML scalar has its surrounding whitespace trimmed, so the value read back would differ from what was written — silent corruption, not a parse error |
+| the whole name equal to `-`, or matching `/^-\s/` (a hyphen immediately followed by whitespace) | a leading `-` plus whitespace is YAML's block-sequence-entry marker; `-` elsewhere (not followed by a space, at the end, or in the middle) is fine |
+
+The check belongs in the commands that create branch/tag names (`lfv branch-rename`, `lfv tag`, and the preserved branch names implicitly created by rewind/detour/rebase/revive), at the same layer as the namespace-keyword check, refusing creation outright on a violation.
+
+**LFV-controlled** (`snap:<ULID>`, `file:<ULID>`, `blake3:<hex>`, RFC 3339 timestamps, `true`/`false`, integer version numbers, and the like) — the character set is defined by LFV itself and known safe; written bare, unquoted and unescaped.
 
 ### 2.2 The object plane
 
@@ -222,7 +243,7 @@ pub struct Retired { pub at: Timestamp, pub onto: FileId }
 pub struct TreePlane { log: SnapshotLog /* plane = Tree */, head: Option<SnapId>, tags: RefTable<TreeTag> }
 ```
 
-`trees/HEAD` being an empty file ↔ `head = None` (§3.7). There are no branches. Reachability: `trees/HEAD` and all `t:` tags are roots; when `rewind <TS-ish>` leaves a HEAD that has no tag and is not an ancestor of the target, a `t:detour/<head-short>` tag is applied automatically (spec §4.5.1).
+`trees/HEAD` being an empty file ↔ `head = None` (§3.7). There are no branches. Reachability: `trees/HEAD` and all `tree:` tags are roots; when `rewind <TS-ish>` leaves a HEAD that has no tag and is not an ancestor of the target, a `tree:detour/<head-short>` tag is applied automatically (spec §4.5.1).
 
 ### 2.7 Working-area state model (shared by `scan` and `index`)
 
@@ -237,6 +258,8 @@ fn flag(row, head: Option<&Snapshot>) -> Flag
   row.hash != head.object                          -> M
   else                                             -> unmodified
 ```
+
+`head == None` always renders as `A`, regardless of whether it is a brand-new file or a path that previously had a deleted file-id — the latter only adds a hint line under the `A` row (§4.4) and does not change the flag itself.
 
 `untracked` rows live in a table of their own (§3.6) and record only paths that exist on disk (§4.2).
 
@@ -253,9 +276,11 @@ pub enum FileTarget  { Worktree(FileId, RepoPath), Object(FileId, ObjectHash) } 
 pub enum TreeTarget  { Object(ObjectHash), Snap(SnapId) }                            // <TO-ish> / <TS-ish>
 ```
 
-Disambiguation order for a bare token: the `snap_` prefix → the `f_/` prefix (working-area literal) → the `f_` prefix with 26 remaining characters forming a ULID → the `t:` prefix (tree) → the `blake3:` prefix (tree-id) → when it contains `@`, the whole token is first resolved as a path (same lookup chain as below) and is a path on a hit; on a miss it is split at the last `@` and resolved as `<file>@<ref>`; if both readings resolve, it is an ambiguity error that suggests `f_<ULID>@<ref>` → otherwise treated as a path (relative to cwd or absolute, normalized into a `RepoPath`, looked up in `tracked.path`, then in `tracked.head_path` (a rename pending write), then as the file-id that last held that path in history). Branch names and tag names may not appear as bare tokens; in commands that already carry a `<file>` argument, a bare token in the `<FS-ish>` position is resolved first as a snap-id, then as a branch name of that file, then as a tag name.
+Disambiguation order for a bare token (purely syntactic, no index lookup): the `snap:` prefix (snap-id; `snap_locator` tells whether it is on the file or tree plane) → the `file:` prefix (file-id) → the `work:` prefix (working-area literal) → the `tree:` prefix (tree tag) → the `blake3:` prefix (tree-id) → when it contains `:`, it is split at the first `:` as `<ref>:<file>`, and the `<file>` part is classified again by these rules as a file-id or a path → otherwise treated as a path (`a`, `./a`, `../a` relative to cwd, `/a/b` repository-absolute; operating-system absolute paths and drive letters are rejected; `\` in input is read as `/`, and several leading `/` count as one; normalized into a `RepoPath`, an error if it leaves the repository; looked up in `tracked.path`, then in `tracked.head_path` (a rename pending write), then as the file-id that last held that path in history). Branch names and tag names may not appear as bare tokens; in commands that already carry a `<file>` argument, a bare token in the `<FS-ish>` position is resolved first as a snap-id, then as a branch name of that file, then as a tag name.
 
-Which file-id / plane a bare `snap_*` belongs to is answered by `index.snap_locator` (§3.6).
+Which file-id / plane a bare `snap:*` belongs to is answered by `index.snap_locator` (§3.6).
+
+The `FileId` carried by `FileTarget::Object` is only the file context the resolution happened to pass through (used, for instance, by `lfv diff <FO-ish>` to infer the implicit second argument `work:<path>`) — it does not mean the File Object belongs to that file. A File Object is a content-addressed storage unit; different file-ids and different branches may reference the same hash (spec §3.2.1). For `lfv show <FO-ish>` (without `--content`/`--out`) to list "every snapshot referencing this hash", it must scan all of `files/*/snapshots.log` and match `object == target hash`, not just the one file-id the resolution happened to carry. This is a repo-wide scan; there is no index for it today — it is a low-frequency diagnostic command, so a full scan is acceptable, with a reverse `object_hash -> snap_id` index left for later if this becomes a bottleneck.
 
 ## 3. Storage Structure
 
@@ -278,7 +303,7 @@ A/                                   # working directory
     │   │   └── a3bc9d12...raw       # Tree Object (manifest YAML, usually small -> .raw)
     │   └── ...
     ├── files/                       # metadata for each tracked file
-    │   ├── <file-id>/
+    │   ├── <ULID>/                  # directory name = the file-id without its `file:` prefix
     │   │   ├── meta.yaml            # file-level metadata (creation time, initial path, retirement marker)
     │   │   ├── HEAD                 # current branch name
     │   │   ├── branches.yaml        # this file's branch table
@@ -289,7 +314,7 @@ A/                                   # working directory
     ├── trees/                       # global metadata
     │   ├── snapshots.log            # append-only global snapshot records (JSON Lines)
     │   ├── tags.yaml                # tree tag table
-    │   └── HEAD                     # current tree-head, holding snap_<ULID> or empty
+    │   └── HEAD                     # current tree-head, holding snap:<ULID> or empty
     └── logs/                        # CLI operation logs (optional, useful for debugging; not implemented in v0.x)
 ```
 
@@ -329,8 +354,8 @@ Each line of `snapshots.log` is one JSON object (JSON Lines):
 
 ```json
 {
-  "id": "snap_01HXYZ...",
-  "parent": "snap_01HXYY...",
+  "id": "snap:01HXYZ...",
+  "parent": "snap:01HXYY...",
   "path": "docs/note.md",
   "object": "blake3:abcdef0123...",
   "size": 12345,
@@ -343,7 +368,7 @@ Each line of `snapshots.log` is one JSON object (JSON Lines):
 
 Field notes:
 
-- `id`: a monotonic, readable snapshot identifier using a [ULID](https://github.com/ulid/spec) with the `snap_` prefix. A ULID carries a timestamp prefix plus a random suffix, which makes chronological sorting in `log` easy and makes the id convenient for a human to paste in a terminal.
+- `id`: a monotonic, readable snapshot identifier using a [ULID](https://github.com/ulid/spec) with the `snap:` prefix. A ULID carries a timestamp prefix plus a random suffix, which makes chronological sorting in `log` easy and makes the id convenient for a human to paste in a terminal.
 - `parent`: the parent snapshot id; `null` for the first snapshot on a branch.
 - `path`: **the file's relative path in the working tree at the moment of this snapshot**. A rename/move event shows up exactly as this field differing from `parent.path`; when the file does not currently exist, the last known on-disk path is kept (which keeps `log` readable).
 - `object`: the blake3 hash of the referenced Object (with the `blake3:` prefix so the algorithm can be switched later); **`null` when the file does not currently exist**.
@@ -404,8 +429,8 @@ This is a cross-version compatibility promise and is independent of the whitespa
 
 ```json
 {
-  "id": "snap_01HABC...",
-  "parent": "snap_01HABZ...",
+  "id": "snap:01HABC...",
+  "parent": "snap:01HABZ...",
   "path": null,
   "object": "blake3:7fa3bc9d...",
   "created_at": "2026-05-17T10:00:00Z",
@@ -464,9 +489,9 @@ The mutable index lives in `index.db` and records the working-area state of each
 | `tracked` | Tracked files that currently own a path (including `D` rows that have disappeared from disk and are waiting for `lfv snap` to record the deletion). Primary key file-id; caches the HEAD snapshot's path/object/size and the on-disk mtime/size/hash from the last scan, to short-circuit incremental scans. | ✓ |
 | `untracked` | The dynamic untracked list in `config.yaml` ∩ LFV-visible ∩ paths that exist on disk; keeps the known former file-id for `lfv track` to reuse. | ✓ |
 | `scan_meta` | Scan metadata: `last_completed_at` and the mtimes of `.lfvignore` and `config.yaml`, for incremental-scan invalidation. | ✓ |
-| `branches` | Branch pointer cache per file. Source of truth: `.lfv/files/<file-id>/branches.yaml`. | ✓ |
-| `tags` | Tag cache per file. Source of truth: `.lfv/files/<file-id>/tags.yaml` and `.lfv/trees/tags.yaml`. | ✓ |
-| `snap_locator` | A bare `snap_<ULID>` → the file-id it belongs to (NULL for the tree plane). Source of truth: the `snapshots.log` files. | ✓ |
+| `branches` | Branch pointer cache per file. Source of truth: `.lfv/files/<ULID>/branches.yaml`. | ✓ |
+| `tags` | Tag cache per file. Source of truth: `.lfv/files/<ULID>/tags.yaml` and `.lfv/trees/tags.yaml`. | ✓ |
+| `snap_locator` | A bare `snap:<ULID>` → the file-id it belongs to (NULL for the tree plane). Source of truth: the `snapshots.log` files. | ✓ |
 | `tree_file_refs` | Reverse-reference cache on the tree dimension. Source of truth: `.lfv/trees/snapshots.log` + `objects/`, rebuilt by `rebuild-index` and written by `lfv snap --tree`. Used to attach tree association information when rendering `lfv log <FS-ish>`, and by `lfv rewind <TS-ish>` to map manifest entries to file-ids. | ✓ |
 
 > [!note] Notes on tracked / untracked
@@ -481,7 +506,7 @@ The mutable index lives in `index.db` and records the working-area state of each
 ```sql
 -- tracked files that currently own a path (or are pending deletion, present = 0)
 CREATE TABLE tracked (
-    file_id       TEXT PRIMARY KEY,  -- f_<ULID>
+    file_id       TEXT PRIMARY KEY,  -- file:<ULID>
     path          TEXT NOT NULL,     -- current worktree path (= head_path unless a rename is pending)
     present       INTEGER NOT NULL,  -- 1 = exists on disk; 0 = missing (rendered as D)
     status        TEXT NOT NULL,     -- 'modified' | 'unmodified'
@@ -508,23 +533,23 @@ CREATE TABLE scan_meta (
     value      TEXT NOT NULL
 );
 
--- branch pointer cache (truth: .lfv/files/<file-id>/branches.yaml)
+-- branch pointer cache (truth: .lfv/files/<ULID>/branches.yaml)
 CREATE TABLE branches (
-    file_id    TEXT NOT NULL,        -- f_<ULID>
+    file_id    TEXT NOT NULL,        -- file:<ULID>
     name       TEXT NOT NULL,
-    snap_id    TEXT NOT NULL,        -- snap_<ULID> at the branch HEAD
+    snap_id    TEXT NOT NULL,        -- snap:<ULID> at the branch HEAD
     PRIMARY KEY (file_id, name)
 );
 
--- tag cache (truth: .lfv/files/<file-id>/tags.yaml and .lfv/trees/tags.yaml; tree tags use file_id = '')
+-- tag cache (truth: .lfv/files/<ULID>/tags.yaml and .lfv/trees/tags.yaml; tree tags use file_id = '')
 CREATE TABLE tags (
     file_id    TEXT NOT NULL,
-    name       TEXT NOT NULL,        -- tree tags keep their 't:' prefix
+    name       TEXT NOT NULL,        -- tree tags keep their 'tree:' prefix
     snap_id    TEXT NOT NULL,
     PRIMARY KEY (file_id, name)
 );
 
--- where does a bare snap_<ULID> live?  NULL file_id = tree plane
+-- where does a bare snap:<ULID> live?  NULL file_id = tree plane
 CREATE TABLE snap_locator (
     snap_id    TEXT PRIMARY KEY,
     file_id    TEXT
@@ -532,8 +557,8 @@ CREATE TABLE snap_locator (
 
 -- tree-side reverse references (truth: trees/snapshots.log + objects/)
 CREATE TABLE tree_file_refs (
-    tree_snap_id  TEXT NOT NULL,     -- snap_<ULID>
-    file_id       TEXT NOT NULL,     -- f_<ULID>
+    tree_snap_id  TEXT NOT NULL,     -- snap:<ULID>
+    file_id       TEXT NOT NULL,     -- file:<ULID>
     file_object   TEXT NOT NULL,     -- blake3:...
     PRIMARY KEY (tree_snap_id, file_id)
 );
@@ -542,9 +567,9 @@ CREATE TABLE tree_file_refs (
 **Writing and rebuilding `tree_file_refs`**: when `lfv snap --tree` creates a Tree Snapshot it expands the Tree Object manifest and inserts one row per file (at that moment each entry's file-id comes straight from its `tracked` row); `rebuild-index` rebuilds it using the attribution rule in §3.10. It is used to attach tree association information when rendering `lfv log <FS-ish>`:
 
 ```
-snap_01HXYZ  M  docs/note.md   "add chapter 2"
-             └─ tree: "chapter 3 complete" [t:v1.0]
-snap_01HWWW  M  docs/note.md   "fix typo"
+snap:01HXYZ  M  docs/note.md   "add chapter 2"
+             └─ tree: "chapter 3 complete" [tree:v1.0]
+snap:01HWWW  M  docs/note.md   "fix typo"
              └─ tree: "routine archive 2026-05-30"
 ```
 
@@ -552,7 +577,7 @@ snap_01HWWW  M  docs/note.md   "fix typo"
 
 The following files record **user intent** or the state of an operation in progress, cannot be derived mechanically from the Snapshot chain, and are not overwritten by `rebuild-index`:
 
-**`.lfv/files/<file-id>/HEAD`**
+**`.lfv/files/<ULID>/HEAD`**
 
 One per tracked file, containing the name of the current branch (plain text, one line):
 
@@ -562,28 +587,28 @@ main
 
 LFV does not support a detached HEAD — `rewind` always creates a new branch to preserve the old HEAD, so HEAD always points at a named branch and is never a bare snap\_id.
 
-**`.lfv/files/<file-id>/meta.yaml`**
+**`.lfv/files/<ULID>/meta.yaml`**
 
 ```yaml
 created_at: 2026-05-17T09:21:33Z
-initial_path: docs/note.md        # path at track time; the only record of it before the first snapshot
-retired:                          # present only after `lfv relink <this> --onto <onto>`
-  at: 2026-06-01T08:00:00Z
-  onto: f_01HA7BCD...
+initial_path: "docs/note.md"      # path at track time; the only record of it before the first snapshot
+retired: ~                        # ~ until `lfv relink <this> --onto <onto>`, then a nested block:
+                                   #   at: 2026-06-01T08:00:00Z
+                                   #   onto: file:01HA7BCD...
 ```
 
 `initial_path` lets a file with no snapshot yet return to the `tracked` table after `rebuild-index` instead of being assigned a new file-id; `retired` keeps a retired file-id from competing for the path with the `onto` side during a rebuild.
 
-**`.lfv/files/<file-id>/REPLAY.yaml`**
+**`.lfv/files/<ULID>/REPLAY.yaml`**
 
-The in-progress state of a merge / rebase (structure in §4.14), existing only between `--continue` / `--abort`. While this file exists, other commands that would modify that file's history refuse to run.
+The in-progress state of a merge / rebase (structure in §4.14), existing only between `--continue` / `--abort`. While this file exists, other commands that would modify that file's history refuse to run, **including starting a new `lfv merge`/`lfv rebase`/`lfv merge --pick` on the same file-id**: a file-id can have at most one merge/rebase/pick in progress at a time, and a new one cannot start until the current one is finished with `--continue` or given up with `--abort`.
 
 **`.lfv/trees/HEAD`**
 
-The current head of the tree layer, containing `snap_<ULID>` or nothing (when the repository has no Tree Snapshot yet):
+The current head of the tree layer, containing `snap:<ULID>` or nothing (when the repository has no Tree Snapshot yet):
 
 ```
-snap_01HABC...
+snap:01HABC...
 ```
 
 **`.lfv/lock`**
@@ -595,12 +620,12 @@ A process-level advisory lock (`std::fs::File::try_lock`, Rust ≥ 1.89). It is 
 ```yaml
 format: 1                 # repository format version; bump on incompatible layout changes
 user:
-  name: goosy
-compression: { ... }      # §3.2.1
+  name: "goosy"
+compression: ...          # see §3.2.1 for the full block-style mapping
 rename:
   autodetect: true
 untracked:                # dynamic untracked list, RepoPath strings
-  - drafts/local.md
+  - "drafts/local.md"
 ```
 
 `lfv config <key> [value]` reads and writes with dot-separated keys (`user.name`, `rename.autodetect`).
@@ -609,37 +634,37 @@ untracked:                # dynamic untracked list, RepoPath strings
 
 The yaml files below are the source of truth for branches and tags; the `branches` and `tags` tables in `index.db` are their rebuildable cache.
 
-**`.lfv/files/<file-id>/branches.yaml`**
+**`.lfv/files/<ULID>/branches.yaml`**
 
-key = branch name, value = the `snap_<ULID>` at that branch's current HEAD:
+key = branch name, value = the `snap:<ULID>` at that branch's current HEAD:
 
 ```yaml
-main: snap_01HXYZ...
-rewind/7RQ2M9KA/1: snap_01HABC...
+main: snap:01HXYZ...
+rewind/7RQ2M9KA/1: snap:01HABC...
 ```
 
 - Written when a branch is first created; the corresponding value is updated after `lfv snap` produces a new snapshot on the current branch.
 - `lfv branch-delete` removes the corresponding key; the snapshots themselves are unaffected (append-only).
 
-**`.lfv/files/<file-id>/tags.yaml`**
+**`.lfv/files/<ULID>/tags.yaml`**
 
-key = tag name, value = `snap_<ULID>`. Once created, a tag cannot be repointed; after deletion the same name can be created again:
+key = tag name, value = `snap:<ULID>`. Once created, a tag cannot be repointed; after deletion the same name can be created again:
 
 ```yaml
-v1.0: snap_01HXYZ...
-stable: snap_01HWWW...
+v1.0: snap:01HXYZ...
+stable: snap:01HWWW...
 ```
 
 **`.lfv/trees/tags.yaml`**
 
-The tag table of the tree layer: key = `"t:<name>"`, value = `snap_<ULID>`. Tree tags are globally unique and likewise cannot be repointed, but can be recreated after deletion:
+The tag table of the tree layer: key = `"tree:<name>"`, value = `snap:<ULID>`. Tree tags are globally unique and likewise cannot be repointed, but can be recreated after deletion:
 
 ```yaml
-t:v1.0: snap_01HABC...
-t:release: snap_01HZZZ...
+tree:v1.0: snap:01HABC...
+tree:release: snap:01HZZZ...
 ```
 
-User-input tag names may not contain `:` (used for namespace isolation); the `t:` prefix is added by LFV automatically. The `t:detour/<head-short>` tags applied automatically by `rewind <TS-ish>` also live in this table.
+User-input tag names may not contain `:` (used for namespace isolation); the `tree:` prefix is added by LFV automatically. The `tree:detour/<head-short>` tags applied automatically by `rewind <TS-ish>` also live in this table.
 
 All yaml / HEAD writes go through `util::atomic_write` (a tmp file in the same directory + rename; `rename` can overwrite on Windows).
 
@@ -657,7 +682,7 @@ The consequence of a crash after each step: after 1 → one unreferenced object 
 ### 3.10 The `rebuild-index` algorithm
 
 1. Rebuild the schema.
-2. Walk `files/*/`: read meta, HEAD, branches, tags, and the log. Write `branches`, `tags`, `snap_locator`. A `retired` file-id gets no `tracked` row (but still gets `snap_locator`, since `lfv log f_src` must keep working). According to the HEAD snapshot of the current branch:
+2. Walk `files/*/`: read meta, HEAD, branches, tags, and the log. Write `branches`, `tags`, `snap_locator`. A `retired` file-id gets no `tracked` row (but still gets `snap_locator`, since `lfv log file:<src>` must keep working). According to the HEAD snapshot of the current branch:
    - present with `object != null` → a `tracked` row: `path = head.path`, `present = stat succeeded`, `head_*` filled in, `disk_*` left empty (forcing the next scan to re-hash);
    - present with `object == null` → deleted, no row;
    - no snapshot → `path = meta.initial_path`, `present = stat`, `head_* = NULL`.
@@ -669,7 +694,7 @@ The consequence of a crash after each step: after 1 → one unreferenced object 
 
 ### 3.11 Reachability and gc
 
-- Roots: file plane = every branch head of every file-id (including retired ones) + every tag + the snapshots referenced by an existing `REPLAY.yaml`; tree plane = `trees/HEAD` + every `t:` tag.
+- Roots: file plane = every branch head of every file-id (including retired ones) + every tag + the snapshots referenced by an existing `REPLAY.yaml`; tree plane = `trees/HEAD` + every `tree:` tag.
 - Reachable snapshots = the closure from the roots along `parent`. Reachable objects = the `object` of every reachable snapshot ∪ the entries in the manifests of reachable Tree Snapshots.
 - `lfv gc`: deletes objects that **no snapshot (dangling ones included) references**; the logs are left alone.
 - `lfv gc --purge`: first `SnapshotLog::rewrite` each log according to reachability (the only permitted log rewrite), then delete objects according to the new reference set. A crash between the two steps is safe (it only leaves extra objects behind).
@@ -707,6 +732,17 @@ Additional conventions:
 - during `rebuild-index`, the `untracked` rows = the dynamic list in `config.yaml` ∩ LFV-visible paths ∩ paths that **exist on disk**;
 - `.lfvignore` syntax is a subset of gitignore syntax, only one file at the repository root is recognized, and matching uses the gitignore matcher of the `ignore` crate; directory patterns take part in traversal pruning;
 - the dynamic untracked list records paths; after an untracked file is renamed on disk the new path is a trackable candidate and will be auto-tracked.
+
+#### 4.2.1 Working-area access layer (`scan::fs`)
+
+Every operation that reads or writes the working area by `RepoPath` goes through this layer (`ops` has it resolve a `RepoPath` into an on-disk path before calling `object::restore_to` and the like).
+
+- **Normal form**: a `RepoPath` is always NFC (`unicode-normalization` crate). The scan converts on-disk file names to NFC; paths, branch names and tag names typed on the CLI are converted to NFC while parsing.
+- **Locating** (`RepoPath` → on-disk path): resolve one path component at a time, trying the NFC form, then the NFD form, and when neither exists, list the parent directory and compare entries by their NFC form. Results are cached for the current process only and never written into `.lfv`: `.lfv` is copied across devices, and a map of on-disk names means nothing on another machine.
+- **Writing**: when an existing entry is located, write to that entry; otherwise create it under the NFC name (missing parent directories are also created under NFC names).
+- **Normalization collisions**: two on-disk names in one directory that are identical in NFC → error (spec §4.2). The scan finds them while walking a directory; the entry-by-entry comparison during locating finds them too.
+- **Case collisions**: when writing path P, if the same directory already holds an entry differing from P only in case and a `stat` of P hits exactly that entry (so the directory is case-insensitive), report an error suggesting that case sensitivity be enabled (spec §4.2). Two active paths that are equal after case folding, found during a scan, are checked the same way. Detection is per directory by probing rather than inferred from the platform, since Windows can enable case sensitivity per directory.
+- **Path too long**: when the underlying I/O fails because a path is too long, turn it into an error that states the cause (spec §4.2).
 
 ### 4.3 Working-tree scan (lazy scan)
 
@@ -765,7 +801,7 @@ When a scan finds a path in the working tree that is **LFV-visible** and not yet
 
 - if it matches `.lfvignore` → **ignore** it (not registered, §4.2);
 - if it is in the dynamic untracked list of `config.yaml` → register it as `untracked` (§4.2);
-- if the path violates the spec §4.2 path rules → error out with a hint to add it to `.lfvignore`, and do not register it;
+- if the path violates the spec §4.2 path rules → do not register it; only issue a warning (the scan continues) with a hint to add it to `.lfvignore`;
 - otherwise → treat it as an "OS create" and `track` it automatically: `tracked::TrackedStore::create(path)` allocates a `file-id`, creates the directory, and writes `meta.initial_path`, while a row with `status = modified` and no `head_*` is inserted into the `tracked` table.
 
 **No Snapshot is appended immediately**; the first Snapshot is written by a later `lfv snap`.
@@ -779,10 +815,10 @@ While a path is in the config untracked list and exists on disk, a scan does not
 **A friendly hint for same-named files**: if a path once had a deleted `file-id` (i.e. the latest Snapshot for that path has `object = null`), then after auto-track has allocated a new `file-id` at the same path, `lfv status` appends a hint under that file's entry:
 
 ```
-  M   f_01HA7EEE...   docs/old-note.md  [newly tracked]
-                      note: this path previously existed as f_023BHCA1 (deleted)
+  A   file:01HA7EEE...   docs/old-note.md  [newly tracked]
+                      note: this path previously existed as file:023BHCA1 (deleted)
                       to continue its history instead, run:
-                        lfv relink f_01HA7EEE --onto f_023BHCA1
+                        lfv relink file:01HA7EEE --onto file:023BHCA1
 ```
 
 How the lookup works: `snap_locator` cannot be searched by path, so for a newly registered path LFV searches the file-id logs for "the last file-id that owned this path and whose HEAD object is null"; this happens only once, when level B discovers the new path. Whether to add a `tracked.prior_file_id` column as a cache or to re-query on every `status` is left to the second step, when this design is compared against the existing skeleton — both implementations satisfy the behavior in this section, are a purely internal optimization choice, and affect neither the spec nor any other part of this document.
@@ -797,11 +833,11 @@ When a scan finds that the path of a **tracked file** has disappeared from the w
 
 A subsequent `lfv snap` command lands that state update (§4.9).
 
-The benefit of this design: before `lfv snap`, a `D` file is still in the tracking list, so the user still has the chance to reclassify it as a rename with `lfv mv f_old <new-path>` and avoid an accidental deletion.
+The benefit of this design: before `lfv snap`, a `D` file is still in the tracking list, so the user still has the chance to reclassify it as a rename with `lfv mv file:<old> <new-path>` and avoid an accidental deletion.
 
 ### 4.6 rename / move (lfv mv)
 
-**`lfv mv` performs path operations only**: `<src>` and `<dst>` both accept paths only, not file-ids. It is for renaming/moving a file that still exists on disk (or that the OS has just moved). The main reason `<dst>` may not be a file-id is the mental confusion it would cause — the user might mistakenly believe the surviving file-id is the `<dst>` side. To splice history onto another file-id, use `lfv relink` (see §4.7).
+**`lfv mv` performs path operations only**: `<src>` accepts a path or a file-id (a file-id is located by its current path, which suits files already gone from disk such as `D` rows); `<dst>` accepts a path only, not a file-id. It is for renaming/moving a file that still exists on disk (or that the OS has just moved). The main reason `<dst>` may not be a file-id is the mental confusion it would cause — the user might mistakenly believe the surviving file-id is the `<dst>` side. To splice history onto another file-id, use `lfv relink` (see §4.7).
 
 - `lfv mv <src> <dst>` (`ops::mv`): migrates the tracked file corresponding to src to the dst path.
   - If the src path still exists in the working tree and dst does not, the CLI moves the file to dst first and then appends the snapshot (atomic semantics).
@@ -910,7 +946,7 @@ Normal mode and loop mode share the step "preserve the old HEAD on a new branch"
 
 Once `lfv rewind <TS-ish>` (`ops::tree_rewind`) has passed the pre-check of spec §4.5.1:
 
-1. If the current tree HEAD has no tag and is not an ancestor of the target, write a `t:detour/<head-short>` tag.
+1. If the current tree HEAD has no tag and is not an ancestor of the target, write a `tree:detour/<head-short>` tag.
 2. Update `.lfv/trees/HEAD` to the snap id of the target Tree Snapshot.
 3. Read the target tree-snapshot's Tree Object to obtain the `{path, file-object-hash}` manifest, and map each entry to a file-id through `tree_file_refs(tree_snap_id = target)`.
 4. Handle all files in the following three categories:
@@ -952,14 +988,14 @@ To guarantee that each file's history presents an **acyclic content-evolution DA
 LFV does not rewrite history automatically; it prompts the user to complete the rewind with `lfv rewind`, preserving all intermediate history:
 
 ```
-warning: content of docs/note.md matches ancestor snap_01HXYZ on branch main
+warning: content of docs/note.md matches ancestor snap:01HXYZ on branch main
          (object hash blake3:abc123...)
-suggestion: run `lfv rewind docs/note.md snap_01HXYZ`
+suggestion: run `lfv rewind docs/note.md snap:01HXYZ`
             this will create a new branch anchored before the duplicate,
             preserving all intermediate history as a detour branch.
 ```
 
-After the user runs `lfv rewind docs/note.md snap_01HXYZ`, `rewind_file` recognizes loop mode (the working-area content == the target object, the target is a strict ancestor of HEAD, and the HEAD object ≠ the target object), and therefore:
+After the user runs `lfv rewind docs/note.md snap:01HXYZ`, `rewind_file` recognizes loop mode (the working-area content == the target object, the target is a strict ancestor of HEAD, and the HEAD object ≠ the target object), and therefore:
 
 1. Creates a branch `detour/<anchor-short>/<n>` pointing at the current HEAD (`anchor-short` is the last 8 characters of the old HEAD's ULID, with `n` incrementing on a name collision); the branch name `main` itself is untouched;
 2. Creates a **new snapshot** on the `main` branch whose:
@@ -976,8 +1012,8 @@ The `lfv verify` command must walk all branches of every file and check whether 
 
 ```bash
 error: branch 'main' of file 'docs/note.md' contains duplicate object hash:
-       snap_01HXYZ (object blake3:abc123...)
-       snap_02HABC (object blake3:abc123...)
+       snap:01HXYZ (object blake3:abc123...)
+       snap:02HABC (object blake3:abc123...)
        This violates the single-branch object uniqueness invariant.
 ```
 
@@ -997,7 +1033,8 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 - Each step: `merge::three_way(base, ours, theirs)` (`diffy::merge`, with the conflict-marker line prefixes substituted for the labels of spec §4.7.3); the content layer performs a three-way merge, and "4-way" refers to the two base snapshots being allowed to differ. The text/binary determination is shared with diff: no NUL byte and decodable as UTF-8.
 - No conflict → `put_bytes` → `loop_check` → pause on a loopback (spec §4.7.4) → append → advance the branch → `next += 1`.
 - Conflict → text: write conflict markers into the working area; binary: leave the working area alone and prompt for `--continue --ours|--theirs` → save `REPLAY.yaml` → exit with a non-zero code. `--continue`: read the working area (or the chosen side) as the new object and continue; `--abort`: point the branch back at `original_head`, `restore_to`, and delete `REPLAY.yaml` (the intermediate snapshots are left dangling for gc to reclaim; `preserved_branch` is kept).
-- rebase = `rewind_file(base-snap-ours, kind = rebase)` first, then enqueue the theirs steps followed by ours' original steps; merge = enqueue the theirs steps only; `--pick` = enqueue a single step with `base = pick.parent.object` (empty content when the parent is null or the parent's object is null).
+- rebase = `rewind_file(base-snap-ours, kind = rebase)` first, then enqueue the theirs steps followed by ours' original steps; merge = enqueue the theirs steps only; `--pick` = enqueue a single step with `base = pick.parent.object` (empty content when the parent is null or the parent's object is null), skipping the co-referent-ancestor lookup entirely (§3.3's ancestor search is needed only by merge/rebase). Aside from how base is computed and the step count, all three share one replay: conflict markers, `REPLAY.yaml` persistence, loopback detection, and `--continue`/`--abort` are identical; a paused `--pick` is likewise continued or rolled back with `lfv merge --continue` / `lfv merge --abort` — `kind = Pick` is for status display only and introduces no new command.
+- `--continue` / `--abort` without `<file>` (spec §4.7.3): scan `files/*/REPLAY.yaml`; exactly one → act on that file; several → error asking for `<file>`; none → error.
 
 ### 4.15 `lfv verify`
 
@@ -1014,10 +1051,10 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 
 `lfv import <archive>` (`ops::import`) and `lfv export` (`ops::export`, spec §4.8) are inverse operations, and neither touches the working tree or the status table:
 
-1. Unpack/open the archive and locate its `<file-id>/` directory; if `files/<file-id>/` already exists in the current repository, error out and refuse (which should not happen normally, as ULIDs are globally unique), performing no partial import and no merge of two histories.
+1. Unpack/open the archive and locate its `<ULID>/` directory; if `files/<ULID>/` already exists in the current repository, error out and refuse (which should not happen normally, as ULIDs are globally unique), performing no partial import and no merge of two histories.
 2. Parse the `snapshots.log` inside the archive, recomputing the `digest` (§3.3.2) of each line and comparing it with the record; a single mismatch rejects the whole import.
 3. Walk every `object` hash the log references: the archive carries those File Objects with it (in the same structure as `.lfv/objects/`), and for each hash, skip it if the local `objects/` already has it (deduplicating by content, consistent with the write policy of §3.2), otherwise write it as-is (with no fresh compression decision, trusting the encoding in the archive; `verify` will check the hash afterwards).
-4. Copy the archive's `meta.yaml`, `HEAD`, `branches.yaml`, `tags.yaml`, and `snapshots.log` wholesale into `.lfv/files/<file-id>/`.
+4. Copy the archive's `meta.yaml`, `HEAD`, `branches.yaml`, `tags.yaml`, and `snapshots.log` wholesale into `.lfv/files/<ULID>/`.
 5. Write `snap_locator(snap_id, file_id)` for every snapshot in that log, so `lfv log <snap-id>` works immediately; **do not** create a `tracked` row and do not modify `config.yaml` — that file-id is in a "has history, not activated" state, equivalent to a "retired" file-id in the relink of §4.7 but without `meta.retired` (it was not absorbed by some dst, it simply has not been materialized yet).
 6. Print a summary: file-id, number of branches, number of snapshots, number of objects imported. Mention that `lfv revive <file-id>` can restore it to the working tree.
 
@@ -1038,7 +1075,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | snap §4.9 | snap | `ops::snap_file` / `ops::snap_all` | `object`, `snapshot::loop_check`, `tracked`, `index` |
 | rewind / switch / revive §4.10 | rewind, switch, revive | `ops::rewind_file` / `ops::switch` / `ops::revive` | `snapshot`, `object::restore_to`, `tracked`, `index` |
 | snap --tree §4.11 | snap --tree | `ops::tree_snap` | `object::TreeManifest`, `tree`, `index` |
-| rewind <TS-ish> §4.12 | rewind t: | `ops::tree_rewind` | `tree`, `index.tree_file_refs`, `ops::rewind_file` |
+| rewind <TS-ish> §4.12 | rewind tree: | `ops::tree_rewind` | `tree`, `index.tree_file_refs`, `ops::rewind_file` |
 | Loopback §4.13 | snap / verify / merge / rebase / relink | `snapshot::loop_check` | — |
 | merge / rebase / --pick §4.14 | merge, rebase, --continue, --abort | `merge::replay` | `diffy`, `ops::rewind_file`, `snapshot`, `object` |
 | verify §4.15 | verify | `ops::verify` | the whole storage layer |
@@ -1056,9 +1093,3 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | v0.3 | tag / export / import / gc / verify | `ops(gc, verify, export, import)` |
 | v0.4 | merge / rebase / --pick | `merge` |
 | v0.5 | tree plane | `tree`, `ops(tree_snap, tree_rewind)`, `tree_file_refs` |
-
----
-
-## Appendix A. Unconfirmed Items
-
-2026-09-19 §4.4 how to cache the same-path old file-id hint (left until this design is compared against the skeleton, to choose between the two equivalent implementations)

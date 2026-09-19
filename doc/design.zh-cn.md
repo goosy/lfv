@@ -36,17 +36,17 @@ src/
 ├── object/        ObjectStore：hash、压缩策略、分桶写读、枚举/删除（gc）；TreeManifest（Tree Object 编解码）
 ├── snapshot/      Snapshot 记录、digest 规范形、SnapshotLog（append / 全量读 / 尾部截断）、事件类型推导、祖先遍历
 ├── reftable/      name → snap_id 的 YAML 表（branches.yaml / tags.yaml / trees/tags.yaml 同一格式）
-├── tracked/       files/<file-id>/ 目录的句柄：meta.yaml、HEAD、分支表、标签表、日志；file-id 分配与退役
-├── tree/          trees/ 目录的句柄：日志、HEAD、t: 标签；Tree Object 的构建
+├── tracked/       files/<ULID>/ 目录的句柄：meta.yaml、HEAD、分支表、标签表、日志；file-id 分配与退役
+├── tree/          trees/ 目录的句柄：日志、HEAD、tree: 标签；Tree Object 的构建
 ├── index/         SQLite：schema、迁移、查询、rebuild
-├── scan/          工作树扫描：.lfvignore、增量失效、auto-track / auto-delete、改名自动识别、状态字母推导
+├── scan/          工作树扫描：.lfvignore、增量失效、auto-track / auto-delete、改名自动识别、状态字母推导；工作区访问层（Unicode 规范化、定位、大小写冲突检测）
 ├── resolve/       CLI 参数解析：<file> <FO-ish> <FS-ish> <TO-ish> <TS-ish> → 强类型目标
 ├── diff/          两个字节串的 unified diff（文本）/ 元数据 diff（二进制）
 ├── merge/         三路文本合并、冲突标记、重放引擎、进行中状态（merge/rebase --continue/--abort）
 └── util/          路径规范化、时间、ULID、原子写（tmp + rename）、文件系统小工具
 ```
 
-分支与标签没有独立模块：两者格式同为 `name: snap_<ULID>` YAML，行为只差"标签只增不改"，由 `reftable` 一个泛型表加各 plane 句柄承担。
+分支与标签没有独立模块：两者格式同为 `name: snap:<ULID>` YAML，行为只差"标签只增不改"，由 `reftable` 一个泛型表加各 plane 句柄承担。
 
 ### 1.3 依赖方向（只允许向下）
 
@@ -74,6 +74,7 @@ cli → ops → { scan, resolve, merge, diff }
 | 时间 | `jiff` | — |
 | ID | `ulid` | — |
 | ignore 规则 | `ignore`（ripgrep 的 gitignore 实现） | 见 §4.2 |
+| Unicode 规范化 | `unicode-normalization` | 仅用于工作区访问层，见 §4.2.1 |
 | 日志 | `tracing` + `tracing-subscriber` | — |
 | 测试 | `assert_cmd` + `predicates` + `tempfile` | — |
 
@@ -110,13 +111,33 @@ tests/
 
 | 类型 | 文本形式 | 说明 |
 | --- | --- | --- |
-| `FileId` | `f_<ULID 26>` | 前缀是 id 的一部分：目录名、DB、CLI 均带 |
-| `SnapId` | `snap_<ULID 26>` | file / tree 两个 plane 共用格式，全局唯一 |
+| `FileId` | `file:<ULID 26>` | 文本形式（DB、YAML、日志、CLI）带 `file:` 前缀；`files/` 下的目录名只用 `<ULID>`（Windows 文件名不允许 `:`） |
+| `SnapId` | `snap:<ULID 26>` | file / tree 两个 plane 共用格式，全局唯一 |
 | `ObjectHash` | `blake3:<64 hex>` | 内部 `[u8; 32]`；File Object 与 Tree Object 同类型，**存储层不区分类型** |
 | `TreeId` | = `ObjectHash` | 内容 hash，无独立身份 |
-| `BranchName` / `TagName` | 不含 `:`；非空；不以 `/` 开头或结尾 | tree 标签内部存 `t:<name>`，`TreeTag` 单独类型 |
-| `RepoPath` | 相对仓库根、`/` 分隔、UTF-8，不含 `"` `\` 与控制字符 | spec §4.2 路径规则 |
-| `WorktreeRef` | `f_/<path>` | 工作区特殊 File Object 的字面量 |
+| `BranchName` / `TagName` | 不含 `:` 与控制字符；不含 YAML 指示符字符与首尾空白（完整规则见 §2.1.1）；非空；不以 `/` 开头或结尾；不是命名空间保留字 `file` / `snap` / `tree` / `work` / `blake3` | tree 标签内部存 `tree:<name>`，`TreeTag` 单独类型 |
+| `RepoPath` | 规范化后相对仓库根（CLI 输入可相对 cwd，或以 `/` 开头表示仓库内绝对路径）、`/` 分隔、UTF-8，满足 Windows 文件名规则（不含 `<>:"\|?*` 与控制字符、分量不以 `.`/空格结尾、非保留名） | spec §4.2 路径规则 |
+| `WorktreeRef` | `work:<path>` | 工作区特殊 File Object 的字面量 |
+
+### 2.1.1 元数据字符串的序列化规则（对应 spec §3.5）
+
+写入这些 yaml 文件的字符串按可控程度分三类，处理方式不同：
+
+**用户可控**（`RepoPath`、`config.yaml` 的 `user.name`、snapshot 的 `author`）——序列化时强制双引号，引号内按标准 YAML 双引号转义规则书写，与 digest 规范化序列化（§3.3.2）复用同一套转义实现（只转义 `"`、`\`、控制字符，非 ASCII 原样 UTF-8）。`RepoPath` 已经禁止 `"`/`\`（spec §4.2），落到这条规则时天然不需要真正转义，直接"扫到下一个 `"`"即可；`user.name`/`author` 没有字符限制，需要按此规则完整转义。
+
+**用户部分可控、由 LFV 批准**（`BranchName`、`TagName`）——序列化时不加引号；换来这个权利的代价是创建时的字符集校验必须挡掉一切会引发 YAML 裸标量歧义的写法：
+
+| 禁止项 | 理由 |
+| --- | --- |
+| 控制字符、`:` | §2.1 `BranchName`/`TagName` 已有规则 |
+| `#?,[]{}&*!\|>'"%@` 及反引号本身 | YAML 指示符字符（c-indicator），在裸标量特定位置有特殊语法含义 |
+| `\` | 若该值将来出现在需要转义的上下文中，保证零转义 |
+| 开头或结尾的空白字符 | YAML 裸标量会裁剪首尾空白，否则写入值与读回值不一致（静默损坏，非解析错误） |
+| 整体等于 `-`，或匹配 `/^-\s/`（连字符后紧跟空白） | 裸标量开头 `-` 加空白是 YAML 块序列项标记；`-` 出现在其它位置（不接空格、结尾、中间）正常 |
+
+校验放在创建分支名/标签名的命令（`lfv branch-rename`、`lfv tag`，以及 rewind/detour/rebase/revive 隐式创建的保留分支名）里，与命名空间保留字检查同一层，不符合直接拒绝创建。
+
+**LFV 自己控制**（`snap:<ULID>`、`file:<ULID>`、`blake3:<hex>`、RFC 3339 时间戳、`true`/`false`、整数版本号等）——字符集由 LFV 自身定义且已知安全，裸写，不加引号、不转义。
 
 ### 2.2 Object 面
 
@@ -222,7 +243,7 @@ pub struct Retired { pub at: Timestamp, pub onto: FileId }
 pub struct TreePlane { log: SnapshotLog /* plane = Tree */, head: Option<SnapId>, tags: RefTable<TreeTag> }
 ```
 
-`trees/HEAD` 为空文件 ↔ `head = None`（§3.7）。无分支。可达性：`trees/HEAD` 与全部 `t:` 标签是根；`rewind <TS-ish>` 离开无标签且非目标祖先的 HEAD 时自动打 `t:detour/<head-short>` 标签（spec §4.5.1）。
+`trees/HEAD` 为空文件 ↔ `head = None`（§3.7）。无分支。可达性：`trees/HEAD` 与全部 `tree:` 标签是根；`rewind <TS-ish>` 离开无标签且非目标祖先的 HEAD 时自动打 `tree:detour/<head-short>` 标签（spec §4.5.1）。
 
 ### 2.7 工作区状态模型（`scan` 与 `index` 共用）
 
@@ -237,6 +258,8 @@ fn flag(row, head: Option<&Snapshot>) -> Flag
   row.hash != head.object                          -> M
   else                                             -> unmodified
 ```
+
+`head == None` 时统一渲染为 `A`，不区分"全新文件"与"该路径此前存在过一个已删除 file-id"两种情况——后者只是在 `A` 行下追加一条提示（§4.4），不改变标志位本身。
 
 `untracked` 行单独一张表（§3.6），只登记盘上存在的路径（§4.2）。
 
@@ -253,9 +276,11 @@ pub enum FileTarget  { Worktree(FileId, RepoPath), Object(FileId, ObjectHash) } 
 pub enum TreeTarget  { Object(ObjectHash), Snap(SnapId) }                            // <TO-ish> / <TS-ish>
 ```
 
-裸 token 的消歧顺序：`snap_` 前缀 → `f_/` 前缀（工作区字面量）→ `f_` 前缀且余下 26 字符是 ULID → `t:` 前缀（tree）→ `blake3:` 前缀（tree-id）→ 含 `@` 时先把整个 token 按路径解析（查找链同下），命中即为路径，未命中再在最后一个 `@` 处拆为 `<file>@<ref>` 解析，两种解释都成立时报歧义错误并提示改用 `f_<ULID>@<ref>` → 否则视为路径（相对 cwd 或绝对，规范化为 `RepoPath`，查 `tracked.path`，再查 `tracked.head_path`（待落盘的改名），再查历史中最后拥有该路径的 file-id）。分支名与标签名不能作为裸 token 出现；在已带 `<file>` 参数的命令中，`<FS-ish>` 位置的裸 token 先按 snap-id，再按该文件的分支名，再按标签名解析。
+裸 token 的消歧顺序（纯语法判定，不查索引）：`snap:` 前缀（snap-id；归属 file / tree plane 由 `snap_locator` 给出）→ `file:` 前缀（file-id）→ `work:` 前缀（工作区字面量）→ `tree:` 前缀（树标签）→ `blake3:` 前缀（tree-id）→ 含 `:` 时在第一个 `:` 处拆为 `<ref>:<file>`，`<file>` 部分再按本规则解析为 file-id 或路径 → 否则视为路径（`a`、`./a`、`../a` 相对 cwd，`/a/b` 为仓库内绝对路径；拒绝操作系统绝对路径与盘符；输入中 `\` 视同 `/`，开头连续多个 `/` 视同一个；规范化为 `RepoPath`，越出仓库报错；查 `tracked.path`，再查 `tracked.head_path`（待落盘的改名），再查历史中最后拥有该路径的 file-id）。分支名与标签名不能作为裸 token 出现；在已带 `<file>` 参数的命令中，`<FS-ish>` 位置的裸 token 先按 snap-id，再按该文件的分支名，再按标签名解析。
 
-裸 `snap_*` 的所属 file-id / plane 由 `index.snap_locator` 给出（§3.6）。
+裸 `snap:*` 的所属 file-id / plane 由 `index.snap_locator` 给出（§3.6）。
+
+`FileTarget::Object` 携带的 `FileId` 只是解析路径上经过的文件上下文（例如供 `lfv diff <FO-ish>` 推断隐式第二参数 `work:<path>` 的路径），不代表该 File Object 归属于这个文件——File Object 是内容寻址的存储单元，不同 file-id、不同分支都可能引用同一个 hash（spec §3.2.1）。`lfv show <FO-ish>`（无 `--content`/`--out`）要列出"引用该 hash 的所有快照"，因此需要遍历全部 `files/*/snapshots.log` 按 `object == 目标 hash` 匹配，而不能只查解析路径上带出的那一个 file-id；这是一个跨全仓库的扫描，目前没有为此建索引，属于低频诊断命令，可接受全量扫描，若后续成为瓶颈再补 `object_hash → snap_id` 的反向索引。
 
 ## 3. 存储结构
 
@@ -278,7 +303,7 @@ A/                                   # 工作目录
     │   │   └── a3bc9d12...raw       # Tree Object（清单 YAML，通常较小 → .raw）
     │   └── ...
     ├── files/                       # 每个跟踪文件的元数据
-    │   ├── <file-id>/
+    │   ├── <ULID>/                  # 目录名为 file-id 去掉 `file:` 前缀后的 ULID
     │   │   ├── meta.yaml            # 文件级元数据（创建时间、初始路径、退役标记）
     │   │   ├── HEAD                 # 当前分支名
     │   │   ├── branches.yaml        # 该文件的分支表
@@ -289,7 +314,7 @@ A/                                   # 工作目录
     ├── trees/                       # 全局元数据
     │   ├── snapshots.log            # append-only 的全局快照记录（JSON Lines）
     │   ├── tags.yaml                # tree 标签表
-    │   └── HEAD                     # 当前 tree-head，存 snap_<ULID> 或为空
+    │   └── HEAD                     # 当前 tree-head，存 snap:<ULID> 或为空
     └── logs/                        # CLI 操作日志（可选，便于调试；v0.x 不实现）
 ```
 
@@ -329,8 +354,8 @@ compression:
 
 ```json
 {
-  "id": "snap_01HXYZ...",
-  "parent": "snap_01HXYY...",
+  "id": "snap:01HXYZ...",
+  "parent": "snap:01HXYY...",
   "path": "docs/note.md",
   "object": "blake3:abcdef0123...",
   "size": 12345,
@@ -343,7 +368,7 @@ compression:
 
 字段说明：
 
-- `id`：单调可读的快照标识符，采用 [ULID](https://github.com/ulid/spec) 加 `snap_` 前缀。ULID 自带时间戳前缀 + 随机后缀，便于在 `log` 中按时间排序，也便于人在终端粘贴。
+- `id`：单调可读的快照标识符，采用 [ULID](https://github.com/ulid/spec) 加 `snap:` 前缀。ULID 自带时间戳前缀 + 随机后缀，便于在 `log` 中按时间排序，也便于人在终端粘贴。
 - `parent`：父快照 id；分支首个快照为 `null`。
 - `path`：**此次快照发生时该文件在工作树上的相对路径**。改名/移动事件就体现为本字段与 `parent.path` 不同；若文件当前不存在，则保留此前盘上最后已知的路径（便于 `log` 阅读）。
 - `object`：所引用 Object 的 blake3 hash（带 `blake3:` 前缀以便日后切换算法）；**当文件当前不存在时，此字段为 `null`**。
@@ -404,8 +429,8 @@ LFV 不在 Snapshot 中显式存"事件类型"字段，而是根据 `(parent, pa
 
 ```json
 {
-  "id": "snap_01HABC...",
-  "parent": "snap_01HABZ...",
+  "id": "snap:01HABC...",
+  "parent": "snap:01HABZ...",
   "path": null,
   "object": "blake3:7fa3bc9d...",
   "created_at": "2026-05-17T10:00:00Z",
@@ -464,9 +489,9 @@ Tree Object 通常很小（每个跟踪文件一行），低于 `min_bytes` 压�
 | `tracked` | 当前拥有路径的跟踪文件（含盘上消失、待 `lfv snap` 记录删除的 `D` 行）。主键 file-id；缓存 HEAD 快照的 path/object/size 与上次扫描的盘上 mtime/size/hash，供增量扫描短路。 | ✓ |
 | `untracked` | `config.yaml` 动态 untracked 列表 ∩ LFV 可见 ∩ 盘上存在的路径；保留已知的前 file-id 供 `lfv track` 复用。 | ✓ |
 | `scan_meta` | 扫描元数据：`last_completed_at`、`.lfvignore` 与 `config.yaml` 的 mtime，供增量扫描失效判定。 | ✓ |
-| `branches` | 每个文件的分支指针缓存。真理源为 `.lfv/files/<file-id>/branches.yaml`。 | ✓ |
-| `tags` | 每个文件的标签缓存。真理源为 `.lfv/files/<file-id>/tags.yaml` 及 `.lfv/trees/tags.yaml`。 | ✓ |
-| `snap_locator` | 裸 `snap_<ULID>` → 所属 file-id（tree plane 为 NULL）。真理源为各 `snapshots.log`。 | ✓ |
+| `branches` | 每个文件的分支指针缓存。真理源为 `.lfv/files/<ULID>/branches.yaml`。 | ✓ |
+| `tags` | 每个文件的标签缓存。真理源为 `.lfv/files/<ULID>/tags.yaml` 及 `.lfv/trees/tags.yaml`。 | ✓ |
+| `snap_locator` | 裸 `snap:<ULID>` → 所属 file-id（tree plane 为 NULL）。真理源为各 `snapshots.log`。 | ✓ |
 | `tree_file_refs` | tree 维度的反向引用缓存。真理源为 `.lfv/trees/snapshots.log` + `objects/`，`rebuild-index` 时重建；`lfv snap --tree` 时写入。供 `lfv log <FS-ish>` 渲染时附加 tree 关联信息，以及 `lfv rewind <TS-ish>` 把清单条目映射到 file-id。 | ✓ |
 
 > [!note] tracked / untracked 说明
@@ -481,7 +506,7 @@ Tree Object 通常很小（每个跟踪文件一行），低于 `min_bytes` 压�
 ```sql
 -- tracked files that currently own a path (or are pending deletion, present = 0)
 CREATE TABLE tracked (
-    file_id       TEXT PRIMARY KEY,  -- f_<ULID>
+    file_id       TEXT PRIMARY KEY,  -- file:<ULID>
     path          TEXT NOT NULL,     -- current worktree path (= head_path unless a rename is pending)
     present       INTEGER NOT NULL,  -- 1 = exists on disk; 0 = missing (rendered as D)
     status        TEXT NOT NULL,     -- 'modified' | 'unmodified'
@@ -508,23 +533,23 @@ CREATE TABLE scan_meta (
     value      TEXT NOT NULL
 );
 
--- branch pointer cache (truth: .lfv/files/<file-id>/branches.yaml)
+-- branch pointer cache (truth: .lfv/files/<ULID>/branches.yaml)
 CREATE TABLE branches (
-    file_id    TEXT NOT NULL,        -- f_<ULID>
+    file_id    TEXT NOT NULL,        -- file:<ULID>
     name       TEXT NOT NULL,
-    snap_id    TEXT NOT NULL,        -- snap_<ULID> at the branch HEAD
+    snap_id    TEXT NOT NULL,        -- snap:<ULID> at the branch HEAD
     PRIMARY KEY (file_id, name)
 );
 
--- tag cache (truth: .lfv/files/<file-id>/tags.yaml and .lfv/trees/tags.yaml; tree tags use file_id = '')
+-- tag cache (truth: .lfv/files/<ULID>/tags.yaml and .lfv/trees/tags.yaml; tree tags use file_id = '')
 CREATE TABLE tags (
     file_id    TEXT NOT NULL,
-    name       TEXT NOT NULL,        -- tree tags keep their 't:' prefix
+    name       TEXT NOT NULL,        -- tree tags keep their 'tree:' prefix
     snap_id    TEXT NOT NULL,
     PRIMARY KEY (file_id, name)
 );
 
--- where does a bare snap_<ULID> live?  NULL file_id = tree plane
+-- where does a bare snap:<ULID> live?  NULL file_id = tree plane
 CREATE TABLE snap_locator (
     snap_id    TEXT PRIMARY KEY,
     file_id    TEXT
@@ -532,8 +557,8 @@ CREATE TABLE snap_locator (
 
 -- tree-side reverse references (truth: trees/snapshots.log + objects/)
 CREATE TABLE tree_file_refs (
-    tree_snap_id  TEXT NOT NULL,     -- snap_<ULID>
-    file_id       TEXT NOT NULL,     -- f_<ULID>
+    tree_snap_id  TEXT NOT NULL,     -- snap:<ULID>
+    file_id       TEXT NOT NULL,     -- file:<ULID>
     file_object   TEXT NOT NULL,     -- blake3:...
     PRIMARY KEY (tree_snap_id, file_id)
 );
@@ -542,9 +567,9 @@ CREATE TABLE tree_file_refs (
 **`tree_file_refs` 的写入与重建**：`lfv snap --tree` 创建 Tree Snapshot 时展开 Tree Object 清单，逐 file 插入一行（此时每个条目的 file-id 直接来自 `tracked` 行）；`rebuild-index` 时按 §3.10 的归属规则重建。供 `lfv log <FS-ish>` 渲染时附加 tree 关联信息：
 
 ```
-snap_01HXYZ  M  docs/note.md   "add chapter 2"
-             └─ tree: "第三章完成" [t:v1.0]
-snap_01HWWW  M  docs/note.md   "fix typo"
+snap:01HXYZ  M  docs/note.md   "add chapter 2"
+             └─ tree: "第三章完成" [tree:v1.0]
+snap:01HWWW  M  docs/note.md   "fix typo"
              └─ tree: "日常归档 2026-05-30"
 ```
 
@@ -552,7 +577,7 @@ snap_01HWWW  M  docs/note.md   "fix typo"
 
 以下文件记录**用户意志**或操作进行中的状态，无法从 Snapshot 链机械推导，`rebuild-index` 时不覆盖：
 
-**`.lfv/files/<file-id>/HEAD`**
+**`.lfv/files/<ULID>/HEAD`**
 
 每个跟踪文件一个，内容为当前所在分支名（纯文本，一行）：
 
@@ -562,28 +587,28 @@ main
 
 LFV 不支持 detached HEAD——`rewind` 强制新建分支保留旧 HEAD，所以 HEAD 始终指向一个具名分支，不会是裸 snap\_id。
 
-**`.lfv/files/<file-id>/meta.yaml`**
+**`.lfv/files/<ULID>/meta.yaml`**
 
 ```yaml
 created_at: 2026-05-17T09:21:33Z
-initial_path: docs/note.md        # path at track time; the only record of it before the first snapshot
-retired:                          # present only after `lfv relink <this> --onto <onto>`
-  at: 2026-06-01T08:00:00Z
-  onto: f_01HA7BCD...
+initial_path: "docs/note.md"      # path at track time; the only record of it before the first snapshot
+retired: ~                        # ~ until `lfv relink <this> --onto <onto>`, then a nested block:
+                                   #   at: 2026-06-01T08:00:00Z
+                                   #   onto: file:01HA7BCD...
 ```
 
 `initial_path` 让尚无快照的文件在 `rebuild-index` 后仍能回到 `tracked` 表而不被再次分配 file-id；`retired` 让退役 file-id 在重建时不与 `onto` 一侧争抢路径。
 
-**`.lfv/files/<file-id>/REPLAY.yaml`**
+**`.lfv/files/<ULID>/REPLAY.yaml`**
 
-merge / rebase 进行中的状态（结构见 §4.14），仅在 `--continue` / `--abort` 之间存在。存在该文件时，其它会修改该文件历史的命令拒绝执行。
+merge / rebase 进行中的状态（结构见 §4.14），仅在 `--continue` / `--abort` 之间存在。存在该文件时，其它会修改该文件历史的命令拒绝执行，**包括对同一 file-id 重新发起 `lfv merge`/`lfv rebase`/`lfv merge --pick`**：一个 file-id 同时只能有一个进行中的 merge/rebase/pick，必须先 `--continue` 完成或 `--abort` 放弃，才能开始新的一个。
 
 **`.lfv/trees/HEAD`**
 
-tree 层当前头部，内容为 `snap_<ULID>` 或空（仓库尚无 Tree Snapshot 时）：
+tree 层当前头部，内容为 `snap:<ULID>` 或空（仓库尚无 Tree Snapshot 时）：
 
 ```
-snap_01HABC...
+snap:01HABC...
 ```
 
 **`.lfv/lock`**
@@ -595,12 +620,12 @@ snap_01HABC...
 ```yaml
 format: 1                 # repository format version; bump on incompatible layout changes
 user:
-  name: goosy
-compression: { ... }      # §3.2.1
+  name: "goosy"
+compression: ...          # see §3.2.1 for the full block-style mapping
 rename:
   autodetect: true
 untracked:                # dynamic untracked list, RepoPath strings
-  - drafts/local.md
+  - "drafts/local.md"
 ```
 
 `lfv config <key> [value]` 以点分键读写（`user.name`、`rename.autodetect`）。
@@ -609,37 +634,37 @@ untracked:                # dynamic untracked list, RepoPath strings
 
 以下 yaml 文件是分支/标签的真理源，`index.db` 中的 `branches`、`tags` 表是其可重建缓存。
 
-**`.lfv/files/<file-id>/branches.yaml`**
+**`.lfv/files/<ULID>/branches.yaml`**
 
-key = 分支名，value = 该分支当前 HEAD 的 `snap_<ULID>`：
+key = 分支名，value = 该分支当前 HEAD 的 `snap:<ULID>`：
 
 ```yaml
-main: snap_01HXYZ...
-rewind/7RQ2M9KA/1: snap_01HABC...
+main: snap:01HXYZ...
+rewind/7RQ2M9KA/1: snap:01HABC...
 ```
 
 - 分支首次创建时写入；`lfv snap` 在当前分支上产生新快照后更新对应 value。
 - `lfv branch-delete` 删除对应 key；快照本身不受影响（append-only）。
 
-**`.lfv/files/<file-id>/tags.yaml`**
+**`.lfv/files/<ULID>/tags.yaml`**
 
-key = 标签名，value = `snap_<ULID>`。标签一旦创建不可改指向；删除后同名可重建：
+key = 标签名，value = `snap:<ULID>`。标签一旦创建不可改指向；删除后同名可重建：
 
 ```yaml
-v1.0: snap_01HXYZ...
-stable: snap_01HWWW...
+v1.0: snap:01HXYZ...
+stable: snap:01HWWW...
 ```
 
 **`.lfv/trees/tags.yaml`**
 
-tree 层标签表，key = `"t:<name>"`，value = `snap_<ULID>`，标签全局唯一，同样不可改指向、删后可重建：
+tree 层标签表，key = `"tree:<name>"`，value = `snap:<ULID>`，标签全局唯一，同样不可改指向、删后可重建：
 
 ```yaml
-t:v1.0: snap_01HABC...
-t:release: snap_01HZZZ...
+tree:v1.0: snap:01HABC...
+tree:release: snap:01HZZZ...
 ```
 
-用户输入的标签名不允许包含 `:`（用于命名空间隔离）；`t:` 前缀由 LFV 自动添加。`rewind <TS-ish>` 自动打的 `t:detour/<head-short>` 也在此表。
+用户输入的标签名不允许包含 `:`（用于命名空间隔离）；`tree:` 前缀由 LFV 自动添加。`rewind <TS-ish>` 自动打的 `tree:detour/<head-short>` 也在此表。
 
 所有 yaml / HEAD 写入统一走 `util::atomic_write`（同目录 tmp + rename；Windows 上 `rename` 可覆盖）。
 
@@ -657,7 +682,7 @@ t:release: snap_01HZZZ...
 ### 3.10 `rebuild-index` 算法
 
 1. 重建 schema。
-2. 遍历 `files/*/`：读 meta、HEAD、branches、tags、日志。写 `branches`、`tags`、`snap_locator`。`retired` 的 file-id 不写 `tracked`（但仍写 `snap_locator`，`lfv log f_src` 要能用）。按当前分支 HEAD 快照：
+2. 遍历 `files/*/`：读 meta、HEAD、branches、tags、日志。写 `branches`、`tags`、`snap_locator`。`retired` 的 file-id 不写 `tracked`（但仍写 `snap_locator`，`lfv log file:<src>` 要能用）。按当前分支 HEAD 快照：
    - 有且 `object != null` → `tracked` 行：`path = head.path`，`present = stat 成功`，`head_*` 填充，`disk_*` 置空（迫使下次扫描重新 hash）；
    - 有且 `object == null` → 已删除，无行；
    - 无快照 → `path = meta.initial_path`，`present = stat`，`head_* = NULL`。
@@ -669,7 +694,7 @@ t:release: snap_01HZZZ...
 
 ### 3.11 可达性与 gc
 
-- 根：file plane = 所有 file-id（含退役）的所有分支头 + 所有标签 + 存在的 `REPLAY.yaml` 里引用的快照；tree plane = `trees/HEAD` + 所有 `t:` 标签。
+- 根：file plane = 所有 file-id（含退役）的所有分支头 + 所有标签 + 存在的 `REPLAY.yaml` 里引用的快照；tree plane = `trees/HEAD` + 所有 `tree:` 标签。
 - 可达快照 = 从根沿 `parent` 闭包。可达对象 = 可达快照的 `object` ∪ 可达 Tree Snapshot 清单中的条目。
 - `lfv gc`：删除**任何快照（含悬空）都不引用**的对象；不动日志。
 - `lfv gc --purge`：先按可达性 `SnapshotLog::rewrite` 每个日志（唯一允许的日志重写），再按新的引用集删除对象。两步之间崩溃是安全的（只会多留对象）。
@@ -707,6 +732,17 @@ cli::<cmd>::run(args)
 - `rebuild-index` 时，`untracked` 行 = `config.yaml` 动态列表 ∩ LFV 可见路径 ∩ **盘上存在**的路径；
 - `.lfvignore` 语法为 gitignore 语法子集，只认仓库根目录的一个文件，用 `ignore` crate 的 gitignore 匹配器；目录模式参与遍历剪枝；
 - 动态 untracked 列表按路径记录；untracked 的文件在盘上改名后，新路径是可跟踪候选，会被 auto-track。
+
+#### 4.2.1 工作区访问层（`scan::fs`）
+
+所有按 `RepoPath` 读写工作区的操作都经过这一层（`ops` 在调用 `object::restore_to` 等之前，先由它把 `RepoPath` 解析为磁盘路径）。
+
+- **规范形**：`RepoPath` 一律为 NFC（`unicode-normalization` crate）。扫描时把磁盘文件名转成 NFC；CLI 输入的路径、分支名、标签名在解析时也转成 NFC。
+- **定位**（`RepoPath` → 磁盘路径）：逐个路径分量解析，每个分量依次尝试 NFC 形式、NFD 形式，都不存在时列出父目录、逐项比较 NFC 形式。只在本进程内缓存结果，不写入 `.lfv`：`.lfv` 需要跨设备复制，磁盘名映射换一台机器就没有意义了。
+- **写入**：定位到已有条目时写到该条目；否则以 NFC 名字创建（缺失的父目录同样以 NFC 名字创建）。
+- **规范化冲突**：同一目录下两个磁盘名转成 NFC 后相同 → 报错（spec §4.2）。扫描遍历目录时即可发现；定位时逐项比较也能发现。
+- **大小写冲突**：写入路径 P 时，若同一目录已有一个与 P 仅大小写不同的条目，且对 P 做 `stat` 命中的正是该条目（说明该目录大小写不敏感），则报错并提示开启大小写敏感（spec §4.2）。扫描时发现两个活跃路径大小写折叠后相同，用同样的方法检测。按目录实测，而不是按平台推断，因为 Windows 可以对单个目录开启大小写敏感。
+- **路径过长**：底层 I/O 因路径过长失败时，转换为说明原因的错误（spec §4.2）。
 
 ### 4.3 工作树扫描（惰性扫描）
 
@@ -765,7 +801,7 @@ cli::<cmd>::run(args)
 
 - 若匹配 `.lfvignore` → **忽略**（不登记，§4.2）；
 - 若在 `config.yaml` 动态 untracked 列表中 → 登记为 `untracked`（§4.2）；
-- 若路径违反 spec §4.2 路径规则 → 报错并提示加入 `.lfvignore`，不登记；
+- 若路径违反 spec §4.2 路径规则 → 不登记，只给出警告（扫描照常继续）并提示加入 `.lfvignore`；
 - 否则 → 视为「OS 新建」，自动 `track`：`tracked::TrackedStore::create(path)` 分配 `file-id`、建目录并写 `meta.initial_path`，`tracked` 表插入 `status = modified`、无 `head_*` 的行。
 
 **不会立即追加 Snapshot**，由后续 `lfv snap` 落盘首条 Snapshot。
@@ -779,10 +815,10 @@ cli::<cmd>::run(args)
 **同名文件的友好提示**：若某路径曾有一个已删除的 `file-id`（即该路径最新 Snapshot 的 `object = null`），自动 track 在同一路径上分配了新的 `file-id` 后，`lfv status` 会在该文件条目下附加提示：
 
 ```
-  M   f_01HA7EEE...   docs/old-note.md  [newly tracked]
-                      note: this path previously existed as f_023BHCA1 (deleted)
+  A   file:01HA7EEE...   docs/old-note.md  [newly tracked]
+                      note: this path previously existed as file:023BHCA1 (deleted)
                       to continue its history instead, run:
-                        lfv relink f_01HA7EEE --onto f_023BHCA1
+                        lfv relink file:01HA7EEE --onto file:023BHCA1
 ```
 
 查找方式：`snap_locator` 无法按路径反查，因此对新登记的路径在各 file-id 日志中查"最后拥有该路径且 HEAD object 为 null 的 file-id"；只在层级 B 发现新路径时做一次。结果是否加一列 `tracked.prior_file_id` 缓存、还是每次 `status` 重查，留到第二步对照现有骨架时再定——两种实现都满足本节行为，属于纯内部优化选择，不影响 spec 或本文其它部分。
@@ -797,11 +833,11 @@ cli::<cmd>::run(args)
 
 后继执行 `lfv snap` 命令时，会落地状态的更新（§4.9）。
 
-这样设计的好处：`lfv snap` 之前，`D` 文件仍在跟踪列表中，用户还有机会通过 `lfv mv f_old <new-path>` 将其识别为改名，避免误删。
+这样设计的好处：`lfv snap` 之前，`D` 文件仍在跟踪列表中，用户还有机会通过 `lfv mv file:<old> <new-path>` 将其识别为改名，避免误删。
 
 ### 4.6 rename / move（lfv mv）
 
-**`lfv mv` 只做路径操作**：`<src>` 和 `<dst>` 均只允许路径，不接受 file-id。用于文件在磁盘上仍存在（或刚被 OS 移动）时的改名/移动。不允许 `<dst>` 为 file-id 的主要原因是：它会造成心智混乱——用户可能误以为保留的 file-id 是 `<dst>` 那一侧。若需要把历史续接到另一个 file-id，请使用 `lfv relink`（见 §4.7）。
+**`lfv mv` 只做路径操作**：`<src>` 接受路径或 file-id（按 file-id 定位时取其当前路径，适用于 `D` 行这类盘上已消失的文件）；`<dst>` 只允许路径，不接受 file-id。用于文件在磁盘上仍存在（或刚被 OS 移动）时的改名/移动。不允许 `<dst>` 为 file-id 的主要原因是：它会造成心智混乱——用户可能误以为保留的 file-id 是 `<dst>` 那一侧。若需要把历史续接到另一个 file-id，请使用 `lfv relink`（见 §4.7）。
 
 - `lfv mv <src> <dst>`（`ops::mv`）：把 src 对应的跟踪文件迁移到 dst 路径。
   - 若工作树上 src 路径仍存在且 dst 不存在，CLI 会先把文件移到 dst，再追加快照（原子语义）。
@@ -910,7 +946,7 @@ index: tracked.head_* / disk_* refresh, status = unmodified
 
 `lfv rewind <TS-ish>`（`ops::tree_rewind`）通过 spec §4.5.1 的前置校验后：
 
-1. 若当前 tree HEAD 无标签且不是目标的祖先，写入 `t:detour/<head-short>` 标签。
+1. 若当前 tree HEAD 无标签且不是目标的祖先，写入 `tree:detour/<head-short>` 标签。
 2. 将 `.lfv/trees/HEAD` 更新为目标 Tree Snapshot 的 snap id。
 3. 读取目标 tree-snapshot 的 Tree Object，得到 `{path, file-object-hash}` 清单；经 `tree_file_refs(tree_snap_id = target)` 把每个条目映射到 file-id。
 4. 按以下三类分别处理所有 file：
@@ -952,14 +988,14 @@ index: tracked.head_* / disk_* refresh, status = unmodified
 LFV 不自动重写历史，而是提示用户使用 `lfv rewind` 来完成回溯，同时保留中间的所有历史：
 
 ```
-warning: content of docs/note.md matches ancestor snap_01HXYZ on branch main
+warning: content of docs/note.md matches ancestor snap:01HXYZ on branch main
          (object hash blake3:abc123...)
-suggestion: run `lfv rewind docs/note.md snap_01HXYZ`
+suggestion: run `lfv rewind docs/note.md snap:01HXYZ`
             this will create a new branch anchored before the duplicate,
             preserving all intermediate history as a detour branch.
 ```
 
-用户执行 `lfv rewind docs/note.md snap_01HXYZ` 后，`rewind_file` 识别出 loop 模式（工作区内容 == 目标 object、目标是 HEAD 的严格祖先、HEAD object ≠ 目标 object），于是：
+用户执行 `lfv rewind docs/note.md snap:01HXYZ` 后，`rewind_file` 识别出 loop 模式（工作区内容 == 目标 object、目标是 HEAD 的严格祖先、HEAD object ≠ 目标 object），于是：
 
 1. 新建分支 `detour/<anchor-short>/<n>` 指向当前 HEAD（`anchor-short` 取旧 HEAD 的 ULID 末 8 位，重名则 `n` 递增）；分支名 `main` 本身不动；
 2. 在 `main` 分支上创建一条**新快照**，其：
@@ -976,8 +1012,8 @@ suggestion: run `lfv rewind docs/note.md snap_01HXYZ`
 
 ```bash
 error: branch 'main' of file 'docs/note.md' contains duplicate object hash:
-       snap_01HXYZ (object blake3:abc123...)
-       snap_02HABC (object blake3:abc123...)
+       snap:01HXYZ (object blake3:abc123...)
+       snap:02HABC (object blake3:abc123...)
        This violates the single-branch object uniqueness invariant.
 ```
 
@@ -997,7 +1033,8 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 - 每步：`merge::three_way(base, ours, theirs)`（`diffy::merge`，冲突标记行首替换为 spec §4.7.3 的标签）；内容层是三路合并，"4-way"指两个 base 快照可以不同。文本判定与 diff 共用：无 NUL 字节且 UTF-8 可解码。
 - 无冲突 → `put_bytes` → `loop_check` → 环回则暂停（spec §4.7.4）→ append → 推进分支 → `next += 1`。
 - 冲突 → 文本：写冲突标记到工作区；二进制：不改工作区，提示 `--continue --ours|--theirs` → 保存 `REPLAY.yaml` → 退出码非 0。`--continue`：读工作区（或所选一侧）为新 object 继续；`--abort`：分支指回 `original_head`，`restore_to`，删 `REPLAY.yaml`（中间快照悬空，由 gc 回收；`preserved_branch` 保留）。
-- rebase = 先 `rewind_file(base-snap-ours, kind = rebase)` 再把 theirs 步骤 + ours 原步骤依次入队；merge = 只入队 theirs 步骤；`--pick` = 单步入队，`base = pick.parent.object`（父为 null 或父 object 为 null 时 base 为空内容）。
+- rebase = 先 `rewind_file(base-snap-ours, kind = rebase)` 再把 theirs 步骤 + ours 原步骤依次入队；merge = 只入队 theirs 步骤；`--pick` = 单步入队，`base = pick.parent.object`（父为 null 或父 object 为 null 时 base 为空内容），且完全跳过"定位同的祖先"这一步（§3.3 的祖先查找只有 merge/rebase 需要）。三者除 base 计算方式与步数不同外，复用同一套 replay：冲突标记、`REPLAY.yaml` 持久化、环回检测、`--continue`/`--abort` 完全一致；`--pick` 暂停后同样用 `lfv merge --continue` / `lfv merge --abort` 续接或回滚，`kind = Pick` 只用于状态展示，不引入新命令。
+- `--continue` / `--abort` 省略 `<file>` 时（spec §4.7.3）：遍历 `files/*/REPLAY.yaml`，恰好一个即作用于该文件；多个则报错要求指定 `<file>`；零个报错。
 
 ### 4.15 `lfv verify`
 
@@ -1014,10 +1051,10 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 
 `lfv import <archive>`（`ops::import`）与 `lfv export`（`ops::export`，spec §4.8）互为逆操作，且不触碰工作树、状态表：
 
-1. 解压/打开归档，定位其 `<file-id>/` 目录；若当前仓库 `files/<file-id>/` 已存在则报错拒绝（正常不会发生，ULID 全局唯一），不做部分导入或合并两条历史。
+1. 解压/打开归档，定位其 `<ULID>/` 目录；若当前仓库 `files/<ULID>/` 已存在则报错拒绝（正常不会发生，ULID 全局唯一），不做部分导入或合并两条历史。
 2. 解析归档内 `snapshots.log`，逐行重算 `digest`（§3.3.2）并与记录比对；任一行不符即整体拒绝导入。
 3. 遍历该日志引用到的每个 `object` hash：归档同时带着这些 File Object（结构与 `.lfv/objects/` 一致），对每个 hash 若本地 `objects/` 已存在则跳过（按内容去重，与 §3.2 的写入策略一致），否则原样写入（不重新压缩判定，信任归档里的编码；`verify` 会在之后校验 hash）。
-4. 把归档的 `meta.yaml`、`HEAD`、`branches.yaml`、`tags.yaml`、`snapshots.log` 整体拷贝到 `.lfv/files/<file-id>/`。
+4. 把归档的 `meta.yaml`、`HEAD`、`branches.yaml`、`tags.yaml`、`snapshots.log` 整体拷贝到 `.lfv/files/<ULID>/`。
 5. 为该日志的每条快照写入 `snap_locator(snap_id, file_id)`，使 `lfv log <snap-id>` 立即可用；**不**创建 `tracked` 行，也不修改 `config.yaml`——该 file-id 处于"有历史、未激活"状态，等同于 §4.7 relink 中"已退役"的 file-id，但没有 `meta.retired`（它不是被某个 dst 吸收，只是尚未 materialize）。
 6. 输出汇总：file-id、分支数、快照数、导入的对象数。提示可用 `lfv revive <file-id>` 恢复到工作树。
 
@@ -1038,7 +1075,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | snap §4.9 | snap | `ops::snap_file` / `ops::snap_all` | `object`、`snapshot::loop_check`、`tracked`、`index` |
 | rewind / switch / revive §4.10 | rewind, switch, revive | `ops::rewind_file` / `ops::switch` / `ops::revive` | `snapshot`、`object::restore_to`、`tracked`、`index` |
 | snap --tree §4.11 | snap --tree | `ops::tree_snap` | `object::TreeManifest`、`tree`、`index` |
-| rewind <TS-ish> §4.12 | rewind t: | `ops::tree_rewind` | `tree`、`index.tree_file_refs`、`ops::rewind_file` |
+| rewind <TS-ish> §4.12 | rewind tree: | `ops::tree_rewind` | `tree`、`index.tree_file_refs`、`ops::rewind_file` |
 | 环回 §4.13 | snap / verify / merge / rebase / relink | `snapshot::loop_check` | — |
 | merge / rebase / --pick §4.14 | merge, rebase, --continue, --abort | `merge::replay` | `diffy`、`ops::rewind_file`、`snapshot`、`object` |
 | verify §4.15 | verify | `ops::verify` | 全部存储层 |
@@ -1056,9 +1093,3 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | v0.3 | tag / export / import / gc / verify | `ops(gc, verify, export, import)` |
 | v0.4 | merge / rebase / --pick | `merge` |
 | v0.5 | tree plane | `tree`、`ops(tree_snap, tree_rewind)`、`tree_file_refs` |
-
----
-
-## 附录 A. 未确认事项
-
-2026-09-19 §4.4 同名旧 file-id 提示的缓存方式（留到对照骨架时在两种实现间选一种，两者行为等价）
