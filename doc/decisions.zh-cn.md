@@ -203,7 +203,7 @@ Tree Snapshot 链没有分支集合，只有：标签（`tree:` 前缀，全局�
 `lfv rewind <TS-ish>` 对每个需要还原的 file，不直接执行 rewind（会产生新分支），而是先检查是否存在 Fast-Forward 路径：
 
 - **FF 路径**：若某条分支的当前 HEAD 的 object hash 等于目标 hash，直接 `switch` 到该分支，不新建分支。优先选当前分支（无切换成本）；若当前分支不匹配，选最近创建的匹配分支。
-- **rewind 路径**：否则执行标准 rewind，自动新建分支（`rewind/<snap-short>/<n>`）。
+- **rewind 路径**：否则执行标准 rewind，自动新建分支（`rewind/<anchor-short>/<n>`）。
 
 tree rewind 是批量操作，可能同时影响数十个文件。若每个文件都无条件新建分支，产生的分支噪音会极大干扰用户对各文件历史的阅读。FF 路径在实践中覆盖大多数 tree rewind 场景（因为 tree-snapshot 通常紧随各文件 snap 之后创建，此时各文件 HEAD 的 object 就是 tree-object 里记录的 object），使零分支污染成为常态。只有真正需要回溯到非 HEAD 位置时才新建分支，与决策 2（回溯不破坏历史）保持一致。
 

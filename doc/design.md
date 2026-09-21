@@ -115,7 +115,7 @@ tests/
 | `SnapId` | `snap:<ULID 26>` | the same format on both the file and tree planes, globally unique |
 | `ObjectHash` | `blake3:<64 hex>` | `[u8; 32]` internally; File Object and Tree Object share one type, and **the storage layer does not distinguish them** |
 | `TreeId` | = `ObjectHash` | a content hash, with no identity of its own |
-| `BranchName` / `TagName` | contains no `:` or control characters; contains no YAML indicator characters or leading/trailing whitespace (full rules in §2.1.1); non-empty; does not start or end with `/`; is not a namespace keyword `file` / `snap` / `tree` / `work` / `blake3` | tree tags are stored internally as `tree:<name>`, with `TreeTag` as a separate type |
+| `BranchName` / `TagName` | full naming rules in spec §4.6 (no `:` or control characters, no YAML indicator characters or leading/trailing whitespace, non-empty, does not start or end with `/`, not a namespace keyword, and no collision between a branch name and a tag name of the same file); §2.1.1 of this document explains where those constraints come from | tree tags are stored internally as `tree:<name>`, with `TreeTag` as a separate type |
 | `RepoPath` | relative to the repo root after normalization (CLI input may be relative to cwd, or start with `/` for a repository-absolute path), `/`-separated, UTF-8, following the Windows file-name rules (no `<>:"\|?*` or control characters, no component ending in `.` or a space, no reserved names) | spec §4.2 path rules |
 | `WorktreeRef` | `work:<path>` | the literal for the special working-area File Object |
 
@@ -125,17 +125,17 @@ Strings written into these YAML files fall into three categories by how controll
 
 **User-controlled** (`RepoPath`, `config.yaml`'s `user.name`, a snapshot's `author`) — always double-quoted on serialization, escaped inside the quotes by the standard YAML double-quoted-string rules, reusing the same escaping implementation as digest canonicalization (§3.3.2) (only `"`, `\`, and control characters are escaped; non-ASCII is raw UTF-8). `RepoPath` already forbids `"` and `\` (spec §4.2), so this rule needs no real escaping for it in practice — a scan to the next `"` is the whole value; `user.name`/`author` have no character restriction and do need full escaping under this rule.
 
-**User-proposed, LFV-approved** (`BranchName`, `TagName`) — not quoted on serialization; the price for that is that creation-time validation must reject anything that would create ambiguity in a bare YAML scalar:
+**User-proposed, LFV-approved** (`BranchName`, `TagName`) — not quoted on serialization. The full naming rules are laid down in spec §4.6; this section explains why they look the way they do: the price of leaving the value unquoted is that creation-time validation must reject anything that would create ambiguity in a bare YAML scalar.
 
-| Forbidden | Why |
+| Rule | Why |
 | --- | --- |
-| control characters, `:` | existing rule in §2.1 (`BranchName`/`TagName`) |
-| `#?,[]{}&*!\|>'"%@` and the backtick itself | YAML indicator characters (c-indicator), which carry special syntactic meaning in specific positions of a bare scalar |
-| `\` | keeps the value escape-free should it ever need to appear somewhere that requires escaping |
-| leading or trailing whitespace | a bare YAML scalar has its surrounding whitespace trimmed, so the value read back would differ from what was written — silent corruption, not a parse error |
-| the whole name equal to `-`, or matching `/^-\s/` (a hyphen immediately followed by whitespace) | a leading `-` plus whitespace is YAML's block-sequence-entry marker; `-` elsewhere (not followed by a space, at the end, or in the middle) is fine |
+| no control characters and no `:` | control characters break line-oriented files and output; `:` is the namespace separator |
+| no `#?,[]{}&*!\|>'"%@` or the backtick itself | YAML indicator characters (c-indicator), which carry special syntactic meaning in specific positions of a bare scalar |
+| no `\` | keeps the value escape-free should it ever need to appear somewhere that requires escaping |
+| no leading or trailing whitespace | a bare YAML scalar has its surrounding whitespace trimmed, so the value read back would differ from what was written — silent corruption, not a parse error |
+| the whole name not equal to `-`, and not matching `/^-\s/` (a hyphen immediately followed by whitespace) | a leading `-` plus whitespace is YAML's block-sequence-entry marker; `-` elsewhere (not followed by a space, at the end, or in the middle) is fine |
 
-The check belongs in the commands that create branch/tag names (`lfv branch-rename`, `lfv tag`, and the preserved branch names implicitly created by rewind/detour/rebase/revive), at the same layer as the namespace-keyword check, refusing creation outright on a violation.
+The check belongs in the commands that create branch/tag names (`lfv branch-rename`, `lfv tag`, and the preserved branch names and `tree:detour/...` tags implicitly created by rewind/detour/rebase/revive), at the same layer as the namespace-keyword check and the branch/tag collision check, refusing creation outright on a violation.
 
 **LFV-controlled** (`snap:<ULID>`, `file:<ULID>`, `blake3:<hex>`, RFC 3339 timestamps, `true`/`false`, integer version numbers, and the like) — the character set is defined by LFV itself and known safe; written bare, unquoted and unescaped.
 
@@ -243,7 +243,7 @@ pub struct Retired { pub at: Timestamp, pub onto: FileId }
 pub struct TreePlane { log: SnapshotLog /* plane = Tree */, head: Option<SnapId>, tags: RefTable<TreeTag> }
 ```
 
-`trees/HEAD` being an empty file ↔ `head = None` (§3.7). There are no branches. Reachability: `trees/HEAD` and all `tree:` tags are roots; when `rewind <TS-ish>` leaves a HEAD that has no tag and is not an ancestor of the target, a `tree:detour/<head-short>` tag is applied automatically (spec §4.5.1).
+`trees/HEAD` being an empty file ↔ `head = None` (§3.7). There are no branches. Reachability: `trees/HEAD` and all `tree:` tags are roots; when `rewind <TS-ish>` leaves a HEAD that has no tag and is not an ancestor of the target, a `tree:detour/<anchor-short>/<n>` tag is applied automatically (spec §4.5.1).
 
 ### 2.7 Working-area state model (shared by `scan` and `index`)
 
@@ -276,7 +276,7 @@ pub enum FileTarget  { Worktree(FileId, RepoPath), Object(FileId, ObjectHash) } 
 pub enum TreeTarget  { Object(ObjectHash), Snap(SnapId) }                            // <TO-ish> / <TS-ish>
 ```
 
-Disambiguation order for a bare token (purely syntactic, no index lookup): the `snap:` prefix (snap-id; `snap_locator` tells whether it is on the file or tree plane) → the `file:` prefix (file-id) → the `work:` prefix (working-area literal) → the `tree:` prefix (tree tag) → the `blake3:` prefix (tree-id) → when it contains `:`, it is split at the first `:` as `<ref>:<file>`, and the `<file>` part is classified again by these rules as a file-id or a path → otherwise treated as a path (`a`, `./a`, `../a` relative to cwd, `/a/b` repository-absolute; operating-system absolute paths and drive letters are rejected; `\` in input is read as `/`, and several leading `/` count as one; normalized into a `RepoPath`, an error if it leaves the repository; looked up in `tracked.path`, then in `tracked.head_path` (a rename pending write), then as the last non-retired file-id that held that path in history, taking among several candidates the one whose HEAD snapshot has the latest `created_at` and failing that the largest snap-id). Branch names and tag names may not appear as bare tokens; in commands that already carry a `<file>` argument, a bare token in the `<FS-ish>` position is resolved first as a snap-id, then as a branch name of that file, then as a tag name.
+Disambiguation order for a bare token (purely syntactic, no index lookup): the `snap:` prefix (snap-id; `snap_locator` tells whether it is on the file or tree plane) → the `file:` prefix (file-id) → the `work:` prefix (working-area literal) → the `tree:` prefix (tree tag) → the `blake3:` prefix (tree-id) → when it contains `:`, it is split at the first `:` as `<ref>:<file>`, and the `<file>` part is classified again by these rules as a file-id or a path → otherwise treated as a path (`a`, `./a`, `../a` relative to cwd, `/a/b` repository-absolute; operating-system absolute paths and drive letters are rejected; `\` in input is read as `/`, and several leading `/` count as one; normalized into a `RepoPath`, an error if it leaves the repository; looked up in `tracked.path`, then in `tracked.head_path` (a rename pending write), then as the last non-retired file-id that held that path in history, taking among several candidates the one whose HEAD snapshot has the latest `created_at` and failing that the largest snap-id). Branch names and tag names may not appear as bare tokens; in commands that already carry a `<file>` argument, a bare token in the `<FS-ish>` position is resolved first as a snap-id, then as a branch name of that file, then as a tag name; a branch and a tag of the same file can never share a name (spec §4.6 blocks that at creation), so the last two steps cannot conflict.
 
 Which file-id / plane a bare `snap:*` belongs to is answered by `index.snap_locator` (§3.6).
 
@@ -664,7 +664,7 @@ tree:v1.0: snap:01HABC...
 tree:release: snap:01HZZZ...
 ```
 
-User-input tag names may not contain `:` (used for namespace isolation); the `tree:` prefix is added by LFV automatically. The `tree:detour/<head-short>` tags applied automatically by `rewind <TS-ish>` also live in this table.
+User-input tag names may not contain `:` (used for namespace isolation); the `tree:` prefix is added by LFV automatically. The `tree:detour/<anchor-short>/<n>` tags applied automatically by `rewind <TS-ish>` also live in this table.
 
 All yaml / HEAD writes go through `util::atomic_write` (a tmp file in the same directory + rename; `rename` can overwrite on Windows).
 
@@ -840,6 +840,7 @@ The benefit of this design: before `lfv snap`, a `D` file is still in the tracki
 **`lfv mv` performs path operations only**: `<src>` accepts a path or a file-id (a file-id is located by its current path, which suits files already gone from disk such as `D` rows); `<dst>` accepts a path only, not a file-id. It is for renaming/moving a file that still exists on disk (or that the OS has just moved). The main reason `<dst>` may not be a file-id is the mental confusion it would cause — the user might mistakenly believe the surviving file-id is the `<dst>` side. To splice history onto another file-id, use `lfv relink` (see §4.7).
 
 - `lfv mv <src> <dst>` (`ops::mv`): migrates the tracked file corresponding to src to the dst path.
+  - Before appending the snapshot, hash src's current content (which is dst's content after the move) and run the loopback check (§4.13): on a hit the whole command is refused, and at that point the file on disk has not been moved.
   - If the src path still exists in the working tree and dst does not, the CLI moves the file to dst first and then appends the snapshot (atomic semantics).
   - If the src path no longer exists (the OS or an editor moved it first) and the file is already at the dst path, `lfv mv` only "registers the snapshot" and does not touch the disk again.
   - The `object` of the new Snapshot is determined by the hash of dst's current content: identical to the parent snapshot renders as a pure `R`, different renders as `R+M`.
@@ -922,7 +923,8 @@ if loop_mode:                                                   // §4.13
 else:
     branches[HEAD] = target
     object.restore_to(target.object, current path)              // content only; path unchanged
-index: tracked.head_* / disk_* refresh, status = unmodified
+index: tracked.head_* / disk_* refresh; status re-derived per §2.7
+       (content now equals target.object => modified/R when target.path != current path, else unmodified)
 ```
 
 Normal mode and loop mode share the step "preserve the old HEAD on a new branch" and differ only in the `kind` of that preserving branch (`rewind` / `detour`).
@@ -946,7 +948,7 @@ Normal mode and loop mode share the step "preserve the old HEAD on a new branch"
 
 Once `lfv rewind <TS-ish>` (`ops::tree_rewind`) has passed the pre-check of spec §4.5.1:
 
-1. If the current tree HEAD has no tag and is not an ancestor of the target, write a `tree:detour/<head-short>` tag.
+1. If the current tree HEAD has no tag and is not an ancestor of the target, write a `tree:detour/<anchor-short>/<n>` tag.
 2. Update `.lfv/trees/HEAD` to the snap id of the target Tree Snapshot.
 3. Read the target tree-snapshot's Tree Object to obtain the `{path, file-object-hash}` manifest, and map each entry to a file-id through `tree_file_refs(tree_snap_id = target)`.
 4. Handle all files in the following three categories:
@@ -969,7 +971,7 @@ Once `lfv rewind <TS-ish>` (`ops::tree_rewind`) has passed the pre-check of spec
 
 ### 4.13 Loopback detection and handling
 
-To guarantee that each file's history presents an **acyclic content-evolution DAG** on any single branch, LFV enforces the **single-branch object uniqueness** invariant. Detection is currently triggered by `lfv snap` and `lfv verify`; `lfv merge`, `lfv rebase`, and `lfv relink` obey it just as much when appending snapshots (for how they handle it see spec §4.7.4 and §4.7 of this document).
+To guarantee that each file's history presents an **acyclic content-evolution DAG** on any single branch, LFV enforces the **single-branch object uniqueness** invariant. Detection is currently triggered by `lfv snap` and `lfv verify`; `lfv mv`, `lfv merge`, `lfv rebase`, and `lfv relink` obey it just as much when appending snapshots (for how they handle it see spec §4.7.4 and §4.7 of this document).
 
 - **On any single branch, the same `file-object-hash` may form only one contiguous run of snapshots and may not reappear non-contiguously.** Contiguous snapshots sharing one object (a pure rename, a path changed back) collapse into a single node at the content layer; `null` takes no part in uniqueness but does break a run: `O1 → null → O1` is a non-contiguous reappearance of O1.
 - **History integrity comes first**: intermediate history is never silently discarded or rewritten, and the user must run `rewind` explicitly to "skip" a duplicate stretch.
@@ -1076,7 +1078,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | rewind / switch / revive §4.10 | rewind, switch, revive | `ops::rewind_file` / `ops::switch` / `ops::revive` | `snapshot`, `object::restore_to`, `tracked`, `index` |
 | snap --tree §4.11 | snap --tree | `ops::tree_snap` | `object::TreeManifest`, `tree`, `index` |
 | rewind <TS-ish> §4.12 | rewind tree: | `ops::tree_rewind` | `tree`, `index.tree_file_refs`, `ops::rewind_file` |
-| Loopback §4.13 | snap / verify / merge / rebase / relink | `snapshot::loop_check` | — |
+| Loopback §4.13 | snap / mv / verify / merge / rebase / relink | `snapshot::loop_check` | — |
 | merge / rebase / --pick §4.14 | merge, rebase, --continue, --abort | `merge::replay` | `diffy`, `ops::rewind_file`, `snapshot`, `object` |
 | verify §4.15 | verify | `ops::verify` | the whole storage layer |
 | import §4.16 | import | `ops::import` | `snapshot` (digest check), `object` (deduplicated write), `tracked` (meta/branches/tags copy), `index.snap_locator` |

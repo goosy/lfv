@@ -203,7 +203,7 @@ After byte operations, the existing lazy scanning mechanism (`design.md §4.3`) 
 `lfv rewind <TS-ish>` does not directly execute rewind (which would create a new branch) for each file that needs restoration. Instead, it first checks whether a Fast-Forward path exists:
 
 - **FF path**: If the current HEAD of a branch has an object hash equal to the target hash, directly `switch` to that branch without creating a new branch. Prefer the current branch (no switching cost); if the current branch does not match, pick the most recently created matching branch.
-- **rewind path**: Otherwise, perform a standard rewind, automatically creating a new branch (`rewind/<snap-short>/<n>`).
+- **rewind path**: Otherwise, perform a standard rewind, automatically creating a new branch (`rewind/<anchor-short>/<n>`).
 
 Tree rewind is a batch operation that may affect dozens of files. If every file unconditionally created a new branch, the resulting branch noise would greatly interfere with users' reading of each file's history. The FF path covers most tree rewind scenarios in practice (because tree snapshots are typically created immediately after each file's snap, at which point each file HEAD's object is exactly the object recorded in the tree object), making zero branch pollution the norm. Only when truly rewinding to a non-HEAD position does a new branch get created, consistent with Decision 2 (Rewind never destroys history).
 

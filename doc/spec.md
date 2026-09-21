@@ -194,7 +194,7 @@ Goal: what LFV writes must be legal YAML that any standard YAML parser can read 
 **Strings fall into three categories by how controllable they are, handled differently**:
 
 - **User-controlled strings** — content comes from the user and LFV places no restriction on the character set (`RepoPath`, `config.yaml`'s `user.name`, a snapshot's `author`). **Always double-quoted**, escaped inside the quotes by the standard YAML double-quoted-string rules (the same as `serde_json` string escaping: only `"`, `\`, and control characters are escaped; non-ASCII is written as raw UTF-8). `RepoPath` already forbids `"` and `\` (§4.2), so this rule needs no real escaping in practice for paths; `user.name`/`author` have no character restriction and do need full escaping under this rule.
-- **User-proposed, LFV-approved** — branch names and tag names (`BranchName`/`TagName`). The user names them, but they only come to exist after passing LFV's creation-time validation, so their character set can be restricted, in exchange for staying unquoted. See design §2.1.1 for the exact character rules.
+- **User-proposed, LFV-approved** — branch names and tag names (`BranchName`/`TagName`). The user names them, but they only come to exist after passing LFV's creation-time validation, so their character set can be restricted, in exchange for staying unquoted. The exact character rules are in §4.6; where each constraint comes from is explained in design §2.1.1.
 - **LFV-controlled** — `snap:<ULID>`, `file:<ULID>`, `blake3:<hex>`, RFC 3339 timestamps, `true`/`false`, integer version numbers, and the like. The character set is defined by LFV itself and known safe; written bare, unquoted and unescaped.
 
 ## 4. CLI Functional Spec
@@ -210,7 +210,7 @@ The parameter conventions below all ultimately resolve to one of the four storag
   - `<branch>:<file>`: the HEAD snapshot of one branch of that file;
   - `<tag>:<file>`: the snapshot that a tag of that file points to.
   The form matches git's `<rev>:<path>`. Paths, branch names and tag names never contain `:`, and branch and tag names may not be a namespace keyword (`file`, `snap`, `tree`, `work`, `blake3`), so splitting at `:` is unambiguous; file names are not restricted by the keywords.
-  In commands that already take a `<file>` argument (such as `lfv rewind <file> <FS-ish>`), `<FS-ish>` may omit the `:<file>` part and be written directly as a branch name, tag name, or snap-id.
+  In commands that already take a `<file>` argument (such as `lfv rewind <file> <FS-ish>`), `<FS-ish>` may omit the `:<file>` part and be written directly as a branch name, tag name, or snap-id; the resolution order is snap-id -> branch name -> tag name (a branch and a tag of the same file may not share a name, see §4.6, so this order only serves to separate them from a snap-id).
 - `<FO-ish>` is an argument that resolves to a File Object, including:
   - any `<FS-ish>`: resolves to that snapshot's `object`;
   - `work:<path>`: the current working-area content, treated as a special unsaved File Object.
@@ -235,7 +235,7 @@ The parameter conventions below all ultimately resolve to one of the four storag
 | ---- | ---- |
 | `lfv track [<file>]` | Add a file to tracking. When `<file>` is given, errors if the path matches `.lfvignore`; otherwise removes it from the untracked list in `config.yaml`. If that path was previously untracked rather than deleted, the original `file-id` is reused and the status table is updated to `modified` (awaiting the first `lfv snap` when there is no snapshot history). With no file argument, automatically scans all trackable files not yet in the status table and adds them to tracking. |
 | `lfv untrack <file>` | Stop tracking: errors if the file is LFV-invisible; if visible, updates the dynamic untracked list in `config.yaml`; if the file exists on disk, records `untracked` in the status table (keeping its file-id so `lfv track` can reuse it), otherwise only config is touched. History is preserved and can be resumed with `lfv track` / `lfv revive`. |
-| `lfv mv <old-file> <new-file>` | Migrate the tracked file at the `<old-file>` path to the `<new-file>` path. `<old-file>` accepts a path or a file-id (a file-id always corresponds to a path); `<new-file>` accepts a path only, not a file-id. Whether the actual file move is performed in the working tree is governed by design §4.6. |
+| `lfv mv <old-file> <new-file>` | Migrate the tracked file at the `<old-file>` path to the `<new-file>` path. `<old-file>` accepts a path or a file-id (a file-id always corresponds to a path); `<new-file>` accepts a path only, not a file-id. If the content after the move would violate single-branch object uniqueness (design §4.13), the whole command is refused and the file on disk has not been moved at that point. Whether the actual file move is performed in the working tree is governed by design §4.6. |
 | `lfv relink <src-file-id> --onto <dst-file-id>` | Splice the history of src-file-id's current branch onto the end of dst-file-id's current branch; the on-disk file becomes identified by dst-file-id and src-file-id is retired. **Operates only on the current branch of each of the two file-ids**, touches no other branch, and performs no 4-way merge content integration. Designed for the case where a new file was created by mistake; not intended as a routine command. See design §4.7. |
 | `lfv delete <file>` | Set the file to modified in the status table and delete the file itself. When a later `lfv snap` detects that it is modified and absent from disk, it appends an `object = null` Snapshot and removes it from the untracked list in `config.yaml`, updating the cached state in the status table. Its history is preserved in full and it can be revived at any time with `lfv revive`. |
 | `lfv revive <file> [<FS-ish>]` | Revive a deleted file. The default restore point is the last snapshot on the current branch with `object != null`; another snapshot can be selected with `<FS-ish>`. Implemented as a rewind (§4.5): the branch name is unchanged, HEAD moves to the restore point, and the original HEAD containing the delete event is preserved by an automatically created `revive/<anchor-short>/<n>` branch; the content is written back to the last known path in the working tree. A new file with the same name that should continue the old history does not go through revive — use `lfv relink` (§5.7). |
@@ -263,7 +263,7 @@ A path that fails these rules is not registered by auto-track, which only issues
 | Command | Description |
 | ---- | ---- |
 | `lfv status [<file>]` | **Without `<file>`, lists all `modified` tracked files**; a lazy scan per design §4.3 runs first. Default output contains tracked changes only, with a `file-id` (`file:*`) on each line. For `--include-untracked` see §4.3.2. `--refresh` forces a full refresh of the scan cache. With `<file>`, only that file is shown. |
-| `lfv snap [<file>] [-m <msg>]` | Create a new snapshot for a file. **Without `<file>`, batch-snapshots every tracked file in `modified` state.** Refuses if both the working-area content and the path are identical to the HEAD snapshot. If single-branch object uniqueness would be violated (design §4.13), refuses to create the snapshot and prompts the user to run `lfv rewind`. For the `--tree` parameter see §4.3.3. |
+| `lfv snap [<file>] [-m <msg>]` | Create a new snapshot for a file. **Without `<file>`, batch-snapshots every tracked file in `modified` state.** Refuses if both the working-area content and the path are identical to the HEAD snapshot. If single-branch object uniqueness would be violated (design §4.13), refuses to create the snapshot and prompts the user to run `lfv rewind`. `--snap-all` is equivalent to omitting `<file>`; it merely makes the intent “batch, one shared message” visible on the command line, and may not be combined with `--tree`. For the `--tree` parameter see §4.3.3. |
 | `lfv log <FS-ish>` | List the history of the branch the snapshot is on, together with tree association information (from the tree reverse-reference cache). When `<FS-ish>` is `<file>`, shows its current branch; when it is `<branch>:<file>`, shows that branch; when it is a snap-id, shows the branch containing that snapshot — preferring the current branch, otherwise the first branch containing it in branch-name order. `--all` shows the history of all branches of that file; `--graph` renders the branch topology as ASCII art; `--limit N` limits the number of entries. |
 | `lfv log --tree` | List the history view of the tree plane: walk the Tree Snapshot chain, showing message, tags, and timestamp for each node. |
 | `lfv show <FS-ish>` | Output the metadata of that snapshot; `--content` also outputs the object content; `--out <path>` exports the content to a file. |
@@ -360,10 +360,10 @@ Text files use a line-based diff (3 lines of context by default); binary files s
 | `lfv rewind <TS-ish>` | Restore the working area to the state of the specified Tree Snapshot. Updates `.lfv/trees/HEAD`; applies an FF-priority strategy per file (details in §4.5.1). |
 | `lfv branches <file>` | List all branches of that file. |
 | `lfv switch <file> <branch>` | Switch that file's current branch (also updating the working-area content to that branch's head snapshot). File plane only; the tree plane is not touched. Refuses while the file is in `modified` state. When the target branch's HEAD has `object = null` (the file is deleted on that branch), the file is removed from the working tree; that path still resolves afterwards (falling back to the last non-retired file-id that held it), but once a new file takes the path it resolves to the new file-id, so referencing it stably means using the file-id. |
-| `lfv branch-rename <file> <old> <new>` | Rename a branch. |
-| `lfv branch-delete <file> <branch>` | Delete a branch (only the pointer is deleted; snapshots and objects are retained so they can be shared and recovered). |
+| `lfv branch-rename <file> <old> <new>` | Rename a branch. `<new>` must satisfy the naming rules in §4.6 and must not collide with an existing branch name or tag name of that file; renaming the current branch rewrites that file's `HEAD` as well. |
+| `lfv branch-delete <file> <branch>` | Delete a branch (only the pointer is deleted; snapshots and objects are retained so they can be shared and recovered). Refuses to delete the branch the current HEAD is on; switch elsewhere with `lfv switch` first. |
 
-**Preserved-branch naming rules**: branches created automatically by rewind-style operations are uniformly named `<kind>/<anchor-short>/<n>`. `kind ∈ {rewind, detour, rebase, revive}` states the originating operation (respectively the rewind in this section, loopback handling in design §4.13, §4.7.1, and revive in §4.2); `anchor-short` is the last 8 characters of the ULID of the preserved old HEAD snapshot; `n` increments from 1 to avoid name collisions.
+**Preserved-branch naming rules**: branches created automatically by rewind-style operations are uniformly named `<kind>/<anchor-short>/<n>`. `kind ∈ {rewind, detour, rebase, revive}` states the originating operation (respectively the rewind in this section, loopback handling in design §4.13, §4.7.1, and revive in §4.2); `anchor-short` is the last 8 characters of the ULID of the preserved old HEAD snapshot; `n` increments from 1 to avoid name collisions. The tree plane has no branches; the tag `tree:detour/<anchor-short>/<n>` that `lfv rewind <TS-ish>` creates automatically for the tree HEAD being left behind follows the same naming rule, with `anchor-short` taken from the last 8 characters of the ULID of that departing tree HEAD snapshot.
 
 #### 4.5.1 `lfv rewind <TS-ish>` Execution Flow
 
@@ -375,7 +375,7 @@ error: the following files have unsaved changes:
 run `lfv snap` first, or discard changes manually.
 ```
 
-**Actual execution**: once the precondition is met, if the current tree HEAD has no tag at all and is not an ancestor of the target Tree Snapshot, it is first tagged automatically as `tree:detour/<head-short>` (the tree plane has no branches, so this is the only way to keep the tip being left behind reachable). Then, for every file involved in `<TS-ish>`, `lfv rewind <file> <FS-ish>` is executed, with `<file>` and `<FS-ish>` derived from `<TS-ish>` (manifest entries are mapped to file-ids through the tree reverse references). The tree HEAD is pointed at `<TS-ish>` at the same time.
+**Actual execution**: once the precondition is met, if the current tree HEAD has no tag at all and is not an ancestor of the target Tree Snapshot, it is first tagged automatically as `tree:detour/<anchor-short>/<n>` (naming rule in §4.5) (the tree plane has no branches, so this is the only way to keep the tip being left behind reachable). Then, for every file involved in `<TS-ish>`, `lfv rewind <file> <FS-ish>` is executed, with `<file>` and `<FS-ish>` derived from `<TS-ish>` (manifest entries are mapped to file-ids through the tree reverse references). The tree HEAD is pointed at `<TS-ish>` at the same time.
 
 **Effect**: restores the whole working tree to the state recorded by the target Tree Snapshot and advances the tree HEAD. Each tracked file uses an FF-priority strategy: if the target content is already reachable through the HEAD of some existing branch, that branch is switched to and no new branch is created; otherwise a new branch is created to preserve where the original branch pointed, and the original branch is directed to the target snapshot. When a file's current path differs from the manifest path, the on-disk file is moved back to the manifest path as well. Files added after the target snapshot are deleted from the working area; files present in the snapshot but currently untracked or deleted have their bytes written back to disk and are handed over to the next scan. The detailed per-file algorithm is in design §4.12.
 
@@ -383,18 +383,30 @@ run `lfv snap` first, or discard changes manually.
 
 | Command | Description |
 | ---- | ---- |
-| `lfv tag <file> <snap> <name>` | Tag a snapshot of a file. |
+| `lfv tag <file> <FS-ish> <name>` | Tag a snapshot of a file. |
 | `lfv tags <file>` | List all tags of that file. |
 | `lfv tag-delete <file> <name>` | Delete a file tag. |
-| `lfv tag --tree <snap> <name>` | Tag a Tree Snapshot (stored as `tree:<name>`). |
+| `lfv tag --tree <TS-ish> <name>` | Tag a Tree Snapshot (stored as `tree:<name>`). |
 | `lfv tags --tree` | List all tree tags. |
 | `lfv tag-delete --tree <name>` | Delete a tree tag. |
 
-User-input tag names may not contain `:` or control characters and may not be a namespace keyword (`file`, `snap`, `tree`, `work`, `blake3`) (namespace isolation); branch names (`lfv branch-rename`) follow the same rule. A name that breaks these rules is refused at creation. Once created, a tag's target cannot be changed; after deletion, the same name can be created again.
+**Naming rules for branch names and tag names** (one shared rule set, validated at creation; a violation is refused outright):
+
+- non-empty; does not start or end with `/`;
+- contains no control characters and no `:` (namespace isolation);
+- contains none of the YAML indicator characters `#?,[]{}&*!|>'"%@` or the backtick itself, and no `\`;
+- has no leading or trailing whitespace;
+- is not equal to `-` as a whole and does not match `/^-\s/` (a hyphen immediately followed by whitespace);
+- is not a namespace keyword `file`, `snap`, `tree`, `work`, `blake3`;
+- a branch name and a tag name of the same file may not collide: `lfv tag` checks that file's branch table at creation and `lfv branch-rename` checks its tag table; tree tags are globally unique on the tree plane.
+
+The same rules apply to the preserved branch names and `tree:detour/...` tags that LFV creates implicitly. Where each constraint comes from, and its serialization consequences, are in design §2.1.1.
+
+Once created, a tag's target cannot be changed; after deletion, the same name can be created again.
 
 ### 4.7 Merge and Rebase
 
-Merge and rebase operations both target **file-plane branches only** and have nothing to do with the tree plane. Both take the **co-referent ancestor** as their base point, replay changes step by step through 4-way merge, and introduce a conflict-handling mechanism. In other words, the file-object in the content layer is the coordinate along which things are aligned.
+Merge and rebase operations both target **file-plane branches only** and have nothing to do with the tree plane. Both take the **co-referent ancestor** as their base point, replay changes step by step through 4-way merge, and introduce a conflict-handling mechanism. In other words, the file-object in the content layer is the coordinate along which things are aligned. 4-way refers to locating the base point: it involves two different base snapshots on the two branches (base-snap-ours and base-snap-theirs); the content merge of each individual step is still a three-way merge (base-object, ours, theirs).
 
 > [!note] Note
 > `lfv merge` and `lfv rebase` differ from `lfv relink`:

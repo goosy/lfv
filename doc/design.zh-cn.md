@@ -115,7 +115,7 @@ tests/
 | `SnapId` | `snap:<ULID 26>` | file / tree 两个 plane 共用格式，全局唯一 |
 | `ObjectHash` | `blake3:<64 hex>` | 内部 `[u8; 32]`；File Object 与 Tree Object 同类型，**存储层不区分类型** |
 | `TreeId` | = `ObjectHash` | 内容 hash，无独立身份 |
-| `BranchName` / `TagName` | 不含 `:` 与控制字符；不含 YAML 指示符字符与首尾空白（完整规则见 §2.1.1）；非空；不以 `/` 开头或结尾；不是命名空间保留字 `file` / `snap` / `tree` / `work` / `blake3` | tree 标签内部存 `tree:<name>`，`TreeTag` 单独类型 |
+| `BranchName` / `TagName` | 完整命名规则见 spec §4.6（不含 `:` 与控制字符、不含 YAML 指示符字符与首尾空白、非空、不以 `/` 开头或结尾、不是命名空间保留字、同一文件内分支名与标签名不重名）；本文 §2.1.1 说明这些约束的由来 | tree 标签内部存 `tree:<name>`，`TreeTag` 单独类型 |
 | `RepoPath` | 规范化后相对仓库根（CLI 输入可相对 cwd，或以 `/` 开头表示仓库内绝对路径）、`/` 分隔、UTF-8，满足 Windows 文件名规则（不含 `<>:"\|?*` 与控制字符、分量不以 `.`/空格结尾、非保留名） | spec §4.2 路径规则 |
 | `WorktreeRef` | `work:<path>` | 工作区特殊 File Object 的字面量 |
 
@@ -125,17 +125,17 @@ tests/
 
 **用户可控**（`RepoPath`、`config.yaml` 的 `user.name`、snapshot 的 `author`）——序列化时强制双引号，引号内按标准 YAML 双引号转义规则书写，与 digest 规范化序列化（§3.3.2）复用同一套转义实现（只转义 `"`、`\`、控制字符，非 ASCII 原样 UTF-8）。`RepoPath` 已经禁止 `"`/`\`（spec §4.2），落到这条规则时天然不需要真正转义，直接"扫到下一个 `"`"即可；`user.name`/`author` 没有字符限制，需要按此规则完整转义。
 
-**用户部分可控、由 LFV 批准**（`BranchName`、`TagName`）——序列化时不加引号；换来这个权利的代价是创建时的字符集校验必须挡掉一切会引发 YAML 裸标量歧义的写法：
+**用户部分可控、由 LFV 批准**（`BranchName`、`TagName`）——序列化时不加引号。完整的命名规则由 spec §4.6 规定，本节说明它为什么长成那样：不加引号的代价是创建时的校验必须挡掉一切会引发 YAML 裸标量歧义的写法。
 
-| 禁止项 | 理由 |
+| 规则 | 理由 |
 | --- | --- |
-| 控制字符、`:` | §2.1 `BranchName`/`TagName` 已有规则 |
-| `#?,[]{}&*!\|>'"%@` 及反引号本身 | YAML 指示符字符（c-indicator），在裸标量特定位置有特殊语法含义 |
-| `\` | 若该值将来出现在需要转义的上下文中，保证零转义 |
-| 开头或结尾的空白字符 | YAML 裸标量会裁剪首尾空白，否则写入值与读回值不一致（静默损坏，非解析错误） |
-| 整体等于 `-`，或匹配 `/^-\s/`（连字符后紧跟空白） | 裸标量开头 `-` 加空白是 YAML 块序列项标记；`-` 出现在其它位置（不接空格、结尾、中间）正常 |
+| 禁止控制字符与 `:` | 控制字符会破坏按行组织的文件与输出；`:` 是命名空间分隔符 |
+| 禁止 `#?,[]{}&*!\|>'"%@` 及反引号本身 | YAML 指示符字符（c-indicator），在裸标量特定位置有特殊语法含义 |
+| 禁止 `\` | 若该值将来出现在需要转义的上下文中，保证零转义 |
+| 禁止开头或结尾的空白字符 | YAML 裸标量会裁剪首尾空白，否则写入值与读回值不一致（静默损坏，非解析错误） |
+| 禁止整体等于 `-`，或匹配 `/^-\s/`（连字符后紧跟空白） | 裸标量开头 `-` 加空白是 YAML 块序列项标记；`-` 出现在其它位置（不接空格、结尾、中间）正常 |
 
-校验放在创建分支名/标签名的命令（`lfv branch-rename`、`lfv tag`，以及 rewind/detour/rebase/revive 隐式创建的保留分支名）里，与命名空间保留字检查同一层，不符合直接拒绝创建。
+校验放在创建分支名/标签名的命令（`lfv branch-rename`、`lfv tag`，以及 rewind/detour/rebase/revive 隐式创建的保留分支名与 `tree:detour/...` 标签）里，与命名空间保留字检查、分支/标签重名检查同一层，不符合直接拒绝创建。
 
 **LFV 自己控制**（`snap:<ULID>`、`file:<ULID>`、`blake3:<hex>`、RFC 3339 时间戳、`true`/`false`、整数版本号等）——字符集由 LFV 自身定义且已知安全，裸写，不加引号、不转义。
 
@@ -243,7 +243,7 @@ pub struct Retired { pub at: Timestamp, pub onto: FileId }
 pub struct TreePlane { log: SnapshotLog /* plane = Tree */, head: Option<SnapId>, tags: RefTable<TreeTag> }
 ```
 
-`trees/HEAD` 为空文件 ↔ `head = None`（§3.7）。无分支。可达性：`trees/HEAD` 与全部 `tree:` 标签是根；`rewind <TS-ish>` 离开无标签且非目标祖先的 HEAD 时自动打 `tree:detour/<head-short>` 标签（spec §4.5.1）。
+`trees/HEAD` 为空文件 ↔ `head = None`（§3.7）。无分支。可达性：`trees/HEAD` 与全部 `tree:` 标签是根；`rewind <TS-ish>` 离开无标签且非目标祖先的 HEAD 时自动打 `tree:detour/<anchor-short>/<n>` 标签（spec §4.5.1）。
 
 ### 2.7 工作区状态模型（`scan` 与 `index` 共用）
 
@@ -276,7 +276,7 @@ pub enum FileTarget  { Worktree(FileId, RepoPath), Object(FileId, ObjectHash) } 
 pub enum TreeTarget  { Object(ObjectHash), Snap(SnapId) }                            // <TO-ish> / <TS-ish>
 ```
 
-裸 token 的消歧顺序（纯语法判定，不查索引）：`snap:` 前缀（snap-id；归属 file / tree plane 由 `snap_locator` 给出）→ `file:` 前缀（file-id）→ `work:` 前缀（工作区字面量）→ `tree:` 前缀（树标签）→ `blake3:` 前缀（tree-id）→ 含 `:` 时在第一个 `:` 处拆为 `<ref>:<file>`，`<file>` 部分再按本规则解析为 file-id 或路径 → 否则视为路径（`a`、`./a`、`../a` 相对 cwd，`/a/b` 为仓库内绝对路径；拒绝操作系统绝对路径与盘符；输入中 `\` 视同 `/`，开头连续多个 `/` 视同一个；规范化为 `RepoPath`，越出仓库报错；查 `tracked.path`，再查 `tracked.head_path`（待落盘的改名），再查历史中最后拥有该路径且未退役的 file-id，多个候选取其 HEAD 快照 `created_at` 最晚者、仍相同则取 snap-id 最大者）。分支名与标签名不能作为裸 token 出现；在已带 `<file>` 参数的命令中，`<FS-ish>` 位置的裸 token 先按 snap-id，再按该文件的分支名，再按标签名解析。
+裸 token 的消歧顺序（纯语法判定，不查索引）：`snap:` 前缀（snap-id；归属 file / tree plane 由 `snap_locator` 给出）→ `file:` 前缀（file-id）→ `work:` 前缀（工作区字面量）→ `tree:` 前缀（树标签）→ `blake3:` 前缀（tree-id）→ 含 `:` 时在第一个 `:` 处拆为 `<ref>:<file>`，`<file>` 部分再按本规则解析为 file-id 或路径 → 否则视为路径（`a`、`./a`、`../a` 相对 cwd，`/a/b` 为仓库内绝对路径；拒绝操作系统绝对路径与盘符；输入中 `\` 视同 `/`，开头连续多个 `/` 视同一个；规范化为 `RepoPath`，越出仓库报错；查 `tracked.path`，再查 `tracked.head_path`（待落盘的改名），再查历史中最后拥有该路径且未退役的 file-id，多个候选取其 HEAD 快照 `created_at` 最晚者、仍相同则取 snap-id 最大者）。分支名与标签名不能作为裸 token 出现；在已带 `<file>` 参数的命令中，`<FS-ish>` 位置的裸 token 先按 snap-id，再按该文件的分支名，再按标签名解析；同一文件内分支名与标签名不会重名（spec §4.6 在创建时已挡住），因此后两步不会互相冲突。
 
 裸 `snap:*` 的所属 file-id / plane 由 `index.snap_locator` 给出（§3.6）。
 
@@ -664,7 +664,7 @@ tree:v1.0: snap:01HABC...
 tree:release: snap:01HZZZ...
 ```
 
-用户输入的标签名不允许包含 `:`（用于命名空间隔离）；`tree:` 前缀由 LFV 自动添加。`rewind <TS-ish>` 自动打的 `tree:detour/<head-short>` 也在此表。
+用户输入的标签名不允许包含 `:`（用于命名空间隔离）；`tree:` 前缀由 LFV 自动添加。`rewind <TS-ish>` 自动打的 `tree:detour/<anchor-short>/<n>` 也在此表。
 
 所有 yaml / HEAD 写入统一走 `util::atomic_write`（同目录 tmp + rename；Windows 上 `rename` 可覆盖）。
 
@@ -840,6 +840,7 @@ cli::<cmd>::run(args)
 **`lfv mv` 只做路径操作**：`<src>` 接受路径或 file-id（按 file-id 定位时取其当前路径，适用于 `D` 行这类盘上已消失的文件）；`<dst>` 只允许路径，不接受 file-id。用于文件在磁盘上仍存在（或刚被 OS 移动）时的改名/移动。不允许 `<dst>` 为 file-id 的主要原因是：它会造成心智混乱——用户可能误以为保留的 file-id 是 `<dst>` 那一侧。若需要把历史续接到另一个 file-id，请使用 `lfv relink`（见 §4.7）。
 
 - `lfv mv <src> <dst>`（`ops::mv`）：把 src 对应的跟踪文件迁移到 dst 路径。
+  - 追加快照前，先按 src 当前内容（即移动后 dst 的内容）算出 hash 并做环回检查（§4.13）：命中则拒绝整条命令，此时盘上文件尚未移动。
   - 若工作树上 src 路径仍存在且 dst 不存在，CLI 会先把文件移到 dst，再追加快照（原子语义）。
   - 若 src 路径已不存在（OS/编辑器先动了），dst 路径上已有该文件，则 `lfv mv` 只做"登记快照"，不再动盘。
   - 新 Snapshot 的 `object` 由 dst 当前内容的 hash 决定：若与父快照相同则呈现为纯 `R`，不同则呈现为 `R+M`。
@@ -922,7 +923,8 @@ if loop_mode:                                                   // §4.13
 else:
     branches[HEAD] = target
     object.restore_to(target.object, current path)              // content only; path unchanged
-index: tracked.head_* / disk_* refresh, status = unmodified
+index: tracked.head_* / disk_* refresh; status re-derived per §2.7
+       (content now equals target.object => modified/R when target.path != current path, else unmodified)
 ```
 
 普通模式与 loop 模式共用"保留旧 HEAD 到新分支"这一步，只是保留分支的 `kind` 不同（`rewind` / `detour`）。
@@ -946,7 +948,7 @@ index: tracked.head_* / disk_* refresh, status = unmodified
 
 `lfv rewind <TS-ish>`（`ops::tree_rewind`）通过 spec §4.5.1 的前置校验后：
 
-1. 若当前 tree HEAD 无标签且不是目标的祖先，写入 `tree:detour/<head-short>` 标签。
+1. 若当前 tree HEAD 无标签且不是目标的祖先，写入 `tree:detour/<anchor-short>/<n>` 标签。
 2. 将 `.lfv/trees/HEAD` 更新为目标 Tree Snapshot 的 snap id。
 3. 读取目标 tree-snapshot 的 Tree Object，得到 `{path, file-object-hash}` 清单；经 `tree_file_refs(tree_snap_id = target)` 把每个条目映射到 file-id。
 4. 按以下三类分别处理所有 file：
@@ -969,7 +971,7 @@ index: tracked.head_* / disk_* refresh, status = unmodified
 
 ### 4.13 环回检测与处理
 
-为保证每个文件的历史在单条分支上呈现**无环的内容演化 DAG**，LFV 强制维护**分支对象唯一性**不变量。目前由 `lfv snap` 与 `lfv verify` 触发检测；`lfv merge`、`lfv rebase`、`lfv relink` 追加快照时同样遵守（处理方式见 spec §4.7.4、本文 §4.7）。
+为保证每个文件的历史在单条分支上呈现**无环的内容演化 DAG**，LFV 强制维护**分支对象唯一性**不变量。目前由 `lfv snap` 与 `lfv verify` 触发检测；`lfv mv`、`lfv merge`、`lfv rebase`、`lfv relink` 追加快照时同样遵守（处理方式见 spec §4.7.4、本文 §4.7）。
 
 - **在任意一条分支上，同一个 `file-object-hash` 只能构成一段连续的快照 run，不允许非连续地再次出现。** 连续同 object 的快照（纯改名、路径改回）在内容层折叠为同一节点；`null` 不参与唯一性，但会打断 run：`O1 → null → O1` 属于 O1 非连续再次出现。
 - **历史完整性优先**：绝不静默丢弃或重写中间历史，用户必须显式执行 `rewind` 才能"跳过"重复段。
@@ -1076,7 +1078,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | rewind / switch / revive §4.10 | rewind, switch, revive | `ops::rewind_file` / `ops::switch` / `ops::revive` | `snapshot`、`object::restore_to`、`tracked`、`index` |
 | snap --tree §4.11 | snap --tree | `ops::tree_snap` | `object::TreeManifest`、`tree`、`index` |
 | rewind <TS-ish> §4.12 | rewind tree: | `ops::tree_rewind` | `tree`、`index.tree_file_refs`、`ops::rewind_file` |
-| 环回 §4.13 | snap / verify / merge / rebase / relink | `snapshot::loop_check` | — |
+| 环回 §4.13 | snap / mv / verify / merge / rebase / relink | `snapshot::loop_check` | — |
 | merge / rebase / --pick §4.14 | merge, rebase, --continue, --abort | `merge::replay` | `diffy`、`ops::rewind_file`、`snapshot`、`object` |
 | verify §4.15 | verify | `ops::verify` | 全部存储层 |
 | import §4.16 | import | `ops::import` | `snapshot`（digest 校验）、`object`（去重写入）、`tracked`（meta/branches/tags 拷贝）、`index.snap_locator` |

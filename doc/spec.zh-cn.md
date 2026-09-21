@@ -194,7 +194,7 @@ LFV 维护一个可重建的**可变索引**（Mutable Index）作为工作区�
 **字符串按可控程度分三类，处理方式不同**：
 
 - **用户可控字符串**——内容来自用户输入、LFV 不限制其字符集（`RepoPath`、`config.yaml` 的 `user.name`、snapshot 的 `author`）。**一律强制双引号**，引号内按标准 YAML 双引号转义规则书写（等同 `serde_json` 字符串转义：只转义 `"`、`\`、控制字符，非 ASCII 原样 UTF-8）。`RepoPath` 已经禁止 `"`/`\`（§4.2），落到本条规则时天然不需要真正转义；`user.name`/`author` 没有字符限制，需要按此规则完整转义。
-- **用户部分可控、由 LFV 批准**——分支名、标签名（`BranchName`/`TagName`）。用户提出名字，但只有通过 LFV 的创建时校验才会真正存在，因此可以对字符集设限，换取继续裸写（不加引号）。具体字符规则见 design §2.1.1。
+- **用户部分可控、由 LFV 批准**——分支名、标签名（`BranchName`/`TagName`）。用户提出名字，但只有通过 LFV 的创建时校验才会真正存在，因此可以对字符集设限，换取继续裸写（不加引号）。具体字符规则见 §4.6，各条约束的由来见 design §2.1.1。
 - **LFV 自己控制**——`snap:<ULID>`、`file:<ULID>`、`blake3:<hex>`、RFC 3339 时间戳、`true`/`false`、整数版本号等。字符集由 LFV 自身定义且已知安全，裸写，不加引号、不转义。
 
 ## 4. CLI 功能规范
@@ -210,7 +210,7 @@ LFV 维护一个可重建的**可变索引**（Mutable Index）作为工作区�
   - `<branch>:<file>`：该文件某分支的 HEAD 快照；
   - `<tag>:<file>`：该文件某标签所指的快照。
   写法与 git 的 `<rev>:<path>` 一致。路径、分支名、标签名都不含 `:`，分支名与标签名也不能是命名空间保留字（`file`、`snap`、`tree`、`work`、`blake3`），因此 `:` 的切分没有歧义；文件名不受保留字限制。
-  在已带 `<file>` 参数的命令中（如 `lfv rewind <file> <FS-ish>`），`<FS-ish>` 可省略 `:<file>`，直接写分支名、标签名或 snap-id。
+  在已带 `<file>` 参数的命令中（如 `lfv rewind <file> <FS-ish>`），`<FS-ish>` 可省略 `:<file>`，直接写分支名、标签名或 snap-id；解析顺序为 snap-id → 分支名 → 标签名（同一文件内分支名与标签名不得重名，见 §4.6，故此顺序只用于与 snap-id 区分）。
 - `<FO-ish>` 最终解析为 File Object 的参数，包括：
   - 任何 `<FS-ish>`：解析为该快照的 `object`；
   - `work:<path>`：工作区当前内容，当成一个未保存的特殊 File Object。
@@ -235,7 +235,7 @@ LFV 维护一个可重建的**可变索引**（Mutable Index）作为工作区�
 | ---- | ---- |
 | `lfv track [<file>]` | 把某文件加入跟踪。指定 `<file>` 时，若路径匹配 `.lfvignore` 则报错；否则从 `config.yaml` 中 untracked 列表移除；若该路径此前是 untrack 而非 delete，则复用原 `file-id`，并将状态表更新为 `modified`（无历史快照时等待首次 `lfv snap`）。无 file 参数时，自动扫描所有可跟踪且尚未进入状态表的文件并加入跟踪。 |
 | `lfv untrack <file>` | 停止跟踪：LFV不可见则报错；可见则更新至 `config.yaml` 动态 untracked 列表；若盘上存在则状态表登记 `untracked`（保留其 file-id 以便 `lfv track` 复用），否则仅 config；历史保留，可 `lfv track` / `lfv revive`。 |
-| `lfv mv <old-file> <new-file>` | 把 `<old-file>` 路径对应的跟踪文件迁移到 `<new-file>` 路径。`<old-file>` 接受路径或 file-id（file-id 必定对应一个路径）；`<new-file>` 只接受路径，不接受 file-id。是否在工作树上执行实际的文件移动，由 design §4.6 规定。 |
+| `lfv mv <old-file> <new-file>` | 把 `<old-file>` 路径对应的跟踪文件迁移到 `<new-file>` 路径。`<old-file>` 接受路径或 file-id（file-id 必定对应一个路径）；`<new-file>` 只接受路径，不接受 file-id。若移动后的内容违反分支对象唯一性（design §4.13）则拒绝整条命令，此时盘上文件尚未移动。是否在工作树上执行实际的文件移动，由 design §4.6 规定。 |
 | `lfv relink <src-file-id> --onto <dst-file-id>` | 将 src-file-id 当前分支的历史续接到 dst-file-id 当前分支末尾，盘上文件改由 dst-file-id 标识，src-file-id 退役。**仅针对两个 file-id 各自当前分支**，不涉及其他分支，不做 4-way merge 内容合并。专为误产生新文件的场景设计，不应作为日常命令。详见 design §4.7。 |
 | `lfv delete <file>` | 在状态表中将该文件设置为 modified，同时删除该文件。后续 `lfv snap` 时检测到它是 modified 且文件不存在时，追加一条 `object = null` 的 Snapshot，并移除出 `config.yaml` 中 untracked 列表。更新状态表的缓存状态。它的历史完整保留，随时可 `lfv revive`。 |
 | `lfv revive <file> [<FS-ish>]` | 复活已删除的文件。默认恢复点为当前分支最后一条 `object != null` 的快照，可用 `<FS-ish>` 指定其它快照。实现为 rewind（§4.5）：分支名不变，HEAD 移到恢复点，含删除事件的原 HEAD 由自动新建的 `revive/<anchor-short>/<n>` 分支保留；内容写回工作树的最后已知路径。同名新文件要接续旧历史不走 revive，用 `lfv relink`（§5.7）。 |
@@ -263,7 +263,7 @@ LFV 维护一个可重建的**可变索引**（Mutable Index）作为工作区�
 | 命令 | 说明 |
 | ---- | ---- |
 | `lfv status [<file>]` | **省略 `<file>` 时列出所有 `modified` 的跟踪文件**；执行前按 design §4.3 做惰性扫描。默认输出仅含 tracked 变更，每行带 `file-id`（`file:*`）。`--include-untracked` 见 §4.3.2。`--refresh` 强制全量刷新扫描缓存。指定 `<file>` 时仅显示该文件。 |
-| `lfv snap [<file>] [-m <msg>]` | 为某文件创建新快照。**省略 `<file>` 时，自动对所有 `modified` 状态的跟踪文件批量拍照**。若工作区内容与路径均与 HEAD 快照相同则拒绝。若违反分支对象唯一性（design §4.13），则拒绝创建快照并提示用户执行 `lfv rewind`。`--tree` 参数见 §4.3.3。 |
+| `lfv snap [<file>] [-m <msg>]` | 为某文件创建新快照。**省略 `<file>` 时，自动对所有 `modified` 状态的跟踪文件批量拍照**。若工作区内容与路径均与 HEAD 快照相同则拒绝。若违反分支对象唯一性（design §4.13），则拒绝创建快照并提示用户执行 `lfv rewind`。`--snap-all` 与省略 `<file>` 等价，只是让「批量、共用同一条 message」的意图在命令行上可见，不能与 `--tree` 同时使用；`--tree` 参数见 §4.3.3。 |
 | `lfv log <FS-ish>` | 列出快照所在分支的历史，附带 tree 关联信息（来自 tree 反向引用缓存）。`<FS-ish>` 为 `<file>` 时显示其当前分支；为 `<branch>:<file>` 时显示该分支；为 snap-id 时显示该快照所在分支——优先当前分支，否则按分支名排序取第一条含它的分支。`--all` 显示该文件所有分支的历史；`--graph` 以 ASCII 图形式渲染分支拓扑；`--limit N` 限制条数。 |
 | `lfv log --tree` | 列出树面（tree plane）历史视图：沿 Tree Snapshot 链，每个节点显示 message、标签、时间戳。 |
 | `lfv show <FS-ish>` | 输出该快照的元数据；`--content` 同时输出对象内容；`--out <path>` 把内容导出到文件。 |
@@ -360,10 +360,10 @@ lfv snap --snap-all -m "第一版完成"   # 用同一 message 逐个 snap 所�
 | `lfv rewind <TS-ish>` | 把工作区还原到指定 Tree Snapshot 的状态。更新 `.lfv/trees/HEAD`；对每个 file 采用 FF 优先策略（详见 §4.5.1）。 |
 | `lfv branches <file>` | 列出该文件的全部分支。 |
 | `lfv switch <file> <branch>` | 切换该文件的当前分支（同时把工作区内容更新为该分支头部快照）。仅针对文件面，不操作树面。文件处于 `modified` 状态时拒绝。目标分支 HEAD 为 `object = null`（该分支上文件已删除）时，从工作树删除该文件；该路径此后仍可解析（回退到历史中最后拥有它且未退役的 file-id），但一旦被新文件占用就解析到新 file-id，因此稳定引用它应使用 file-id。 |
-| `lfv branch-rename <file> <old> <new>` | 重命名分支。 |
-| `lfv branch-delete <file> <branch>` | 删除分支（仅删除指针，快照和对象保留，以便共享和找回）。 |
+| `lfv branch-rename <file> <old> <new>` | 重命名分支。`<new>` 须满足 §4.6 的命名规则，且在该文件内不与现有分支名、标签名重复；重命名当前分支时同步改写该文件的 `HEAD`。 |
+| `lfv branch-delete <file> <branch>` | 删除分支（仅删除指针，快照和对象保留，以便共享和找回）。拒绝删除当前 HEAD 所在的分支，需先 `lfv switch` 到其它分支。 |
 
-**保留分支命名规则**：回溯类操作自动新建的保留分支统一命名为 `<kind>/<anchor-short>/<n>`。`kind ∈ {rewind, detour, rebase, revive}` 标明来源操作（分别对应本节 rewind、环回处理 design §4.13、§4.7.1、§4.2 revive）；`anchor-short` 为被保留的旧 HEAD 快照 ULID 的末 8 位；`n` 从 1 起递增以避免重名。
+**保留分支命名规则**：回溯类操作自动新建的保留分支统一命名为 `<kind>/<anchor-short>/<n>`。`kind ∈ {rewind, detour, rebase, revive}` 标明来源操作（分别对应本节 rewind、环回处理 design §4.13、§4.7.1、§4.2 revive）；`anchor-short` 为被保留的旧 HEAD 快照 ULID 的末 8 位；`n` 从 1 起递增以避免重名。树面没有分支，`lfv rewind <TS-ish>` 为离开的 tree HEAD 自动创建的标签 `tree:detour/<anchor-short>/<n>` 沿用同一命名规则，其 `anchor-short` 取离开的 tree HEAD 快照 ULID 的末 8 位。
 
 #### 4.5.1 `lfv rewind <TS-ish>` 的执行流程
 
@@ -375,7 +375,7 @@ error: the following files have unsaved changes:
 run `lfv snap` first, or discard changes manually.
 ```
 
-**实际执行**：满足前置后，若当前 tree HEAD 没有任何标签、且不是目标 Tree Snapshot 的祖先，先自动为它打上 `tree:detour/<head-short>` 标签（tree 面没有分支，这是让离开的 tip 保持可达的唯一手段）。然后对 `<TS-ish>` 涉及的每一个文件，都执行一遍 `lfv rewind <file> <FS-ish>`，其中 `<file>` `<FS-ish>` 从 `<TS-ish>` 中推导（清单条目经 tree 反向引用定位 file-id）。同时将 tree HEAD 指向 `<TS-ish>`。
+**实际执行**：满足前置后，若当前 tree HEAD 没有任何标签、且不是目标 Tree Snapshot 的祖先，先自动为它打上 `tree:detour/<anchor-short>/<n>` 标签（命名规则见 §4.5）（tree 面没有分支，这是让离开的 tip 保持可达的唯一手段）。然后对 `<TS-ish>` 涉及的每一个文件，都执行一遍 `lfv rewind <file> <FS-ish>`，其中 `<file>` `<FS-ish>` 从 `<TS-ish>` 中推导（清单条目经 tree 反向引用定位 file-id）。同时将 tree HEAD 指向 `<TS-ish>`。
 
 **效果**：将整个工作树还原为目标 Tree Snapshot 所记录的状态，并推进 tree HEAD。对每个跟踪文件采用 FF 优先策略：若目标内容已可经由某个现有分支 HEAD 访问，则直接切换分支，不新建；否则创建新的分支用于保留原分支指向，将原分支定向至目标快照。文件当前路径与清单路径不同时，同时把盘上文件移回清单路径。目标快照之后新增的文件从工作区删除；快照中存在而当前已 untracked 或 deleted 的文件将字节写回磁盘，交由下次扫描接管。详细的逐文件算法见 design §4.12。
 
@@ -383,18 +383,30 @@ run `lfv snap` first, or discard changes manually.
 
 | 命令 | 说明 |
 | ---- | ---- |
-| `lfv tag <file> <snap> <name>` | 给某文件快照打标签。 |
+| `lfv tag <file> <FS-ish> <name>` | 给某文件快照打标签。 |
 | `lfv tags <file>` | 列出该文件的所有标签。 |
 | `lfv tag-delete <file> <name>` | 删除文件标签。 |
-| `lfv tag --tree <snap> <name>` | 给 Tree Snapshot 打标签（存储为 `tree:<name>`）。 |
+| `lfv tag --tree <TS-ish> <name>` | 给 Tree Snapshot 打标签（存储为 `tree:<name>`）。 |
 | `lfv tags --tree` | 列出所有 tree 标签。 |
 | `lfv tag-delete --tree <name>` | 删除 tree 标签。 |
 
-用户输入的标签名不允许包含 `:` 与控制字符，也不能是命名空间保留字 `file`、`snap`、`tree`、`work`、`blake3`（命名空间隔离）；分支名（`lfv branch-rename`）同此规则。不符合规则的名称直接拒绝创建。标签一旦创建不可改指向；删除后同名可重建。
+**分支名与标签名的命名规则**（两者共用一套规则，在创建时校验，不符合直接拒绝创建）：
+
+- 非空；不以 `/` 开头或结尾；
+- 不含控制字符，不含 `:`（命名空间隔离）；
+- 不含 YAML 指示符字符 `#?,[]{}&*!|>'"%@` 与反引号本身，也不含 `\`；
+- 开头与结尾不含空白字符；
+- 整体不等于 `-`，也不匹配 `/^-\s/`（连字符后紧跟空白）；
+- 不是命名空间保留字 `file`、`snap`、`tree`、`work`、`blake3`；
+- 同一文件内分支名与标签名不得重名：`lfv tag` 创建时检查该文件的分支表，`lfv branch-rename` 创建时检查该文件的标签表；树标签在树面全局唯一。
+
+以上规则同样适用于 LFV 隐式创建的保留分支名与 `tree:detour/...` 标签。各条约束的来源与序列化后果见 design §2.1.1。
+
+标签一旦创建不可改指向；删除后同名可重建。
 
 ### 4.7 合并与变基
 
-合并与变基操作均**仅针对文件面（file plane）分支**，与树面（tree plane）无关。两者都以**同的祖先** 为基点，通过 4-way merge 逐步重放变化，并引入冲突处理机制。即内容层 file-object 是对齐的坐标。
+合并与变基操作均**仅针对文件面（file plane）分支**，与树面（tree plane）无关。两者都以**同的祖先** 为基点，通过 4-way merge 逐步重放变化，并引入冲突处理机制。即内容层 file-object 是对齐的坐标。4-way 指的是定位基点时涉及两条分支上两条不同的基点快照（base-snap-ours 与 base-snap-theirs）；每一步的内容合并本身仍是三路（base-object、ours、theirs）。
 
 > [!note] 注意
 > `lfv merge` 或 `lfv rebase`，与 `lfv relink` 有区别：
