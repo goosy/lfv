@@ -79,10 +79,10 @@ Snapshot history forms a **directed tree (forest), not a DAG**: each Snapshot ha
 
 ## Roadmap
 
-* **v0.1** – `init`, `track`, `snap`, `log`, `status`, `show`
-* **v0.2** – `diff`, `branches`, `rewind`, `switch`
+* **v0.1** – `init`, `config`, `track`, `untrack`, `snap`, `status`, `log`, `show`, `list`, `rebuild-index`, `branches`, `switch`, `rewind`
+* **v0.2** – `diff`, `mv`, `delete`, `revive`, `relink`, `branch-rename`, `branch-delete`
 * **v0.3** – tags, `export` / `import`, `gc`, `verify`
-* **v0.4** – `merge` / `rebase`, conflict handling
-* **v0.5** – tree plane (`snap --tree`, `log --tree`, `rewind tree:`, `tag --tree`), performance tuning
+* **v0.4** – `merge` / `rebase`, `merge --pick`, conflict handling
+* **v0.5** – tree plane (`snap --tree`, `log --tree`, `rewind <TS-ish>`, `tag --tree`), performance tuning
 * **v1.0** – stable CLI, complete docs, cross‑platform CI
 * **v1.1** – remote repositories

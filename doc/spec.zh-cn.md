@@ -705,10 +705,10 @@ Tree Snapshot 同样受到 append-only 约束，不能直接修改。但当 Tree
 
 ## 7. 路线图（粗略）
 
-- **v0.1** ：`init` / `track` / `snap` / `log` / `status` / `show`。
-- **v0.2** ：`diff` / `branches` / `rewind` / `switch`。
+- **v0.1** ：`init` / `config` / `track` / `untrack` / `snap` / `status` / `log` / `show` / `list` / `rebuild-index`；以及 `branches` / `switch` / `rewind`——`lfv snap` 的环回提示要求用户执行 `rewind`，三者必须与 `snap` 同期落地。
+- **v0.2** ：`diff` / `mv` / `delete` / `revive` / `relink` / `branch-rename` / `branch-delete`。
 - **v0.3** ：`tag` 系列、`export` / `import`、`gc`、`verify`。
-- **v0.4** ：`merge` / `rebase`、冲突处理。
-- **v0.5** ：tree plane（`snap --tree` / `log --tree` / `rewind tree:` / `tag --tree`）、性能优化。
+- **v0.4** ：`merge` / `rebase` / `merge --pick`、冲突处理。
+- **v0.5** ：tree plane（`snap --tree` / `log --tree` / `rewind <TS-ish>` / `tag --tree`）、性能优化。
 - **v1.0** ：稳定 CLI 语义，文档完整，跨平台 CI 通过。
 - **v1.1** ：远程仓库，完成协同任务。

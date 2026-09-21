@@ -679,6 +679,16 @@ tree:release: snap:01HZZZ...
 
 任一步之后崩溃的后果：1 后 → 多一个无引用对象（`gc` 回收）；2 后 → 一条悬空快照（`gc --purge` 回收）；3 后 → 索引落后于真理源，由 `lfv rebuild-index` 修复。`ops` 层保证 3→4 在同一函数内完成，且真理源写入永远先于索引写入——索引只会落后，不会领先。
 
+其它多步写入流程沿用同一原则：真理源先于索引，且把可重放而不产生错误结果的步骤排在前面。
+
+| 流程 | 写入顺序 | 崩溃后果 |
+| --- | --- | --- |
+| `rewind`（§4.10） | ① 保留分支写入 `branches.yaml` → ②（loop 模式）append 新快照 → ③ 当前分支指针改写 → ④ `restore_to` 工作区 → ⑤ index | ① 后：多一个分支名指向原 HEAD，无害，重跑即可；② 后：多一条悬空快照；③ 后：工作区与 HEAD 不一致，下次扫描记为 `modified`；④ 后：索引落后，`rebuild-index` 修复 |
+| `relink`（§4.7） | ① 复制链 append 到 dst 日志 → ② dst `branches.yaml` 推进 → ③ src `meta.yaml` 写 `retired` → ④ index | ① 后：dst 日志尾部多一段无分支引用的悬空链（`gc --purge` 可回收），重跑 relink 会重新生成一段新 ULID 的链；② 后：src 未退役，两个 file-id 同时声称同一路径，需重跑 relink；③ 后：索引落后 |
+| `import`（§4.16） | ① 写 `objects/` → ② 归档目录整体 rename 到 `files/<ULID>/` → ③ index `snap_locator` | ① 后：多出无引用对象（`gc` 回收）；② 是原子分界点，rename 成功即视为导入完成；③ 后：索引落后，`rebuild-index` 修复 |
+| `snap --tree`（§4.11） | ① 写 Tree Object → ② append Tree Snapshot → ③ `trees/HEAD` → ④ `trees/tags.yaml` → ⑤ index | ① 后：多一个无引用对象；② 后：悬空 Tree Snapshot；③ 后：标签未写入，重跑 `--tag` 即可；④ 后：索引落后 |
+| `gc --purge`（§3.11） | ① 按可达性裁剪各日志 → ② 按新引用集删除对象 | 两步之间崩溃只会多留对象，安全 |
+
 ### 3.10 `rebuild-index` 算法
 
 1. 重建 schema。
@@ -791,9 +801,9 @@ cli::<cmd>::run(args)
 | `lfv status` | 默认增量扫描（§4.3.2） |
 | `lfv status --refresh` | 强制失效后扫描 |
 | `lfv track`（无参）、`lfv snap`（无参） | 扫描后再批量 track / snap |
-| `lfv snap <file>`、`lfv mv`、`lfv delete`、`lfv rewind`、`lfv switch`、`lfv snap --tree`、`lfv rewind <TS-ish>` | 增量扫描（这些命令需要准确的 `modified` 判定） |
+| `lfv snap <file>`、`lfv track <file>`、`lfv untrack`、`lfv mv`、`lfv delete`、`lfv revive`、`lfv relink`、`lfv rewind`、`lfv switch`、`lfv merge` / `lfv rebase` / `lfv merge --pick`（含 `--continue`）、`lfv snap --tree`、`lfv rewind <TS-ish>` | 增量扫描（这些命令需要准确的 `modified` 判定，或需要知道目标路径在盘上是否已被占用） |
 | `lfv status --include-untracked` | **不**改变扫描；仅多打印状态表中的 `untracked` 行（spec §4.3.2） |
-| `lfv log`、`lfv show`、`lfv diff <FO-ish> <FO-ish>`、`lfv list`、标签/分支查询 | 不扫描 |
+| `lfv log`、`lfv show`、`lfv diff`（含单参数形式——它直接读盘，不依赖索引）、`lfv list`、标签/分支查询 | 不扫描 |
 
 ### 4.4 自动 track（新建文件）
 
@@ -1077,7 +1087,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | snap §4.9 | snap | `ops::snap_file` / `ops::snap_all` | `object`、`snapshot::loop_check`、`tracked`、`index` |
 | rewind / switch / revive §4.10 | rewind, switch, revive | `ops::rewind_file` / `ops::switch` / `ops::revive` | `snapshot`、`object::restore_to`、`tracked`、`index` |
 | snap --tree §4.11 | snap --tree | `ops::tree_snap` | `object::TreeManifest`、`tree`、`index` |
-| rewind <TS-ish> §4.12 | rewind tree: | `ops::tree_rewind` | `tree`、`index.tree_file_refs`、`ops::rewind_file` |
+| rewind <TS-ish> §4.12 | rewind <TS-ish> | `ops::tree_rewind` | `tree`、`index.tree_file_refs`、`ops::rewind_file` |
 | 环回 §4.13 | snap / mv / verify / merge / rebase / relink | `snapshot::loop_check` | — |
 | merge / rebase / --pick §4.14 | merge, rebase, --continue, --abort | `merge::replay` | `diffy`、`ops::rewind_file`、`snapshot`、`object` |
 | verify §4.15 | verify | `ops::verify` | 全部存储层 |
@@ -1090,8 +1100,8 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 
 | 版本 | 命令 | 需要的模块 |
 | --- | --- | --- |
-| v0.1 | init / track / snap / log / status / show | `util repo object snapshot reftable tracked index scan resolve ops(snap, track, log, status, show)`；**`index` 的全部 schema 与 `rebuild-index` 一起在 v0.1 落地**，否则后续无法验证"可重建"这一核心承诺 |
-| v0.2 | diff / branches / rewind / switch | `diff`、`ops(rewind_file, switch)`；`mv` / `delete` / `revive` / `relink` 一并归入 v0.2（只依赖 v0.1 模块） |
+| v0.1 | init / config / track / untrack / snap / status / log / show / list / rebuild-index；branches / switch / rewind | `util repo object snapshot reftable tracked index scan resolve ops(snap, track, untrack, log, status, show, list, rebuild_index, rewind_file, switch)`；**`index` 的全部 schema 与 `rebuild-index` 一起在 v0.1 落地**，否则后续无法验证"可重建"这一核心承诺；`rewind` 与 `branches` / `switch` 也必须落在 v0.1——`lfv snap` 的环回提示要求用户执行 `rewind`（§4.13.2） |
+| v0.2 | diff / mv / delete / revive / relink / branch-rename / branch-delete | `diff`、`ops(mv, delete, revive, relink)`（只依赖 v0.1 模块） |
 | v0.3 | tag / export / import / gc / verify | `ops(gc, verify, export, import)` |
 | v0.4 | merge / rebase / --pick | `merge` |
 | v0.5 | tree plane | `tree`、`ops(tree_snap, tree_rewind)`、`tree_file_refs` |

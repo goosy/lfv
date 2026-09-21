@@ -705,10 +705,10 @@ For collaborative work with repositories in other locations, remote repositories
 
 ## 7. Roadmap (rough)
 
-- **v0.1**: `init` / `track` / `snap` / `log` / `status` / `show`.
-- **v0.2**: `diff` / `branches` / `rewind` / `switch`.
+- **v0.1**: `init` / `config` / `track` / `untrack` / `snap` / `status` / `log` / `show` / `list` / `rebuild-index`; plus `branches` / `switch` / `rewind` — the loopback hint of `lfv snap` tells the user to run `rewind`, so those three must land together with `snap`.
+- **v0.2**: `diff` / `mv` / `delete` / `revive` / `relink` / `branch-rename` / `branch-delete`.
 - **v0.3**: the `tag` family, `export` / `import`, `gc`, `verify`.
-- **v0.4**: `merge` / `rebase`, conflict handling.
-- **v0.5**: tree plane (`snap --tree` / `log --tree` / `rewind tree:` / `tag --tree`), performance tuning.
+- **v0.4**: `merge` / `rebase` / `merge --pick`, conflict handling.
+- **v0.5**: tree plane (`snap --tree` / `log --tree` / `rewind <TS-ish>` / `tag --tree`), performance tuning.
 - **v1.0**: stable CLI semantics, complete documentation, cross-platform CI passing.
 - **v1.1**: remote repositories, completing the collaboration work.

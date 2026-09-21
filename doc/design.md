@@ -679,6 +679,16 @@ The write order of one `snap` (`ops::snap_file`):
 
 The consequence of a crash after each step: after 1 → one unreferenced object more (reclaimed by `gc`); after 2 → one dangling snapshot (reclaimed by `gc --purge`); after 3 → the index lags behind the source of truth, repaired by `lfv rebuild-index`. The `ops` layer guarantees that 3→4 happen inside one function and that writes to the source of truth always precede writes to the index — the index can only lag, never lead.
 
+The other multi-step write flows follow the same principle: the source of truth before the index, and steps that can be replayed without producing a wrong result first.
+
+| Flow | Write order | Consequence of a crash |
+| --- | --- | --- |
+| `rewind` (§4.10) | (1) write the preserved branch into `branches.yaml` → (2) append the new snapshot (loop mode) → (3) rewrite the current branch pointer → (4) `restore_to` the working area → (5) index | after (1): one extra branch name pointing at the old HEAD, harmless, just re-run; after (2): one dangling snapshot; after (3): the working area disagrees with HEAD and the next scan records `modified`; after (4): the index lags, repaired by `rebuild-index` |
+| `relink` (§4.7) | (1) append the copied chain to the dst log → (2) advance dst `branches.yaml` → (3) write `retired` into src `meta.yaml` → (4) index | after (1): the tail of the dst log holds a dangling chain no branch references (reclaimable by `gc --purge`), and re-running relink produces a fresh chain with new ULIDs; after (2): src is not retired, so two file-ids claim the same path and relink must be re-run; after (3): the index lags |
+| `import` (§4.16) | (1) write `objects/` → (2) rename the archive directory wholesale into `files/<ULID>/` → (3) index `snap_locator` | after (1): extra unreferenced objects (reclaimed by `gc`); (2) is the atomic dividing line — a successful rename means the import happened; after (3): the index lags, repaired by `rebuild-index` |
+| `snap --tree` (§4.11) | (1) write the Tree Object → (2) append the Tree Snapshot → (3) `trees/HEAD` → (4) `trees/tags.yaml` → (5) index | after (1): one extra unreferenced object; after (2): a dangling Tree Snapshot; after (3): the tag was not written, just re-run with `--tag`; after (4): the index lags |
+| `gc --purge` (§3.11) | (1) prune every log by reachability → (2) delete objects by the new reference set | a crash between the two steps only leaves extra objects behind, which is safe |
+
 ### 3.10 The `rebuild-index` algorithm
 
 1. Rebuild the schema.
@@ -791,9 +801,9 @@ All the scan actions above update the status table. In addition, `lfv track` and
 | `lfv status` | incremental scan by default (§4.3.2) |
 | `lfv status --refresh` | forced invalidation, then scan |
 | `lfv track` (no argument), `lfv snap` (no argument) | scan first, then batch track / snap |
-| `lfv snap <file>`, `lfv mv`, `lfv delete`, `lfv rewind`, `lfv switch`, `lfv snap --tree`, `lfv rewind <TS-ish>` | incremental scan (these commands need an accurate `modified` determination) |
+| `lfv snap <file>`, `lfv track <file>`, `lfv untrack`, `lfv mv`, `lfv delete`, `lfv revive`, `lfv relink`, `lfv rewind`, `lfv switch`, `lfv merge` / `lfv rebase` / `lfv merge --pick` (including `--continue`), `lfv snap --tree`, `lfv rewind <TS-ish>` | incremental scan (these commands need an accurate `modified` determination, or need to know whether the target path is already taken on disk) |
 | `lfv status --include-untracked` | does **not** change the scan; merely prints the `untracked` rows of the status table as well (spec §4.3.2) |
-| `lfv log`, `lfv show`, `lfv diff <FO-ish> <FO-ish>`, `lfv list`, tag/branch queries | no scan |
+| `lfv log`, `lfv show`, `lfv diff` (including the one-argument form — it reads the disk directly and does not depend on the index), `lfv list`, tag/branch queries | no scan |
 
 ### 4.4 Auto-track (new files)
 
@@ -1077,7 +1087,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | snap §4.9 | snap | `ops::snap_file` / `ops::snap_all` | `object`, `snapshot::loop_check`, `tracked`, `index` |
 | rewind / switch / revive §4.10 | rewind, switch, revive | `ops::rewind_file` / `ops::switch` / `ops::revive` | `snapshot`, `object::restore_to`, `tracked`, `index` |
 | snap --tree §4.11 | snap --tree | `ops::tree_snap` | `object::TreeManifest`, `tree`, `index` |
-| rewind <TS-ish> §4.12 | rewind tree: | `ops::tree_rewind` | `tree`, `index.tree_file_refs`, `ops::rewind_file` |
+| rewind <TS-ish> §4.12 | rewind <TS-ish> | `ops::tree_rewind` | `tree`, `index.tree_file_refs`, `ops::rewind_file` |
 | Loopback §4.13 | snap / mv / verify / merge / rebase / relink | `snapshot::loop_check` | — |
 | merge / rebase / --pick §4.14 | merge, rebase, --continue, --abort | `merge::replay` | `diffy`, `ops::rewind_file`, `snapshot`, `object` |
 | verify §4.15 | verify | `ops::verify` | the whole storage layer |
@@ -1090,8 +1100,8 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 
 | Version | Commands | Required modules |
 | --- | --- | --- |
-| v0.1 | init / track / snap / log / status / show | `util repo object snapshot reftable tracked index scan resolve ops(snap, track, log, status, show)`; **the full `index` schema lands in v0.1 together with `rebuild-index`**, since otherwise the core promise of "rebuildable" cannot be verified later |
-| v0.2 | diff / branches / rewind / switch | `diff`, `ops(rewind_file, switch)`; `mv` / `delete` / `revive` / `relink` are grouped into v0.2 as well (they depend only on v0.1 modules) |
+| v0.1 | init / config / track / untrack / snap / status / log / show / list / rebuild-index; branches / switch / rewind | `util repo object snapshot reftable tracked index scan resolve ops(snap, track, untrack, log, status, show, list, rebuild_index, rewind_file, switch)`; **the full `index` schema lands in v0.1 together with `rebuild-index`**, since otherwise the core promise of "rebuildable" cannot be verified later; `rewind` plus `branches` / `switch` must also land in v0.1 — the loopback hint of `lfv snap` tells the user to run `rewind` (§4.13.2) |
+| v0.2 | diff / mv / delete / revive / relink / branch-rename / branch-delete | `diff`, `ops(mv, delete, revive, relink)` (they depend only on v0.1 modules) |
 | v0.3 | tag / export / import / gc / verify | `ops(gc, verify, export, import)` |
 | v0.4 | merge / rebase / --pick | `merge` |
 | v0.5 | tree plane | `tree`, `ops(tree_snap, tree_rewind)`, `tree_file_refs` |
