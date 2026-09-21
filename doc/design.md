@@ -206,7 +206,7 @@ impl SnapshotLog {
     pub fn get(&self, id) -> Option<&Snapshot>;
     pub fn ancestors(&self, from: SnapId) -> impl Iterator<Item = &Snapshot>;   // from inclusive, follows parent
     pub fn children(&self, id) -> Vec<&Snapshot>;   // for `log --graph`; built lazily
-    pub fn rewrite(&self, keep: impl Fn(&SnapId) -> bool) -> Result<()>;  // gc --purge only; tmp + rename
+    pub fn prune(&self, keep: impl Fn(&SnapId) -> bool) -> Result<()>;    // gc --purge only; drops whole lines, never edits one; tmp + rename
 }
 ```
 
@@ -276,7 +276,7 @@ pub enum FileTarget  { Worktree(FileId, RepoPath), Object(FileId, ObjectHash) } 
 pub enum TreeTarget  { Object(ObjectHash), Snap(SnapId) }                            // <TO-ish> / <TS-ish>
 ```
 
-Disambiguation order for a bare token (purely syntactic, no index lookup): the `snap:` prefix (snap-id; `snap_locator` tells whether it is on the file or tree plane) → the `file:` prefix (file-id) → the `work:` prefix (working-area literal) → the `tree:` prefix (tree tag) → the `blake3:` prefix (tree-id) → when it contains `:`, it is split at the first `:` as `<ref>:<file>`, and the `<file>` part is classified again by these rules as a file-id or a path → otherwise treated as a path (`a`, `./a`, `../a` relative to cwd, `/a/b` repository-absolute; operating-system absolute paths and drive letters are rejected; `\` in input is read as `/`, and several leading `/` count as one; normalized into a `RepoPath`, an error if it leaves the repository; looked up in `tracked.path`, then in `tracked.head_path` (a rename pending write), then as the file-id that last held that path in history). Branch names and tag names may not appear as bare tokens; in commands that already carry a `<file>` argument, a bare token in the `<FS-ish>` position is resolved first as a snap-id, then as a branch name of that file, then as a tag name.
+Disambiguation order for a bare token (purely syntactic, no index lookup): the `snap:` prefix (snap-id; `snap_locator` tells whether it is on the file or tree plane) → the `file:` prefix (file-id) → the `work:` prefix (working-area literal) → the `tree:` prefix (tree tag) → the `blake3:` prefix (tree-id) → when it contains `:`, it is split at the first `:` as `<ref>:<file>`, and the `<file>` part is classified again by these rules as a file-id or a path → otherwise treated as a path (`a`, `./a`, `../a` relative to cwd, `/a/b` repository-absolute; operating-system absolute paths and drive letters are rejected; `\` in input is read as `/`, and several leading `/` count as one; normalized into a `RepoPath`, an error if it leaves the repository; looked up in `tracked.path`, then in `tracked.head_path` (a rename pending write), then as the last non-retired file-id that held that path in history, taking among several candidates the one whose HEAD snapshot has the latest `created_at` and failing that the largest snap-id). Branch names and tag names may not appear as bare tokens; in commands that already carry a `<file>` argument, a bare token in the `<FS-ish>` position is resolved first as a snap-id, then as a branch name of that file, then as a tag name.
 
 Which file-id / plane a bare `snap:*` belongs to is answered by `index.snap_locator` (§3.6).
 
@@ -480,7 +480,7 @@ The format is a valid YAML subset, so external programs can read it with a stand
 
 ### 3.6 Mutable index and the `index.db` schema
 
-The mutable index lives in `index.db` and records the working-area state of each file in the current working directory plus branch/tag caches. It is a rebuildable cache of current state and is not part of the immutable history objects. Storage objects cannot be tampered with and are the repository's source of truth; mutable state can be rebuilt when it goes wrong (as long as the Objects and Snapshots are still there).
+The mutable index lives in `index.db` and records the working-area state of each file in the current working directory plus branch/tag caches. It is a rebuildable cache of current state and is not part of the immutable history objects. Storage objects and the Snapshot chain cannot be tampered with; together with the yaml / HEAD files under `.lfv` they form the repository's source of truth, and `index.db` can be rebuilt from that source of truth whenever it goes wrong.
 
 `index.db` holds only **rebuildable** cached data; every source of truth lives in the filesystem (the Snapshot chain, the yaml files). The tables:
 
@@ -697,7 +697,7 @@ The consequence of a crash after each step: after 1 → one unreferenced object 
 - Roots: file plane = every branch head of every file-id (including retired ones) + every tag + the snapshots referenced by an existing `REPLAY.yaml`; tree plane = `trees/HEAD` + every `tree:` tag.
 - Reachable snapshots = the closure from the roots along `parent`. Reachable objects = the `object` of every reachable snapshot ∪ the entries in the manifests of reachable Tree Snapshots.
 - `lfv gc`: deletes objects that **no snapshot (dangling ones included) references**; the logs are left alone.
-- `lfv gc --purge`: first `SnapshotLog::rewrite` each log according to reachability (the only permitted log rewrite), then delete objects according to the new reference set. A crash between the two steps is safe (it only leaves extra objects behind).
+- `lfv gc --purge`: first `SnapshotLog::prune` each log according to reachability: unreachable snapshot lines are dropped whole and the kept lines stay byte-for-byte unchanged — the only change to a log besides appending, which deletes but never modifies an existing record; then delete objects according to the new reference set. A crash between the two steps is safe (it only leaves extra objects behind).
 
 ## 4. Internal Mechanisms
 
@@ -821,7 +821,7 @@ While a path is in the config untracked list and exists on disk, a scan does not
                         lfv relink file:01HA7EEE --onto file:023BHCA1
 ```
 
-How the lookup works: `snap_locator` cannot be searched by path, so for a newly registered path LFV searches the file-id logs for "the last file-id that owned this path and whose HEAD object is null"; this happens only once, when level B discovers the new path. Whether to add a `tracked.prior_file_id` column as a cache or to re-query on every `status` is left to the second step, when this design is compared against the existing skeleton — both implementations satisfy the behavior in this section, are a purely internal optimization choice, and affect neither the spec nor any other part of this document.
+How the lookup works: `snap_locator` cannot be searched by path, so for a newly registered path LFV searches the file-id logs for "the last file-id that owned this path and whose HEAD object is null"; this happens only once, when level B discovers the new path. That result is **not cached**: the `tracked` table has no `prior_file_id` column, and every `lfv status` looks it up again. Files in this `A` state are few and the hint disappears after the first snap, so the cost of re-querying is negligible; a cache column would mean a schema change plus one more recomputation rule in `rebuild-index`, which is not worth it.
 
 The hint appears only while auto-track has produced a new `file-id`; once that new `file-id` has its first Snapshot, it is an independent file and the hint disappears.
 
@@ -882,7 +882,7 @@ src-file-id has already produced several Snapshots (the chain being `snap_A1 -> 
 
 `lfv delete <file>` (`ops::delete`): deletes the file if it exists on disk and sets the `tracked` row to `present = 0, status = modified`. On the next `lfv snap`, LFV consults the current filesystem existence of the target file: if the file does not exist, it appends an `object = null` Snapshot and deletes that `tracked` row.
 
-From then on that file-id can no longer be resolved through its current path, but the last path information is preserved in that Snapshot, so `lfv list --deleted` can still display it by path.
+From then on that file-id has no `tracked` row. Its last path is preserved in that Snapshot and still resolves to it (by falling back to the last non-retired file-id that held the path, see §2.8), but once a new file takes the path it resolves to the new file-id; `lfv list --deleted` can still display it by path.
 
 The file's **history is preserved in full**: `lfv log` / `lfv show` / `lfv diff` still work. To "revive" it, use `lfv revive` (§4.10) or `lfv rewind <file> <snap>` directly; both automatically create a preserving branch (so the existing delete event is not destroyed).
 
@@ -1080,7 +1080,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | merge / rebase / --pick §4.14 | merge, rebase, --continue, --abort | `merge::replay` | `diffy`, `ops::rewind_file`, `snapshot`, `object` |
 | verify §4.15 | verify | `ops::verify` | the whole storage layer |
 | import §4.16 | import | `ops::import` | `snapshot` (digest check), `object` (deduplicated write), `tracked` (meta/branches/tags copy), `index.snap_locator` |
-| gc §3.11 | gc | `ops::gc` | `snapshot::rewrite`, `object::remove` |
+| gc §3.11 | gc | `ops::gc` | `snapshot::prune`, `object::remove` |
 | rebuild-index §3.10 | rebuild-index | `ops::rebuild_index` | `index`, `tracked`, `tree` |
 | log / show / diff / list / branches / tags | queries | `ops::query::*` | `resolve`, `snapshot`, `diff`, `index` |
 

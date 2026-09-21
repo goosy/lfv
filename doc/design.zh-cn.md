@@ -206,7 +206,7 @@ impl SnapshotLog {
     pub fn get(&self, id) -> Option<&Snapshot>;
     pub fn ancestors(&self, from: SnapId) -> impl Iterator<Item = &Snapshot>;   // from inclusive, follows parent
     pub fn children(&self, id) -> Vec<&Snapshot>;   // for `log --graph`; built lazily
-    pub fn rewrite(&self, keep: impl Fn(&SnapId) -> bool) -> Result<()>;  // gc --purge only; tmp + rename
+    pub fn prune(&self, keep: impl Fn(&SnapId) -> bool) -> Result<()>;    // gc --purge only; drops whole lines, never edits one; tmp + rename
 }
 ```
 
@@ -276,7 +276,7 @@ pub enum FileTarget  { Worktree(FileId, RepoPath), Object(FileId, ObjectHash) } 
 pub enum TreeTarget  { Object(ObjectHash), Snap(SnapId) }                            // <TO-ish> / <TS-ish>
 ```
 
-裸 token 的消歧顺序（纯语法判定，不查索引）：`snap:` 前缀（snap-id；归属 file / tree plane 由 `snap_locator` 给出）→ `file:` 前缀（file-id）→ `work:` 前缀（工作区字面量）→ `tree:` 前缀（树标签）→ `blake3:` 前缀（tree-id）→ 含 `:` 时在第一个 `:` 处拆为 `<ref>:<file>`，`<file>` 部分再按本规则解析为 file-id 或路径 → 否则视为路径（`a`、`./a`、`../a` 相对 cwd，`/a/b` 为仓库内绝对路径；拒绝操作系统绝对路径与盘符；输入中 `\` 视同 `/`，开头连续多个 `/` 视同一个；规范化为 `RepoPath`，越出仓库报错；查 `tracked.path`，再查 `tracked.head_path`（待落盘的改名），再查历史中最后拥有该路径的 file-id）。分支名与标签名不能作为裸 token 出现；在已带 `<file>` 参数的命令中，`<FS-ish>` 位置的裸 token 先按 snap-id，再按该文件的分支名，再按标签名解析。
+裸 token 的消歧顺序（纯语法判定，不查索引）：`snap:` 前缀（snap-id；归属 file / tree plane 由 `snap_locator` 给出）→ `file:` 前缀（file-id）→ `work:` 前缀（工作区字面量）→ `tree:` 前缀（树标签）→ `blake3:` 前缀（tree-id）→ 含 `:` 时在第一个 `:` 处拆为 `<ref>:<file>`，`<file>` 部分再按本规则解析为 file-id 或路径 → 否则视为路径（`a`、`./a`、`../a` 相对 cwd，`/a/b` 为仓库内绝对路径；拒绝操作系统绝对路径与盘符；输入中 `\` 视同 `/`，开头连续多个 `/` 视同一个；规范化为 `RepoPath`，越出仓库报错；查 `tracked.path`，再查 `tracked.head_path`（待落盘的改名），再查历史中最后拥有该路径且未退役的 file-id，多个候选取其 HEAD 快照 `created_at` 最晚者、仍相同则取 snap-id 最大者）。分支名与标签名不能作为裸 token 出现；在已带 `<file>` 参数的命令中，`<FS-ish>` 位置的裸 token 先按 snap-id，再按该文件的分支名，再按标签名解析。
 
 裸 `snap:*` 的所属 file-id / plane 由 `index.snap_locator` 给出（§3.6）。
 
@@ -480,7 +480,7 @@ Tree Object 通常很小（每个跟踪文件一行），低于 `min_bytes` 压�
 
 ### 3.6 可变索引（Mutable Index）与 `index.db` 表结构
 
-可变索引位于 `index.db`，记录当前工作目录中各文件的工作区状态及分支/标签缓存。它是可重建的当前状态缓存，不属于不可变历史对象。存储对象不可篡改，是仓库的真理之源；可变状态出错可以重建（只要 Object + Snapshot 还在）。
+可变索引位于 `index.db`，记录当前工作目录中各文件的工作区状态及分支/标签缓存。它是可重建的当前状态缓存，不属于不可变历史对象。存储对象与 Snapshot 链不可篡改，它们与 `.lfv` 下的 yaml / HEAD 文件共同构成仓库的真理源；`index.db` 出错可以随时从真理源重建。
 
 `index.db` 只存放**可重建**的缓存数据，真理源均在文件系统（Snapshot 链、yaml 文件）中。各表说明：
 
@@ -697,7 +697,7 @@ tree:release: snap:01HZZZ...
 - 根：file plane = 所有 file-id（含退役）的所有分支头 + 所有标签 + 存在的 `REPLAY.yaml` 里引用的快照；tree plane = `trees/HEAD` + 所有 `tree:` 标签。
 - 可达快照 = 从根沿 `parent` 闭包。可达对象 = 可达快照的 `object` ∪ 可达 Tree Snapshot 清单中的条目。
 - `lfv gc`：删除**任何快照（含悬空）都不引用**的对象；不动日志。
-- `lfv gc --purge`：先按可达性 `SnapshotLog::rewrite` 每个日志（唯一允许的日志重写），再按新的引用集删除对象。两步之间崩溃是安全的（只会多留对象）。
+- `lfv gc --purge`：先按可达性对每个日志执行 `SnapshotLog::prune`：不可达快照整行丢弃，保留的行逐字节不变——这是日志除追加之外唯一的变更，只删除、从不改写已有记录；再按新的引用集删除对象。两步之间崩溃是安全的（只会多留对象）。
 
 ## 4. 内部机制
 
@@ -821,7 +821,7 @@ cli::<cmd>::run(args)
                         lfv relink file:01HA7EEE --onto file:023BHCA1
 ```
 
-查找方式：`snap_locator` 无法按路径反查，因此对新登记的路径在各 file-id 日志中查"最后拥有该路径且 HEAD object 为 null 的 file-id"；只在层级 B 发现新路径时做一次。结果是否加一列 `tracked.prior_file_id` 缓存、还是每次 `status` 重查，留到第二步对照现有骨架时再定——两种实现都满足本节行为，属于纯内部优化选择，不影响 spec 或本文其它部分。
+查找方式：`snap_locator` 无法按路径反查，因此对新登记的路径在各 file-id 日志中查"最后拥有该路径且 HEAD object 为 null 的 file-id"；只在层级 B 发现新路径时做一次。该结果**不缓存**：`tracked` 表不设 `prior_file_id` 列，每次 `lfv status` 重新查找。这类 `A` 状态的文件很少，且首次 snap 后提示即消失，重查开销可以忽略；加一列缓存则要改 schema，并在 `rebuild-index` 中增加一条重算规则，不值得。
 
 此提示仅在自动 track 产生新 `file-id` 时出现；一旦新 `file-id` 落下首条 Snapshot，它就是独立的文件，提示消失。
 
@@ -882,7 +882,7 @@ src-file-id 已经产生了若干 Snapshot（链为 `snap_A1 -> snap_A2 -> ... -
 
 `lfv delete <file>`（`ops::delete`）：盘上存在则删除该文件；`tracked` 行置 `present = 0, status = modified`。后继 `lfv snap` 时，LFV 会参照目标文件的当前 FS 存在状态：若文件不存在，则追加 `object = null` 的 Snapshot，并删除该 `tracked` 行。
 
-此后该 file-id 不再能通过当前路径解析，但最后的路径信息保留在该 Snapshot 中，`lfv list --deleted` 仍可按路径显示。
+此后该 file-id 不再有 `tracked` 行。它的最后路径保留在该 Snapshot 中，该路径仍可解析到它（回退到历史中最后拥有该路径且未退役的 file-id，见 §2.8），但一旦被新文件占用就解析到新 file-id；`lfv list --deleted` 仍可按路径显示。
 
 文件 **历史完整保留**：仍可 `lfv log` / `lfv show` / `lfv diff` 查询；想"复活"用 `lfv revive`（§4.10）或直接 `lfv rewind <file> <snap>`，二者都会自动新建保留分支（不破坏既有删除事件）。
 
@@ -1080,7 +1080,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | merge / rebase / --pick §4.14 | merge, rebase, --continue, --abort | `merge::replay` | `diffy`、`ops::rewind_file`、`snapshot`、`object` |
 | verify §4.15 | verify | `ops::verify` | 全部存储层 |
 | import §4.16 | import | `ops::import` | `snapshot`（digest 校验）、`object`（去重写入）、`tracked`（meta/branches/tags 拷贝）、`index.snap_locator` |
-| gc §3.11 | gc | `ops::gc` | `snapshot::rewrite`、`object::remove` |
+| gc §3.11 | gc | `ops::gc` | `snapshot::prune`、`object::remove` |
 | rebuild-index §3.10 | rebuild-index | `ops::rebuild_index` | `index`、`tracked`、`tree` |
 | log / show / diff / list / branches / tags | 查询类 | `ops::query::*` | `resolve`、`snapshot`、`diff`、`index` |
 

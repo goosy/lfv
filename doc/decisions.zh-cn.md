@@ -29,9 +29,9 @@ LFV 把仓库快照当成用户可选，而单个文件的快照是必须。
 
 ## 3. 内容寻址 + 去重
 
-在存储机制上与 GIT 保持一致。内容寻址的键值，便是 `file-id` ，它是文件的持久身份，是唯一稳定引用。
+在存储机制上与 GIT 保持一致：对象按内容寻址，键是原始字节的 blake3 hash，内容相同即共享同一对象。文件的持久身份则是 `file-id`——track 时分配的 ULID，与内容和路径都无关，是唯一稳定引用。
 
-`file-id` 在 track 时分配，贯穿文件整个生命周期（含删除后），是文件消失、路径变更后唯一仍然有效的引用手段。文件删除或改名后，路径不再可解析。用户和脚本需要一个稳定的句柄来查询历史（`lfv log`）、恢复内容（`lfv revive`）或续接历史（`lfv relink`）。
+`file-id` 在 track 时分配，贯穿文件整个生命周期（含删除后），是文件消失、路径变更后唯一稳定的引用手段。文件删除或改名后，旧路径仍可解析到它，但一旦被新文件占用就指向新文件，因此路径不是稳定句柄。用户和脚本需要一个稳定的句柄来查询历史（`lfv log`）、恢复内容（`lfv revive`）或续接历史（`lfv relink`）。
 
 路径是常规场景下的便利别名，所有接受 `<file>` 的命令同时接受路径或 `file:*`。两者在所有命令中均被接受，用户在日常操作中无需被迫查询 `file-id`。
 
@@ -186,15 +186,15 @@ Tree Snapshot 链没有分支集合，只有：标签（`tree:` 前缀，全局�
 
 分支的核心价值在于支持"同一文件的多条独立演化线"——这是 file 面的典型需求（用户需要在不同分支上实验不同内容）。Tree 是里程碑式的仓库快照，其使用模式是线性推进，不需要也不应该有多条并行演化线。引入 tree 分支只会增加心智负担，而不带来实质好处。
 
-**tree HEAD 存储在单独文件 `.lfv/trees/HEAD` 中**：tree HEAD 是不可从 Snapshot 链重建的当前状态（它记录"用户当前位于 tree 历史的哪个节点"，而非哪条 Snapshot 是最新的）。`index.db` 里的其他状态（分支指针、file HEAD）在 `rebuild-index` 时可以从 Snapshot 链派生重建；tree HEAD 一旦丢失无法重建，因此应独立于可重建的 `index.db`，以单独文件持久化，避免在 `rebuild-index` 时被意外覆盖。
+**tree HEAD 存储在单独文件 `.lfv/trees/HEAD` 中**：tree HEAD 是不可从 Snapshot 链重建的当前状态（它记录"用户当前位于 tree 历史的哪个节点"，而非哪条 Snapshot 是最新的）。它与 file HEAD、分支表一样记录的是用户意志：`index.db` 里的分支指针缓存在 `rebuild-index` 时从 `branches.yaml` 重建，而 tree HEAD 一旦丢失无从推导，因此以单独文件持久化、自身即真理源，不放进可重建的 `index.db`，避免在 `rebuild-index` 时被覆盖。
 
 `lfv switch <branch>` 只针对 file 分支，不提供 tree 的切换操作（因为 tree 没有分支）。tree 的位置变更只通过 `lfv rewind <TS-ish>` 操作。
 
-### 11.3 tree rewind 不直接操作 config、分支或状态表
+### 11.3 tree rewind 不改变跟踪身份，也不碰 config
 
-`lfv rewind <TS-ish>` 执行时，只做两件事：更新 `.lfv/trees/HEAD`，以及对工作区文件执行字节级操作（写入或删除）。它不直接调用 `track`/`untrack`/`revive` 命令，不修改 `config.yaml` 动态 untracked 列表，不修改任何分支指针或状态表。
+`lfv rewind <TS-ish>` 不直接调用 `track`/`untrack`/`delete`/`revive` 命令，不修改 `config.yaml` 动态 untracked 列表，也不改变任何 file-id 的跟踪身份——不分配新 file-id、不退役、不登记也不注销跟踪。它更新 `.lfv/trees/HEAD`，并对工作区文件执行字节级操作（写入或删除）；对清单中 file-id 仍活跃的文件，它还经 `rewind_file` / `switch` 移动该文件的分支指针并刷新 `tracked` 行的缓存字段（见 §11.4）——这是回溯该文件内容本身所必需的，与跟踪身份是两回事。对不在清单中的文件（只删工作区文件）与 file-id 已不活跃的条目（只写回字节），则纯粹是字节操作。
 
-`config.yaml`、分支和状态表属于 `track`/`untrack`/`delete`/`revive` 命令的职责边界。tree rewind 越过这个边界直接操作，会使用户难以预测哪些命令会对 config 产生副作用，破坏命令职责的清晰性。
+`config.yaml` 与 file-id 的生死属于 `track`/`untrack`/`delete`/`revive` 命令的职责边界。tree rewind 越过这个边界直接操作，会使用户难以预测哪些命令会对 config 产生副作用，破坏命令职责的清晰性。
 
 字节操作之后，现有的惰性扫描机制（`design.zh-cn.md §4.3`）会在下次 `lfv status` 或 `lfv snap` 时自然感知变化并驱动状态更新。tree rewind 产生的"新增文件"和"消失文件"与 OS 直接操作文件产生的效果完全等同，用户的心智模型无需特殊化。
 
@@ -227,7 +227,7 @@ Tree Object 清单采用 YAML 块序列格式（`- "path": hash`），而非 JSO
 
 ## 12. 存储对象仅两类
 
-仓库内真正不可变的存储对象分为 **Object** 与 **Snapshot** 两大类，每类各有两种子类型。其余概念均为可变索引（详见 spec §3.4、`design.zh-cn.md §3.6`）。
+仓库内真正不可变的存储对象分为 **Object** 与 **Snapshot** 两大类，每类各有两种子类型。其余概念分两类：`index.db` 里的可重建缓存（详见 spec §3.4、`design.zh-cn.md §3.6`），以及记录用户意志、无法从快照链推导的可变文件——HEAD、分支表、标签表与 `config.yaml`（见 `design.zh-cn.md §3.7`、§3.8）。
 
 | 大类 | 子类型 | 内容 | 寻址方式 |
 | --- | --- | --- | --- |

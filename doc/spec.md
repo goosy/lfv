@@ -96,7 +96,7 @@ A File Object is the content-addressed storage unit for a single file's raw byte
 
 - A separate ULID is assigned **at first track**.
 - It has **no derivation relationship whatsoever** with the file path and does not change on rename or move; a `file-id` remains valid after the file is deleted.
-- A file's "current path" is maintained by the mutable index (§3.4) and continuously derived and updated from events on the Snapshot chain — the Snapshot chain is the single source of truth, and all mutable state can be rebuilt from it.
+- A file's "current path" is maintained by the mutable index (§3.4) and continuously derived and updated from events on the Snapshot chain — the mutable state in `index.db` can all be rebuilt from Objects, the Snapshot chain, and the metadata files under `.lfv`; `HEAD`, the branch table, the tag table, and `config.yaml` record user intent, cannot be derived from the snapshot chain, and are each a source of truth in their own right.
 
 #### 3.2.2 Tree Object
 
@@ -173,7 +173,7 @@ The co-referent ancestor snaps of two branches may be the same snapshot, or diff
 
 ### 3.4 Mutable Index
 
-LFV maintains a rebuildable **Mutable Index** as a cache of working-area state, so that no command has to scan the whole filesystem; the recommended implementation is an embedded database. Storage objects (Objects) and the Snapshot chain are the repository's single source of truth, so a corrupted index can be rebuilt from the source of truth at any time (`lfv rebuild-index`, §4.8). See design §3.6 for details.
+LFV maintains a rebuildable **Mutable Index** as a cache of working-area state, so that no command has to scan the whole filesystem; the recommended implementation is an embedded database. Storage objects (Objects), the Snapshot chain, and the metadata files under `.lfv` (`HEAD`, the branch table, the tag table, `config.yaml`) together form the repository's source of truth, so a corrupted index can be rebuilt from it at any time (`lfv rebuild-index`, §4.8). See design §3.6 for details.
 
 ### 3.5 YAML Constraints on Metadata Files
 
@@ -202,7 +202,7 @@ Goal: what LFV writes must be legal YAML that any standard YAML parser can read 
 The parameter conventions below all ultimately resolve to one of the four storage objects (File Object, Tree Object, File Snapshot, Tree Snapshot). Branch names and tag names live in **a namespace that is independent per file** (§2, goal 2), so they may not appear on their own and must always carry file context.
 
 - `<file>` locates a tracked file (not one of its versions), in two spellings:
-  - a path: `a`, `./a` and `../a` are relative to the current working directory; `/a/b`, starting with `/`, is a repository-absolute path (rooted at the repository root, not an operating-system absolute path). Operating-system absolute paths and drive letters are not accepted, so the same spelling works on every platform. Every path is normalized to a path relative to the repository root, and one that resolves outside the repository is an error; a path that has disappeared from disk resolves to the file-id that last held that path in history;
+  - a path: `a`, `./a` and `../a` are relative to the current working directory; `/a/b`, starting with `/`, is a repository-absolute path (rooted at the repository root, not an operating-system absolute path). Operating-system absolute paths and drive letters are not accepted, so the same spelling works on every platform. Every path is normalized to a path relative to the repository root, and one that resolves outside the repository is an error; a path that has disappeared from disk resolves to the last non-retired file-id that held that path in history (among several candidates, the one whose HEAD snapshot has the latest `created_at`, and failing that the largest snap-id); once that path is taken by a new file it resolves to the new active file-id, so a file that has disappeared is best referenced by file-id;
   - `<file-id>`, i.e. `file:<ULID>`.
 - `<FS-ish>` is an argument that resolves to a File Snapshot, including:
   - `<snap-id>`: a snapshot identifier `snap:<ULID>`, globally unique and carrying its own file affiliation;
@@ -359,7 +359,7 @@ Text files use a line-based diff (3 lines of context by default); binary files s
 | `lfv rewind <file> <FS-ish>` | Restore the working-area file content to the File Object of the snapshot that `<FS-ish>` points to (content only, the path is not changed; when the HEAD snapshot path differs from the on-disk path, the next `lfv snap` records an `R`). **The branch name is unchanged**: a preserving branch `rewind/<anchor-short>/<n>` pointing at the original HEAD is created automatically first, then the current branch's HEAD is moved to the target snapshot. Refuses to run while the file is in `modified` state (run `lfv snap` first, or discard the changes yourself), except in loopback mode. When used to resolve a loopback event, the user passes the matched ancestor snapshot itself, and LFV splices according to the rules in design §4.13. |
 | `lfv rewind <TS-ish>` | Restore the working area to the state of the specified Tree Snapshot. Updates `.lfv/trees/HEAD`; applies an FF-priority strategy per file (details in §4.5.1). |
 | `lfv branches <file>` | List all branches of that file. |
-| `lfv switch <file> <branch>` | Switch that file's current branch (also updating the working-area content to that branch's head snapshot). File plane only; the tree plane is not touched. Refuses while the file is in `modified` state. When the target branch's HEAD has `object = null` (the file is deleted on that branch), the file is removed from the working tree, after which it can only be referenced by file-id. |
+| `lfv switch <file> <branch>` | Switch that file's current branch (also updating the working-area content to that branch's head snapshot). File plane only; the tree plane is not touched. Refuses while the file is in `modified` state. When the target branch's HEAD has `object = null` (the file is deleted on that branch), the file is removed from the working tree; that path still resolves afterwards (falling back to the last non-retired file-id that held it), but once a new file takes the path it resolves to the new file-id, so referencing it stably means using the file-id. |
 | `lfv branch-rename <file> <old> <new>` | Rename a branch. |
 | `lfv branch-delete <file> <branch>` | Delete a branch (only the pointer is deleted; snapshots and objects are retained so they can be shared and recovered). |
 

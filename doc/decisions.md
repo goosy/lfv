@@ -29,9 +29,9 @@ In-place mutation provides no meaningful benefit while sacrificing all three pro
 
 ## 3. Content addressing + deduplication
 
-LFV follows the same storage mechanism as Git. The key of the content-addressed store is the `file-id`, which is the persistent identity of a file and its only stable reference.
+LFV follows the same storage mechanism as Git: objects are content-addressed, keyed by the blake3 hash of their raw bytes, so identical content shares one object. A file's persistent identity, by contrast, is its `file-id` — a ULID assigned at track time, independent of both content and path, and its only stable reference.
 
-A `file-id` is assigned when a file is tracked and persists throughout the file's entire lifecycle (including after deletion). It remains the only valid means of reference after a file disappears or its path changes. Once a file is deleted or renamed, the path no longer resolves. Users and scripts need a stable handle for querying history (`lfv log`), restoring content (`lfv revive`), or continuing history (`lfv relink`).
+A `file-id` is assigned when a file is tracked and persists throughout the file's entire lifecycle (including after deletion). It remains the only stable means of reference after a file disappears or its path changes. After a delete or rename the old path still resolves to the file, but once a new file takes that path it points at the new file instead, so a path is not a stable handle. Users and scripts need a stable handle for querying history (`lfv log`), restoring content (`lfv revive`), or continuing history (`lfv relink`).
 
 Paths are convenience aliases for the common case. Any command that accepts `<file>` also accepts either a path or an `file:*` identifier. Both forms are accepted everywhere, so users are never forced to look up a `file-id` during routine work.
 
@@ -186,15 +186,15 @@ Tree Snapshot chains have no branch set. They have only: tags (prefixed with `tr
 
 The core value of branches is to support "multiple independent evolution lines of the same file" — a typical need on the file plane (users need to experiment with different content on different branches). Trees are milestone-style repository snapshots; their usage pattern is linear progression, and they neither need nor should have multiple parallel evolution lines. Introducing tree branches would only increase cognitive load without meaningful benefit.
 
-**Tree HEAD is stored in a separate file `.lfv/trees/HEAD`**: tree HEAD is a current state that cannot be reconstructed from the Snapshot chain (it records "which node the user is currently on in tree history", not which Snapshot is the latest). Other state in `index.db` (branch pointers, file HEAD) can be rebuilt from Snapshot chains during `rebuild-index`; tree HEAD, once lost, cannot be rebuilt, so it must be persisted independently of the rebuildable `index.db` to avoid accidental overwrite during `rebuild-index`.
+**Tree HEAD is stored in a separate file `.lfv/trees/HEAD`**: tree HEAD is a current state that cannot be reconstructed from the Snapshot chain (it records "which node the user is currently on in tree history", not which Snapshot is the latest). Like a file HEAD and the branch tables, it records user intent: the branch-pointer cache in `index.db` is rebuilt from `branches.yaml` during `rebuild-index`, whereas a lost tree HEAD cannot be derived from anything, so it is persisted in a file of its own as its own source of truth, outside the rebuildable `index.db`, where `rebuild-index` can never overwrite it.
 
 `lfv switch <branch>` only operates on file branches; there is no tree switch operation (because trees have no branches). Tree position changes are done only via `lfv rewind <TS-ish>`.
 
-### 11.3 tree rewind does not directly operate on config, branches, or status table
+### 11.3 tree rewind does not change tracking identity, and does not touch config
 
-When `lfv rewind <TS-ish>` executes, it does only two things: update `.lfv/trees/HEAD`, and perform byte-level operations (write or delete) on working directory files. It does not directly call `track`/`untrack`/`revive` commands, does not modify the dynamic untracked list in `config.yaml`, and does not modify any branch pointers or the status table.
+`lfv rewind <TS-ish>` does not directly call the `track`/`untrack`/`delete`/`revive` commands, does not modify the dynamic untracked list in `config.yaml`, and does not change the tracking identity of any file-id — it allocates no new file-id, retires none, and neither registers nor deregisters tracking. It updates `.lfv/trees/HEAD` and performs byte-level operations (write or delete) on working directory files; for a file in the manifest whose file-id is still active, it additionally moves that file's branch pointer and refreshes the cached fields of its `tracked` row through `rewind_file` / `switch` (see §11.4) — that is what rewinding the file's own content requires, and is a different matter from tracking identity. For files not in the manifest (the working-tree file is merely deleted) and for entries whose file-id is no longer active (the bytes are merely written back), it is a pure byte operation.
 
-`config.yaml`, branches, and the status table belong to the responsibility boundaries of `track`/`untrack`/`delete`/`revive` commands. If tree rewind crossed these boundaries, users would find it hard to predict which commands have side effects on config, breaking command responsibility clarity.
+`config.yaml` and the life and death of a file-id belong to the responsibility boundaries of the `track`/`untrack`/`delete`/`revive` commands. If tree rewind crossed these boundaries, users would find it hard to predict which commands have side effects on config, breaking command responsibility clarity.
 
 After byte operations, the existing lazy scanning mechanism (`design.md §4.3`) will naturally detect changes and drive state updates on the next `lfv status` or `lfv snap`. "Newly created files" and "disappeared files" produced by tree rewind are identical in effect to files directly manipulated by the OS, so the user's mental model does not need special casing.
 
@@ -227,7 +227,7 @@ The Tree Object manifest uses YAML block sequence format (`- "path": hash`), not
 
 ## 12. Two storage object categories, each with two subtypes
 
-The truly immutable storage objects in the repository fall into two categories — **Object** and **Snapshot** — each with two subtypes. Everything else is mutable index (see spec §3.4 and `design.md §3.6`).
+The truly immutable storage objects in the repository fall into two categories — **Object** and **Snapshot** — each with two subtypes. Everything else falls into two classes: the rebuildable cache inside `index.db` (see spec §3.4 and `design.md §3.6`), and the mutable files that record user intent and cannot be derived from the snapshot chain — `HEAD`, the branch table, the tag table, and `config.yaml` (see `design.md §3.7` and §3.8).
 
 | Category | Subtype | Contents | Addressing |
 | --- | --- | --- | --- |
