@@ -45,11 +45,11 @@ lfv snap -m "first version"
 
 lfv log notes.md
 lfv diff notes.md
-lfv rewind notes.md snap:01HXYZ   # automatically creates a new branch
+lfv rewind notes.md snap:01HXYZ   # old HEAD is kept on an auto-created branch
 
 lfv mv notes.md archive/notes.md  # rename is a first‑class event
 lfv delete old.md && lfv snap     # deletion is part of history
-lfv revive old.md                 # restore from anywhere
+lfv revive old.md                 # bring a deleted file back
 ```
 
 ## How to Use It (Everyday Commands)
@@ -71,7 +71,7 @@ lfv revive old.md                 # restore from anywhere
 
 LFV keeps content in an immutable, content‑addressed object store (**File Objects** and **Tree Objects**, addressed by `blake3` hash, deduplicated and compressed) and records history as append‑only **Snapshots** in JSON Lines, each protected by a digest: File Snapshots per file, and optional Tree Snapshots that mark repository‑wide milestones.
 
-Branches, tags and HEAD are small YAML files kept per file; `index.db` (SQLite) is a rebuildable cache of working‑tree status and lookups, not part of history.
+Branches and tags are small YAML files and HEAD is a one-line text file, kept per file (tree tags and the tree HEAD live under `.lfv/trees/`); `index.db` (SQLite) is a rebuildable cache of working‑tree status and lookups, not part of history.
 
 No staging area, no multi‑file commits. Written in Rust.
 

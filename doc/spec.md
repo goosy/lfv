@@ -70,7 +70,7 @@ In order to stay "lightweight", the following are **out of scope**:
 | HEAD | The current branch name and latest snapshot pointer of a tracked file. |
 | Tag | An optional readable name for a snapshot, used to reference a version stably. |
 | Action | An operation that changes file state. Explicit actions: `track`, `snap`, `untrack`; implicit actions: `modify` (the user edits a file), `auto-track` / `auto-delete` (LFV responds to OS events automatically during a scan, see design §4.3). |
-| LFV-visible | — The files remaining in the working directory after directory pruning by `.lfvignore` matches. |
+| LFV-visible | The files remaining in the working directory after directory pruning by `.lfvignore` matches. |
 
 ### 3.2 Storage Objects: File Object, Tree Object, File Snapshot, Tree Snapshot
 
@@ -311,7 +311,7 @@ Untracked (config.yaml):
 
 Displays `file:*` (a ULID with the `file:` prefix), abbreviated by default to the prefix plus the first 8 characters of the ULID (e.g. `file:01HA7BCD`); `--long` shows the full length. The value is assigned at track time, spans the file's entire lifecycle, and is the only stable reference token at the CLI level.
 
-**Any command that accepts `<file>` normally accepts either a path or an `file:*` as its argument**:
+**Any command that accepts `<file>` normally accepts either a path or a `file:*` as its argument**:
 
 - `lfv relink file:01HA7EEE --onto file:01HA7BCD` — splices the history of file:01HA7EEE (the new file-id, present on disk) onto file:01HA7BCD (the old file-id, which has disappeared); file:01HA7BCD continues as the active file-id, while file:01HA7EEE is retired but preserved.
 - `lfv mv docs/old-note.md docs/notes/new.md` — a path rename.

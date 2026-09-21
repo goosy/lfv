@@ -33,7 +33,7 @@ LFV follows the same storage mechanism as Git: objects are content-addressed, ke
 
 A `file-id` is assigned when a file is tracked and persists throughout the file's entire lifecycle (including after deletion). It remains the only stable means of reference after a file disappears or its path changes. After a delete or rename the old path still resolves to the file, but once a new file takes that path it points at the new file instead, so a path is not a stable handle. Users and scripts need a stable handle for querying history (`lfv log`), restoring content (`lfv revive`), or continuing history (`lfv relink`).
 
-Paths are convenience aliases for the common case. Any command that accepts `<file>` also accepts either a path or an `file:*` identifier. Both forms are accepted everywhere, so users are never forced to look up a `file-id` during routine work.
+Paths are convenience aliases for the common case. Any command that accepts `<file>` also accepts either a path or a `file:*` identifier. Both forms are accepted everywhere, so users are never forced to look up a `file-id` during routine work.
 
 ## 4. Tracking policy
 
