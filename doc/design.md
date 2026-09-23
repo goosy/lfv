@@ -523,7 +523,7 @@ CREATE UNIQUE INDEX tracked_path ON tracked(path) WHERE present = 1;
 -- dynamically untracked paths that exist on disk (config.yaml untracked list ∩ visible ∩ on disk)
 CREATE TABLE untracked (
     path      TEXT PRIMARY KEY,
-    file_id   TEXT,                  -- former file-id, if any; reused by `lfv track`
+    file_id   TEXT,                  -- former file-id, if non-retired and not currently active; reused by `lfv track` (§3.10)
     size      INTEGER NOT NULL
 );
 
@@ -684,7 +684,7 @@ The other multi-step write flows follow the same principle: the source of truth 
 | Flow | Write order | Consequence of a crash |
 | --- | --- | --- |
 | `rewind` (§4.10) | (1) write the preserved branch into `branches.yaml` → (2) append the new snapshot (loop mode) → (3) rewrite the current branch pointer → (4) `restore_to` the working area → (5) index | after (1): one extra branch name pointing at the old HEAD, harmless, just re-run; after (2): one dangling snapshot; after (3): the working area disagrees with HEAD and the next scan records `modified`; after (4): the index lags, repaired by `rebuild-index` |
-| `relink` (§4.7) | (1) append the copied chain to the dst log → (2) advance dst `branches.yaml` → (3) write `retired` into src `meta.yaml` → (4) index | after (1): the tail of the dst log holds a dangling chain no branch references (reclaimable by `gc --purge`), and re-running relink produces a fresh chain with new ULIDs; after (2): src is not retired, so two file-ids claim the same path and relink must be re-run; after (3): the index lags |
+| `relink` (§4.7) | (1) append the copied chain to the dst log → (2) advance dst `branches.yaml` → (3) write `retired` into src `meta.yaml` → (4) index (re-hang the `tracked` row onto dst; null out `untracked.file_id` if a row still references dst) | after (1): the tail of the dst log holds a dangling chain no branch references (reclaimable by `gc --purge`), and re-running relink produces a fresh chain with new ULIDs; after (2): src is not retired, so two file-ids claim the same path and relink must be re-run; after (3): the index lags, including a stale `untracked.file_id` pointing at dst — harmless, §3.10's rebuild rule excludes active file-ids anyway |
 | `import` (§4.16) | (1) write `objects/` → (2) rename the archive directory wholesale into `files/<ULID>/` → (3) index `snap_locator` | after (1): extra unreferenced objects (reclaimed by `gc`); (2) is the atomic dividing line — a successful rename means the import happened; after (3): the index lags, repaired by `rebuild-index` |
 | `snap --tree` (§4.11) | (1) write the Tree Object → (2) append the Tree Snapshot → (3) `trees/HEAD` → (4) `trees/tags.yaml` → (5) index | after (1): one extra unreferenced object; after (2): a dangling Tree Snapshot; after (3): the tag was not written, just re-run with `--tag`; after (4): the index lags |
 | `gc --purge` (§3.11) | (1) prune every log by reachability → (2) delete objects by the new reference set | a crash between the two steps only leaves extra objects behind, which is safe |
@@ -697,7 +697,7 @@ The other multi-step write flows follow the same principle: the source of truth 
    - present with `object == null` → deleted, no row;
    - no snapshot → `path = meta.initial_path`, `present = stat`, `head_* = NULL`.
 3. Tree plane: read `trees/snapshots.log` → `snap_locator(file_id = NULL)`; `trees/tags.yaml` → `tags`; rebuild `tree_file_refs` with the attribution rule below.
-4. `untracked`: `config.untracked ∩ visible ∩ exists on disk`; `file_id` is the last non-retired file-id that held that path in history (may be empty).
+4. `untracked`: `config.untracked ∩ visible ∩ exists on disk`; among file-ids that are non-retired and not currently active (§2.7), `file_id` is the one whose current-branch HEAD has `path == P` and `object != null` (ties: latest HEAD `created_at` wins) — not any file-id whose history merely passed through P at some earlier point; empty if none qualifies.
 5. Clear `scan_meta` → the next scan is a full one.
 
 **The `tree_file_refs` attribution rule**: a Tree Object holds only `{path, hash}` and no file-id. For each manifest entry `(P, H)`, search all file-id logs for a snapshot with `path == P && object == H && created_at <= tree.created_at` and take the file-id of the one with the **latest created_at**. This rule gives the right answer both for "a new file at the same path after a deletion" and for relink (the copied chain has newer ULIDs and later timestamps); the only residual ambiguity is two file-ids holding the same `(P, H)` at the very same moment, which normal operation does not produce.
@@ -868,11 +868,13 @@ The benefit of this design: before `lfv snap`, a `D` file is still in the tracki
 
 The command is designed for the scenario "a user mistake caused LFV to produce a new file-id" (typically: a rename plus a content change at the OS level made auto-track allocate a new file-id) and should not be used as a routine command. If src-file-id has no history yet, dst-file-id's history is left as it is and only the file-id binding is transferred.
 
-- **src-file-id**: status `A`/`M`, a live file present on disk (the new file-id, still tracked)
-- **dst-file-id**: status `D`, a file that has disappeared from disk (the old file-id, awaiting continuation), or a deleted file whose latest snapshot has `object = null`
+- **src-file-id**: an active file-id (tracked, not retired) whose file is present on disk (`present = 1`); the stored status may be either `modified` or `unmodified` (`A`/`M`/blank are only render-time flags, §2.7). Refused if `present = 0`, because there is no on-disk file to hand over
+- **dst-file-id**: must own no live path — a file that has disappeared from disk (`present = 0`, the old file-id, awaiting continuation), a deleted file whose latest snapshot has `object = null`, an untracked file-id that still has history (no `tracked` row; its former path may sit in `config.untracked` with a live `untracked` row), or an imported file-id that has not been activated (no `tracked` row). A dst that currently owns a live path (`present = 1`) is refused: relink is not a way to merge two live files. If dst still has a `tracked` row (`present = 0`), it is replaced by src's re-hung row
 - **The file-id that survives is the `--onto` side (dst-file-id)**, consistent with the direction of the preposition
 
 Afterwards, src-file-id's current path and content are appended as the next Snapshot of dst-file-id's history; src-file-id's `tracked` row is re-hung onto dst-file-id (the `file_id` is swapped and `head_*` taken from dst) and produces no further snapshot. **src-file-id's `files/<src-file-id>/` directory and `snapshots.log` are preserved in full** (append-only, never deleted), and `retired: {at, onto: dst}` is written into its `meta.yaml`; src-file-id becomes a "retired" file-id, `lfv log src-file-id` still works, and `lfv list` does not list it by default.
+
+If dst was an untracked-with-history file-id, its former path stays in `config.untracked` unchanged; only a live `untracked` row with `file_id = dst`, if any, has that field nulled (index bookkeeping, §3.9).
 
 **Case 1: src-file-id has no snapshot history**
 

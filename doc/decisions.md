@@ -264,7 +264,9 @@ The status table and branch pointers are **mutable** and require efficient rando
 
 If `lfv mv <src> <f_dst-id>` were allowed to mix path manipulation with history continuation, users would naturally assume that "the `file-id` left behind afterwards is the `<dst>` one" — whereas the identity that actually survives the continuation is the `--onto` side (i.e. `f_dst`), and `f_src` is retired. This mental-model confusion would almost inevitably lead to mistakes.
 
-`lfv relink` also solves a second problem that `lfv mv` fundamentally cannot: **merging another file's history**. A typical case is when the content of `<f_src>` is a superset of `<f_dst>` and the user does not need to keep both `file-id`s, wanting instead to splice the full snapshot chain of `f_src` onto `f_dst` and then retire `f_src`. This is semantically a history-consolidation operation, a different level of concept from a plain path rename; forcing them together would only make both commands hard to understand.
+`lfv relink` also solves a second problem that `lfv mv` fundamentally cannot: **a new `file-id` produced by mistake**. A typical case is an OS-level rename plus a content change, which defeats automatic rename detection and leaves a `D` row for the old `file-id` next to a fresh one for the new path. The user then splices the fresh `file-id`'s history onto the old one and retires it. This is semantically a history-continuation operation, a different level of concept from a plain path rename; forcing them together would only make both commands hard to understand.
+
+Relink is deliberately **not** a way to merge two live files. `dst` must own no live path (`D`, deleted, or imported but not activated) and `src` must be a live file on disk (stored status `modified` or `unmodified`). Merging two live file-ids would require one of the two on-disk files to vanish or be overwritten, which is a very different operation with far more complex semantics.
 
 ## 16. Tree reverse references use `tree_file_refs` DB table
 
@@ -377,6 +379,16 @@ Branch and tag names may not contain control characters; a name that does is ref
 The `anchor-short` in a preserved branch name (`<kind>/<anchor-short>/<n>`, spec §4.5) takes the **last 8 characters** of the preserved snapshot's ULID; the `file-id` display abbreviation in `lfv status` (spec §4.3.1) takes the **first 8 characters**. The difference is deliberate, not a typo.
 
 A ULID is Crockford Base32-encoded: of its 26 characters, roughly the first 10 are a 48-bit timestamp and the remaining 16 are 80 bits of randomness. The file-id abbreviation takes the first 8 characters, landing in the timestamp segment -- files created around the same time get similar-looking file-id prefixes, which suits how a person reads `log`/`status` output in chronological order and types short prefixes by hand; it's an optimization for human display. `anchor-short` takes the last 8, landing in the random segment -- when several rewind / detour / rebase / revive operations happen in quick succession (for example one `lfv rewind <TS-ish>` touching dozens of files at once), a timestamp-segment prefix would look nearly identical across them and rely almost entirely on the trailing `<n>` to disambiguate; the random segment collides far less often, reducing that reliance on `<n>`.
+
+## 30. `untracked.file_id` keys off each file-id's own current HEAD, not any point in its history
+
+**Why**: the `untracked` row's `file_id` is a rebuildable hint so `lfv track` can restore a path's original history (design §3.6, §3.10). Getting it right takes two independent conditions; dropping either produces a wrong candidate.
+
+**Match the file-id's own current-branch HEAD path, not any snapshot that ever recorded this path.** A file-id's history can pass through a path it no longer rests at -- renamed away by `mv`, or later deleted from an entirely different path. Searching "did any snapshot in this file-id's log ever have path P" surfaces such unrelated file-ids; only the one whose HEAD (its last-known state, `object != null`) is still at P is a real match. This mirrors how a `tracked` row is reconstructed from `head.path` (§3.10 step 2), just applied to an inactive file-id instead of an active one.
+
+**Exclude file-ids that are currently active** (have a `tracked` row), even if their own HEAD path happens to equal P. §2.7's invariant is that an active file-id owns at most one live path; one that already owns a path elsewhere must not also be handed out as the recoverable identity for a second path. The case where this actually bites is a pending rename, where `tracked.path` (current) and `head_path` (last snapshot) briefly diverge (design §3.6): without this exclusion, a coincidental new file created at the vacated old path before the rename is snapped could wrongly inherit that file-id's whole history.
+
+`lfv relink`'s dst side (design §4.7) is what surfaced this rule while it was being designed, but the first condition alone already excludes it: relink appends new snapshots to dst's own log, so dst's HEAD moves to src's former path and stops matching its old one. The second condition is kept anyway, to enforce the ownership invariant directly rather than lean on the incidental fact that this particular operation happens to move the HEAD.
 
 ## Possible Future Extensions
 

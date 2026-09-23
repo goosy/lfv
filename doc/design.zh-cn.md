@@ -523,7 +523,7 @@ CREATE UNIQUE INDEX tracked_path ON tracked(path) WHERE present = 1;
 -- dynamically untracked paths that exist on disk (config.yaml untracked list ∩ visible ∩ on disk)
 CREATE TABLE untracked (
     path      TEXT PRIMARY KEY,
-    file_id   TEXT,                  -- former file-id, if any; reused by `lfv track`
+    file_id   TEXT,                  -- former file-id, if non-retired and not currently active; reused by `lfv track` (§3.10)
     size      INTEGER NOT NULL
 );
 
@@ -684,7 +684,7 @@ tree:release: snap:01HZZZ...
 | 流程 | 写入顺序 | 崩溃后果 |
 | --- | --- | --- |
 | `rewind`（§4.10） | ① 保留分支写入 `branches.yaml` → ②（loop 模式）append 新快照 → ③ 当前分支指针改写 → ④ `restore_to` 工作区 → ⑤ index | ① 后：多一个分支名指向原 HEAD，无害，重跑即可；② 后：多一条悬空快照；③ 后：工作区与 HEAD 不一致，下次扫描记为 `modified`；④ 后：索引落后，`rebuild-index` 修复 |
-| `relink`（§4.7） | ① 复制链 append 到 dst 日志 → ② dst `branches.yaml` 推进 → ③ src `meta.yaml` 写 `retired` → ④ index | ① 后：dst 日志尾部多一段无分支引用的悬空链（`gc --purge` 可回收），重跑 relink 会重新生成一段新 ULID 的链；② 后：src 未退役，两个 file-id 同时声称同一路径，需重跑 relink；③ 后：索引落后 |
+| `relink`（§4.7） | ① 复制链 append 到 dst 日志 → ② dst `branches.yaml` 推进 → ③ src `meta.yaml` 写 `retired` → ④ index（`tracked` 行改挂到 dst；若仍有 `untracked` 行指向 dst，将其 `file_id` 置空） | ① 后：dst 日志尾部多一段无分支引用的悬空链（`gc --purge` 可回收），重跑 relink 会重新生成一段新 ULID 的链；② 后：src 未退役，两个 file-id 同时声称同一路径，需重跑 relink；③ 后：索引落后，包括一条指向 dst 的 stale `untracked.file_id`——无害，§3.10 的重建规则本就排除活跃 file-id |
 | `import`（§4.16） | ① 写 `objects/` → ② 归档目录整体 rename 到 `files/<ULID>/` → ③ index `snap_locator` | ① 后：多出无引用对象（`gc` 回收）；② 是原子分界点，rename 成功即视为导入完成；③ 后：索引落后，`rebuild-index` 修复 |
 | `snap --tree`（§4.11） | ① 写 Tree Object → ② append Tree Snapshot → ③ `trees/HEAD` → ④ `trees/tags.yaml` → ⑤ index | ① 后：多一个无引用对象；② 后：悬空 Tree Snapshot；③ 后：标签未写入，重跑 `--tag` 即可；④ 后：索引落后 |
 | `gc --purge`（§3.11） | ① 按可达性裁剪各日志 → ② 按新引用集删除对象 | 两步之间崩溃只会多留对象，安全 |
@@ -697,7 +697,7 @@ tree:release: snap:01HZZZ...
    - 有且 `object == null` → 已删除，无行；
    - 无快照 → `path = meta.initial_path`，`present = stat`，`head_* = NULL`。
 3. tree plane：读 `trees/snapshots.log` → `snap_locator(file_id = NULL)`；`trees/tags.yaml` → `tags`；`tree_file_refs` 按下面的归属规则重建。
-4. `untracked`：`config.untracked ∩ 可见 ∩ 盘上存在`；`file_id` 取历史中最后拥有该路径且未退役的 file-id（可为空）。
+4. `untracked`：`config.untracked ∩ 可见 ∩ 盘上存在`；在未退役且非活跃（§2.7）的 file-id 中，`file_id` 取其当前分支 HEAD 满足 `path == P` 且 `object != null` 的那个（同时满足者取 HEAD `created_at` 最晚的一个）——不是历史中间某一刻经过 P 的 file-id；不存在则留空。
 5. 清空 `scan_meta` → 下次扫描为全量。
 
 **`tree_file_refs` 归属规则**：Tree Object 只有 `{path, hash}`，没有 file-id。对每个清单条目 `(P, H)`，在所有 file-id 日志中找 `path == P && object == H && created_at <= tree.created_at` 的快照，取 **created_at 最晚**者所属 file-id。此规则对"删除后同路径新文件"和 relink（复制链的 ULID 更新，时间更晚）两种情况都给出正确答案；残余歧义只在同一时刻两个 file-id 持有相同 `(P, H)`，正常操作不会发生。
@@ -868,11 +868,13 @@ cli::<cmd>::run(args)
 
 该命令专为"用户误操作导致 LFV 产生了新的 file-id"的场景设计（典型场景：OS 层改名+改内容导致 auto-track 分配了新 file-id），不应作为日常命令。如果 src-file-id 还没有历史，则 dst-file-id 的历史维护不变，只做 file-id 绑定转移。
 
-- **src-file-id**：状态 `A`/`M`，盘上存在的活文件（新 file-id，尚在跟踪中）
-- **dst-file-id**：状态 `D`，已从磁盘消失的文件（旧 file-id，待续接），或最新快照 `object = null` 的已删除文件
+- **src-file-id**：活跃的 file-id（在跟踪中、未退役），且文件在盘上存在（`present = 1`）；存储状态 `modified` 或 `unmodified` 均可。`present = 0` 则拒绝，因为没有盘上文件可以移交
+- **dst-file-id**：必须没有活跃路径——已从磁盘消失的文件（`present = 0`，旧 file-id，待续接）、最新快照 `object = null` 的已删除文件、已 untrack 但仍有历史的 file-id（无 `tracked` 行；其原路径可能还在 `config.untracked` 里并留有一条活的 `untracked` 行），或 import 进来尚未激活的 file-id（无 `tracked` 行）。dst 当前占有活跃路径（`present = 1`）则拒绝：relink 不用于合并两个活文件。dst 若仍有 `tracked` 行（`present = 0`），由改挂后的 src 行取代
 - **最终保留的 file-id 是 `--onto` 的那一侧（dst-file-id）**，与介词方向一致
 
 执行后 src-file-id 的当前路径和内容作为 dst-file-id 历史的下一条 Snapshot 追加；src-file-id 的 `tracked` 行改挂到 dst-file-id（`file_id` 换、`head_*` 取 dst），不再产生新快照。**src-file-id 的 `files/<src-file-id>/` 目录及 `snapshots.log` 完整保留**（append-only，不删除），并在其 `meta.yaml` 写入 `retired: {at, onto: dst}`；src-file-id 成为"已退役"的 file-id，`lfv log src-file-id` 仍然有效，`lfv list` 默认不列。
+
+如果 dst 原是"已 untrack 但有历史"的 file-id，它的原路径在 `config.untracked` 中保持不变；只清一件事：若还有一条 `untracked` 行的 `file_id = dst`，将该字段置空（索引层记录，§3.9）。
 
 **情况一：src-file-id 尚无快照历史**
 
