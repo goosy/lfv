@@ -893,7 +893,7 @@ src-file-id has already produced several Snapshots (the chain being `snap_A1 -> 
 
 ### 4.8 lfv delete
 
-`lfv delete <file>` (`ops::delete`): deletes the file if it exists on disk and sets the `tracked` row to `present = 0, status = modified`. On the next `lfv snap`, LFV consults the current filesystem existence of the target file: if the file does not exist, it appends an `object = null` Snapshot and deletes that `tracked` row.
+`lfv delete <file>` (`ops::delete`): the target must have a `tracked` row, otherwise it errors (spec §4.2); deletes the file if it exists on disk and sets the `tracked` row to `present = 0, status = modified`. On the next `lfv snap`, LFV consults the current filesystem existence of the target file: if the file does not exist, it appends an `object = null` Snapshot and deletes that `tracked` row.
 
 From then on that file-id has no `tracked` row. Its last path is preserved in that Snapshot and still resolves to it (by falling back to the last non-retired file-id that held the path, see §2.8), but once a new file takes the path it resolves to the new file-id; `lfv list --deleted` can still display it by path.
 
@@ -943,7 +943,25 @@ Normal mode and loop mode share the step "preserve the old HEAD on a new branch"
 
 **`ops::switch(file, branch)`**: the file is `modified` → refuse; the target branch HEAD has `object != null` → `restore_to` the current path and refresh `tracked.head_*`; the HEAD has `object == null` → delete the file from the working tree and delete the `tracked` row; write the `HEAD` file.
 
-**`ops::revive(file, target?)`**: `target` defaults to the last snapshot on the current branch with `object != null`; calls `rewind_file` with `kind = revive`; the content is written back to `target.path` (the last known path) and a `tracked` row is inserted (`present = 1, unmodified`). If that path is already occupied by another active file-id, the command refuses.
+**`ops::revive(file, fs_ish?)`** (spec §4.2, `lfv revive` resolution):
+
+```
+t = fs_ish ? resolve(fs_ish) : branches[HEAD]
+if t is not HEAD or an ancestor of HEAD on the current branch  -> error (run `lfv switch` first)
+if t.path is LFV-invisible                                     -> error (path is outside LFV's scope)
+if t.path is in the config.yaml untracked list                 -> error (run `lfv track` first)
+if t.path is occupied by another active file-id                -> error (make room with `lfv mv`)
+if t.object == null:
+    r = last snapshot before t on the current branch with object != null   // none -> error
+    rewind_file(file, r, kind = revive)          // content goes to t.path, the current path
+    upsert tracked row for t.path; status re-derived per §2.7
+else if fs_ish given                             -> error (use `lfv rewind <file> <FS-ish>`)
+else if tracked row exists && present = 1        -> no-op, print a message
+else if tracked row exists && present = 0        -> error (status D: `lfv show <file> --out <path>`, or `lfv snap` first)
+else:                                            // no tracked row, e.g. imported (§4.16)
+    object.restore_to(t.object, t.path)
+    insert tracked row (present = 1, unmodified); no preserving branch
+```
 
 ### 4.11 `lfv snap --tree`: internal execution flow
 
@@ -1072,7 +1090,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 5. Write `snap_locator(snap_id, file_id)` for every snapshot in that log, so `lfv log <snap-id>` works immediately; **do not** create a `tracked` row and do not modify `config.yaml` — that file-id is in a "has history, not activated" state, equivalent to a "retired" file-id in the relink of §4.7 but without `meta.retired` (it was not absorbed by some dst, it simply has not been materialized yet).
 6. Print a summary: file-id, number of branches, number of snapshots, number of objects imported. Mention that `lfv revive <file-id>` can restore it to the working tree.
 
-`lfv revive` applies equally to a file-id with no `tracked` row whose `HEAD` snapshot has `object != null` (the precondition of revive in §4.10 only requires "a non-null snapshot can be located", not that the file was previously tracked); if the restore path is already occupied by another active file-id, it is refused per §4.10, and the user can make room with `lfv mv` first or choose another path.
+For a file-id with no `tracked` row whose `HEAD` snapshot has `object != null`, `lfv revive` activates it without a rewind (§4.10): the content is written to `HEAD.path` and a `tracked` row is inserted; if that path is already occupied by another active file-id, it is refused, and the user can make room with `lfv mv` first.
 
 ### 4.17 Flow → module mapping table
 

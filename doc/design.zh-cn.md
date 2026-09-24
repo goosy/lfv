@@ -893,7 +893,7 @@ src-file-id 已经产生了若干 Snapshot（链为 `snap_A1 -> snap_A2 -> ... -
 
 ### 4.8 lfv delete
 
-`lfv delete <file>`（`ops::delete`）：盘上存在则删除该文件；`tracked` 行置 `present = 0, status = modified`。后继 `lfv snap` 时，LFV 会参照目标文件的当前 FS 存在状态：若文件不存在，则追加 `object = null` 的 Snapshot，并删除该 `tracked` 行。
+`lfv delete <file>`（`ops::delete`）：目标须有 `tracked` 行，否则报错（spec §4.2）；盘上存在则删除该文件；`tracked` 行置 `present = 0, status = modified`。后继 `lfv snap` 时，LFV 会参照目标文件的当前 FS 存在状态：若文件不存在，则追加 `object = null` 的 Snapshot，并删除该 `tracked` 行。
 
 此后该 file-id 不再有 `tracked` 行。它的最后路径保留在该 Snapshot 中，该路径仍可解析到它（回退到历史中最后拥有该路径且未退役的 file-id，见 §2.8），但一旦被新文件占用就解析到新 file-id；`lfv list --deleted` 仍可按路径显示。
 
@@ -943,7 +943,25 @@ index: tracked.head_* / disk_* refresh; status re-derived per §2.7
 
 **`ops::switch(file, branch)`**：文件 `modified` → 拒绝；目标分支 HEAD `object != null` → `restore_to` 到当前路径，`tracked.head_*` 刷新；HEAD `object == null` → 从工作树删除文件、删除 `tracked` 行；写 `HEAD` 文件。
 
-**`ops::revive(file, target?)`**：`target` 缺省为当前分支最后一条 `object != null` 的快照；调用 `rewind_file`，`kind = revive`；内容写回 `target.path`（最后已知路径），并插入 `tracked` 行（`present = 1, unmodified`）。若该路径已被另一个活跃 file-id 占用则拒绝。
+**`ops::revive(file, fs_ish?)`**（spec §4.2 `lfv revive` 判定规则）：
+
+```
+t = fs_ish ? resolve(fs_ish) : branches[HEAD]
+if t is not HEAD or an ancestor of HEAD on the current branch  -> error (run `lfv switch` first)
+if t.path is LFV-invisible                                     -> error (path is outside LFV's scope)
+if t.path is in the config.yaml untracked list                 -> error (run `lfv track` first)
+if t.path is occupied by another active file-id                -> error (make room with `lfv mv`)
+if t.object == null:
+    r = last snapshot before t on the current branch with object != null   // none -> error
+    rewind_file(file, r, kind = revive)          // content goes to t.path, the current path
+    upsert tracked row for t.path; status re-derived per §2.7
+else if fs_ish given                             -> error (use `lfv rewind <file> <FS-ish>`)
+else if tracked row exists && present = 1        -> no-op, print a message
+else if tracked row exists && present = 0        -> error (status D: `lfv show <file> --out <path>`, or `lfv snap` first)
+else:                                            // no tracked row, e.g. imported (§4.16)
+    object.restore_to(t.object, t.path)
+    insert tracked row (present = 1, unmodified); no preserving branch
+```
 
 ### 4.11 `lfv snap --tree`：内部执行流程
 
@@ -1072,7 +1090,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 5. 为该日志的每条快照写入 `snap_locator(snap_id, file_id)`，使 `lfv log <snap-id>` 立即可用；**不**创建 `tracked` 行，也不修改 `config.yaml`——该 file-id 处于"有历史、未激活"状态，等同于 §4.7 relink 中"已退役"的 file-id，但没有 `meta.retired`（它不是被某个 dst 吸收，只是尚未 materialize）。
 6. 输出汇总：file-id、分支数、快照数、导入的对象数。提示可用 `lfv revive <file-id>` 恢复到工作树。
 
-`lfv revive` 对无 `tracked` 行、`HEAD` 快照 `object != null` 的 file-id 同样适用（§4.10 revive 的前提只要求"能定位到一个非 null 快照"，不要求文件此前处于跟踪状态）；恢复路径已被另一个活跃 file-id 占用时按 §4.10 拒绝，用户可先 `lfv mv` 让路或改用其它路径。
+对无 `tracked` 行、`HEAD` 快照 `object != null` 的 file-id，`lfv revive` 不做 rewind、直接激活（§4.10）：内容写到 `HEAD.path` 并插入 `tracked` 行；该路径已被另一个活跃 file-id 占用时拒绝，用户可先 `lfv mv` 让路。
 
 ### 4.17 流程 → 模块映射总表
 
