@@ -276,7 +276,7 @@ pub enum FileTarget  { Worktree(FileId, RepoPath), Object(FileId, ObjectHash) } 
 pub enum TreeTarget  { Object(ObjectHash), Snap(SnapId) }                            // <TO-ish> / <TS-ish>
 ```
 
-裸 token 的消歧顺序（纯语法判定，不查索引）：`snap:` 前缀（snap-id；归属 file / tree plane 由 `snap_locator` 给出）→ `file:` 前缀（file-id）→ `work:` 前缀（工作区字面量）→ `tree:` 前缀（树标签）→ `blake3:` 前缀（tree-id）→ 含 `:` 时在第一个 `:` 处拆为 `<ref>:<file>`，`<file>` 部分再按本规则解析为 file-id 或路径 → 否则视为路径（`a`、`./a`、`../a` 相对 cwd，`/a/b` 为仓库内绝对路径；拒绝操作系统绝对路径与盘符；输入中 `\` 视同 `/`，开头连续多个 `/` 视同一个；规范化为 `RepoPath`，越出仓库报错；查 `tracked.path`，再查 `tracked.head_path`（待落盘的改名），再查历史中最后拥有该路径且未退役的 file-id，多个候选取其 HEAD 快照 `created_at` 最晚者、仍相同则取 snap-id 最大者）。分支名与标签名不能作为裸 token 出现；在已带 `<file>` 参数的命令中，`<FS-ish>` 位置的裸 token 先按 snap-id，再按该文件的分支名，再按标签名解析；同一文件内分支名与标签名不会重名（spec §4.6 在创建时已挡住），因此后两步不会互相冲突。
+裸 token 的消歧顺序（纯语法判定，不查索引）：`snap:` 前缀（snap-id；归属 file / tree plane 由 `snap_locator` 给出）→ `file:` 前缀（file-id）→ `work:` 前缀（工作区字面量）→ `tree:` 前缀（树标签）→ `blake3:` 前缀（tree-id）→ 含 `:` 时在第一个 `:` 处拆为 `<ref>:<file>`，`<file>` 部分再按本规则解析为 file-id 或路径 → 否则视为路径（`a`、`./a`、`../a` 相对 cwd，`/a/b` 为仓库内绝对路径；拒绝操作系统绝对路径与盘符；输入中 `\` 视同 `/`，开头连续多个 `/` 视同一个；规范化为 `RepoPath`，越出仓库报错，LFV 不可见也报错（spec §4 作用域规则 1；`work:<path>` 中的路径同样适用）；查 `tracked.path`，再查 `tracked.head_path`（待落盘的改名），再查历史中最后拥有该路径且未退役的 file-id，多个候选取其 HEAD 快照 `created_at` 最晚者、仍相同则取 snap-id 最大者）。分支名与标签名不能作为裸 token 出现；在已带 `<file>` 参数的命令中，`<FS-ish>` 位置的裸 token 先按 snap-id，再按该文件的分支名，再按标签名解析；同一文件内分支名与标签名不会重名（spec §4.6 在创建时已挡住），因此后两步不会互相冲突。
 
 裸 `snap:*` 的所属 file-id / plane 由 `index.snap_locator` 给出（§3.6）。
 
@@ -743,6 +743,13 @@ cli::<cmd>::run(args)
 - `.lfvignore` 语法为 gitignore 语法子集，只认仓库根目录的一个文件，用 `ignore` crate 的 gitignore 匹配器；目录模式参与遍历剪枝；
 - 动态 untracked 列表按路径记录；untracked 的文件在盘上改名后，新路径是可跟踪候选，会被 auto-track。
 
+**作用域检查**（spec §4 作用域规则）：可见性由唯一的谓词 `scan::visibility::is_visible(RepoPath)` 按当前 `.lfvignore` 判定；`.lfv/` 中任何地方都不存储可见性状态，历史也从不被标记。
+
+- 规则 1（路径参数）由 `resolve`（§2.8）执行，因此任何 `ops::*` 流程都不会拿到 LFV 不可见的路径参数。
+- 规则 2（工作区路径）：每个 `ops::*` 流程先收集它将写入的全部工作区路径，在其它所有前置条件之前、第一次改动之前，逐一用 `is_visible` 检查；任一不通过则整条命令拒绝。活跃 file-id 的当前路径总能通过，因为扫描（§4.3.1）已删除所有路径不可见的行；该检查真正起作用的是来自参数或历史的路径，如 `mv` 的 `<new-file>`、`revive` 的 `t.path`（含激活 import 的 file-id），以及 `tree_rewind` 的 manifest 路径（§4.12，`--force` 把拒绝改为跳过）。
+- 作为最后一道防线，工作区访问层（§4.2.1）在每次写入时断言 `is_visible`；断言失败属于内部错误，而不是面向用户的拒绝。
+- 只读历史（规则 3）从不调用 `is_visible`。
+
 #### 4.2.1 工作区访问层（`scan::fs`）
 
 所有按 `RepoPath` 读写工作区的操作都经过这一层（`ops` 在调用 `object::restore_to` 等之前，先由它把 `RepoPath` 解析为磁盘路径）。
@@ -768,12 +775,12 @@ cli::<cmd>::run(args)
   - 如果 LFV 可见且为动态未跟踪：设置为 `untracked` 状态；
   - 如果 LFV 可见且已有 tracked 状态行：对比 `disk_mtime_ns` / `disk_size` → 未变则沿用 `disk_hash`，变了则重算 hash → 与 `head_object` / `head_path` 比较得到 `modified` 或 `unmodified`（状态字母见 §2.7）；判断链条不一定要执行完才能出结果；
   - 如果 LFV 可见、未登记且为可跟踪候选：执行 auto-track（§4.4）；
-  - LFV 不可见：删除状态表中对应记录，保持 `config.yaml` 与历史 Snapshot 不变，不产生 `D`。
+  - LFV 不可见：删除状态表中对应记录，保持 `config.yaml` 与历史 Snapshot 不变，不产生 `D`。每删除一条 `tracked` 行，扫描输出一条警告（spec §4.2 修改 `.lfvignore`），列出 file-id 与路径，说明历史保留；若该行为 `modified`，还说明未 snap 的改动只存在于盘上。之后该行已不存在，因此警告只出现一次。路径恢复可见时，通过恢复原 file-id（§4.4）重建该行。删除 `untracked` 行不输出警告。
 
 | 层级 | 对象 | 扫描动作 |
 | ---- | ---- | ---- |
 | **A. 已登记路径** | `tracked` / `untracked` 中已有的行 | 对每行先依据 `.lfvignore` mtime 决定是否判断 LFV 可见，不可见则删除状态表记录，可见则 `stat` + 状态更新；`stat` 失败的 tracked 行走 auto-delete（§4.5）。成本 O(已登记路径数)。 |
-| **B. 发现新路径** | 遍历中见到的、尚未登记的 LFV 可见路径 | 动态未跟踪文件设置为 `untracked`；可跟踪候选先做改名识别（§4.6），未配对者执行 auto-track（§4.4）。 |
+| **B. 发现新路径** | 遍历中见到的、尚未登记的 LFV 可见路径 | 动态未跟踪文件设置为 `untracked`；可跟踪候选先尝试恢复原 file-id（§4.4），再做改名识别（§4.6），未配对者执行 auto-track（§4.4）。 |
 
 以上扫描动作都会更新状态表。此外，`lfv track`、`lfv untrack` 也会更新 `config.yaml` 与状态表。
 
@@ -812,9 +819,12 @@ cli::<cmd>::run(args)
 - 若匹配 `.lfvignore` → **忽略**（不登记，§4.2）；
 - 若在 `config.yaml` 动态 untracked 列表中 → 登记为 `untracked`（§4.2）；
 - 若路径违反 spec §4.2 路径规则 → 不登记，只给出警告（扫描照常继续）并提示加入 `.lfvignore`；
-- 否则 → 视为「OS 新建」，自动 `track`：`tracked::TrackedStore::create(path)` 分配 `file-id`、建目录并写 `meta.initial_path`，`tracked` 表插入 `status = modified`、无 `head_*` 的行。
+- 若该路径存在**原 file-id** → 恢复它（见下文）；此判断先于改名识别（§4.6）；
+- 否则，且改名识别未配对 → 视为「OS 新建」，自动 `track`：`tracked::TrackedStore::create(path)` 分配 `file-id`、建目录并写 `meta.initial_path`，`tracked` 表插入 `status = modified`、无 `head_*` 的行。
 
 **不会立即追加 Snapshot**，由后续 `lfv snap` 落盘首条 Snapshot。
+
+**恢复原 file-id**：路径 P 的原 file-id，指未退役、没有 `tracked` 行、且当前分支 HEAD 的 `path == P`、`object != null` 的 file-id（并列时取 HEAD `created_at` 最晚者，再取 snap-id 最大者）——与 §3.10 第 4 步 `untracked.file_id` 的候选规则相同。对仓库而言，这样的 file-id 仍在跟踪中，只是丢了 `tracked` 行，典型原因是其路径曾有一段时间 LFV 不可见（§4.3.1）。因此扫描按 `rebuild-index` 的方式（§3.10 第 2 步）重建该行：`path = head.path`，`present = 1`，`head_*` 取自 HEAD 快照，状态按 §2.7 推导（盘上内容等于 `head.object` 时为 `unmodified`，否则为 `modified`）。不分配 file-id，也不写 `files/` 下的任何内容。此判断先于改名识别，因为 `rebuild-index` 会无条件把 P 分配给该 file-id；若改为分配新 file-id，就会有两个 file-id 同时占有 P，而这种状态 `rebuild-index` 无法重现。候选在每次扫描中一次性收集为内存映射 `HEAD path -> file-id`，且仅在层级 B 有新路径时才收集。
 
 自动 track 的触发时机：`lfv status`（扫描时即时执行）、`lfv track`（无参跟踪时执行）、`lfv snap`（无参批量拍照前执行）。
 
@@ -872,13 +882,13 @@ cli::<cmd>::run(args)
 - **dst-file-id**：必须没有活跃路径——已从磁盘消失的文件（`present = 0`，旧 file-id，待续接）、最新快照 `object = null` 的已删除文件、已 untrack 但仍有历史的 file-id（无 `tracked` 行；其原路径可能还在 `config.untracked` 里并留有一条活的 `untracked` 行），或 import 进来尚未激活的 file-id（无 `tracked` 行）。dst 当前占有活跃路径（`present = 1`）则拒绝：relink 不用于合并两个活文件。dst 若仍有 `tracked` 行（`present = 0`），由改挂后的 src 行取代
 - **最终保留的 file-id 是 `--onto` 的那一侧（dst-file-id）**，与介词方向一致
 
-执行后 src-file-id 的当前路径和内容作为 dst-file-id 历史的下一条 Snapshot 追加；src-file-id 的 `tracked` 行改挂到 dst-file-id（`file_id` 换、`head_*` 取 dst），不再产生新快照。**src-file-id 的 `files/<src-file-id>/` 目录及 `snapshots.log` 完整保留**（append-only，不删除），并在其 `meta.yaml` 写入 `retired: {at, onto: dst}`；src-file-id 成为"已退役"的 file-id，`lfv log src-file-id` 仍然有效，`lfv list` 默认不列。
+执行后 src-file-id 的当前路径和内容作为 dst-file-id 历史的下一条 Snapshot 追加（情况一中与 dst 末尾快照完全相同时不追加）；src-file-id 的 `tracked` 行改挂到 dst-file-id（`file_id` 换、`head_*` 取 dst），不再产生新快照。**src-file-id 的 `files/<src-file-id>/` 目录及 `snapshots.log` 完整保留**（append-only，不删除），并在其 `meta.yaml` 写入 `retired: {at, onto: dst}`；src-file-id 成为"已退役"的 file-id，`lfv log src-file-id` 仍然有效，`lfv list` 默认不列。
 
 如果 dst 原是"已 untrack 但有历史"的 file-id，它的原路径在 `config.untracked` 中保持不变；只清一件事：若还有一条 `untracked` 行的 `file_id = dst`，将该字段置空（索引层记录，§3.9）。
 
 **情况一：src-file-id 尚无快照历史**
 
-src-file-id 只有跟踪记录，未产生任何 Snapshot。执行后：将 src-file-id 的当前路径的文件使用 dst-file-id 这个 file-id。事件类型按 §3.3.1 由 dst-file-id 末尾快照与当前的 path/object 对比推导（通常为 `R+M` 或 `R`，dst 已删除时为 `+`）。
+src-file-id 只有跟踪记录，未产生任何 Snapshot。执行后：将 src-file-id 的当前路径的文件使用 dst-file-id 这个 file-id。事件类型按 §3.3.1 由 dst-file-id 末尾快照与当前的 path/object 对比推导（通常为 `R+M` 或 `R`，dst 已删除时为 `+`；path 与 object 都与 dst 末尾快照相同时为 `unmodified`，不追加快照）。
 
 **情况二：src-file-id 已有快照历史**
 
@@ -948,7 +958,6 @@ index: tracked.head_* / disk_* refresh; status re-derived per §2.7
 ```
 t = fs_ish ? resolve(fs_ish) : branches[HEAD]
 if t is not HEAD or an ancestor of HEAD on the current branch  -> error (run `lfv switch` first)
-if t.path is LFV-invisible                                     -> error (path is outside LFV's scope)
 if t.path is in the config.yaml untracked list                 -> error (run `lfv track` first)
 if t.path is occupied by another active file-id                -> error (make room with `lfv mv`)
 if t.object == null:
@@ -978,8 +987,10 @@ else:                                            // no tracked row, e.g. importe
 
 `lfv rewind <TS-ish>`（`ops::tree_rewind`）通过 spec §4.5.1 的前置校验后：
 
+spec §4.5.1 的作用域检查最先进行，先于未保存改动的前置校验：读取目标的 manifest，逐条用 `is_visible`（§4.2）检查条目路径。有不通过者且未给 `--force` 时，拒绝并列出这些路径，不做任何改动。带 `--force` 时，不通过的条目构成**跳过集**：它们从下面第 3–4 步使用的 manifest 中移除，每条输出 `[skipped] build/output.md (outside LFV's scope)`，其映射到的 file-id 同时排除在分类 A、B、C 之外——即使该 file-id 在另一个可见路径上是活跃的，也保持原样（它在 manifest 中，因此不属于分类 B）。Tree Object 与目标 Tree Snapshot 都不会被改写。
+
 1. 若当前 tree HEAD 无标签且不是目标的祖先，写入 `tree:detour/<anchor-short>/<n>` 标签。
-2. 将 `.lfv/trees/HEAD` 更新为目标 Tree Snapshot 的 snap id。
+2. 将 `.lfv/trees/HEAD` 更新为目标 Tree Snapshot 的 snap id（带 `--force` 时同样如此）。
 3. 读取目标 tree-snapshot 的 Tree Object，得到 `{path, file-object-hash}` 清单；经 `tree_file_refs(tree_snap_id = target)` 把每个条目映射到 file-id。
 4. 按以下三类分别处理所有 file：
 
@@ -1096,7 +1107,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 
 | 流程 | 触发命令 | 入口 | 主要依赖 |
 | --- | --- | --- | --- |
-| 可见性规则 §4.2 | 所有扫描 | `scan::visibility` | `repo`（`.lfvignore`、`config.untracked`）、`ignore` crate |
+| 可见性规则 §4.2 | 所有扫描；参数解析；各 `ops::*` 流程的作用域检查 | `scan::visibility` | `repo`（`.lfvignore`、`config.untracked`）、`ignore` crate |
 | 惰性扫描 §4.3 | §4.3.3 表 | `scan::Scanner::run` | `index`、`tracked`、`object`（hash） |
 | auto-track §4.4 | 扫描 | `scan::autotrack` | `tracked::TrackedStore::create`、`index` |
 | auto-delete §4.5 | 扫描 | `scan` 层级 A | `index` |
@@ -1107,7 +1118,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | snap §4.9 | snap | `ops::snap_file` / `ops::snap_all` | `object`、`snapshot::loop_check`、`tracked`、`index` |
 | rewind / switch / revive §4.10 | rewind, switch, revive | `ops::rewind_file` / `ops::switch` / `ops::revive` | `snapshot`、`object::restore_to`、`tracked`、`index` |
 | snap --tree §4.11 | snap --tree | `ops::tree_snap` | `object::TreeManifest`、`tree`、`index` |
-| rewind <TS-ish> §4.12 | rewind <TS-ish> | `ops::tree_rewind` | `tree`、`index.tree_file_refs`、`ops::rewind_file` |
+| rewind <TS-ish> §4.12 | rewind <TS-ish> | `ops::tree_rewind` | `tree`、`index.tree_file_refs`、`ops::rewind_file`、`scan::visibility` |
 | 环回 §4.13 | snap / mv / verify / merge / rebase / relink | `snapshot::loop_check` | — |
 | merge / rebase / --pick §4.14 | merge, rebase, --continue, --abort | `merge::replay` | `diffy`、`ops::rewind_file`、`snapshot`、`object` |
 | verify §4.15 | verify | `ops::verify` | 全部存储层 |

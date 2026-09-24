@@ -390,6 +390,16 @@ A ULID is Crockford Base32-encoded: of its 26 characters, roughly the first 10 a
 
 `lfv relink`'s dst side (design §4.7) is what surfaced this rule while it was being designed, but the first condition alone already excludes it: relink appends new snapshots to dst's own log, so dst's HEAD moves to src's former path and stops matching its old one. The second condition is kept anyway, to enforce the ownership invariant directly rather than lean on the incidental fact that this particular operation happens to move the HEAD.
 
+## 31. LFV visibility is checked at use time, never recorded in history
+
+**Why no visibility flag in the history**: visibility is a function of a path and the current `.lfvignore`, not a property of a file-id or a snapshot. One file-id's snapshots may sit at different paths on different branches, some visible and some not, so a per-file-id flag has no single correct value; a per-snapshot flag would violate the immutability of `snapshots.log`; and because `.lfvignore` can be edited back, any stored flag would either have to be rewritten or would drift from the rules. The state a file-id falls into when its path becomes invisible — a `tracked` row dropped by the scan, history intact, no live path — already exists (a deleted file, an imported file-id not yet activated), so no new storage state is needed.
+
+**Why a single scope rule instead of per-command checks**: continuous monitoring is unnecessary; one matcher call at the moment a command fixes a working-area path is cheap, and the matcher is already loaded for the scan. Most commands operate on an active file-id whose path the scan has already confirmed, so the check only matters for paths taken from arguments or from history. Stating it once in spec §4 (and implementing it once, before any other precondition) keeps commands from diverging — a per-command clause is easy to forget, as `mv`'s target path and the tree rewind manifest showed.
+
+**Why a path that becomes visible again resumes its former file-id**: while the path is invisible, the repository itself does not change — the file-id's HEAD still sits at that path with content. Whether a file-id is tracked is decided by the repository; the `tracked` row is only a cache of it, and `rebuild-index` would give that file-id its row back. If the scan allocated a new file-id instead, the result would depend on whether a cache row happened to be dropped, and a later `rebuild-index` would find two file-ids claiming one path. Resuming makes a visibility round trip behave exactly like a file deleted and restored in the OS before any `lfv snap`: same file-id, `unmodified` if nothing changed. For the same reason the resume check runs before rename detection: `rebuild-index` assigns the path to that file-id unconditionally.
+
+**Why `lfv rewind <TS-ish>` refuses without `--force`**: restoring a tree snapshot is expected to reproduce it in full; silently skipping entries would leave a working tree that no longer matches the tree HEAD. Requiring `--force` makes the user acknowledge the scope change. The target Tree Snapshot is not rewritten (it is immutable); the next `lfv snap --tree` is built from the tracked files and therefore contains no invisible path, just as it never contains inactive files.
+
 ## Possible Future Extensions
 
 - Simple HTML5 interface with visual branch-tree display.

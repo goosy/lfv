@@ -70,7 +70,7 @@ In order to stay "lightweight", the following are **out of scope**:
 | HEAD | The current branch name and latest snapshot pointer of a tracked file. |
 | Tag | An optional readable name for a snapshot, used to reference a version stably. |
 | Action | An operation that changes file state. Explicit actions: `track`, `snap`, `untrack`; implicit actions: `modify` (the user edits a file), `auto-track` / `auto-delete` (LFV responds to OS events automatically during a scan, see design §4.3). |
-| LFV-visible | The files remaining in the working directory after directory pruning by `.lfvignore` matches. |
+| LFV-visible / LFV-invisible | A path is LFV-visible if and only if it is inside the working directory, not inside the `.lfv/` directory, and not matched by `.lfvignore` (including through a pruned directory). Otherwise it is LFV-invisible, i.e. outside LFV's scope. |
 
 ### 3.2 Storage Objects: File Object, Tree Object, File Snapshot, Tree Snapshot
 
@@ -222,6 +222,14 @@ The parameter conventions below all ultimately resolve to one of the four storag
   - `<snap-id>`: a tree snapshot identifier (it must belong to the tree plane; snap-ids are globally unique and the index tells which plane one belongs to);
   - `tree:<tag>`: the tree snapshot that a tree tag points to.
 
+**Scope rule**: every command obeys the following; the individual command descriptions do not repeat it.
+
+1. A `<file>` written as a path, and the path in `work:<path>`, must be LFV-visible (§3.1); an LFV-invisible path is refused with a message that it is outside LFV's scope. A file-id always resolves, whatever the visibility of the paths in its history.
+2. Every working-area path a command reads or writes must be LFV-visible, whether it is given as an argument (such as `<new-file>` of `lfv mv`) or derived from history (such as `T.path` of `lfv revive` or the manifest paths of `lfv rewind <TS-ish>`). This is checked before every other precondition and before anything is changed, and a violation refuses the whole command. The only exception is `lfv rewind <TS-ish> --force` (§4.5.1). The `--out <path>` of `lfv show` is an export destination chosen by the user, not a working-area path, and is not checked.
+3. Commands and arguments that only read history (`lfv log`, `lfv show` and `lfv diff` on snapshots and objects, `lfv branches`, `lfv tags`, `lfv list`, `lfv verify`, `lfv export`, and so on) are not subject to it: a path recorded in a snapshot is historical data, and whether it is visible now has no bearing on it.
+
+Visibility is always evaluated against the current `.lfvignore`; a change to `.lfvignore` never rewrites history (§4.2, changing `.lfvignore`).
+
 ### 4.1 Repository Management
 
 | Command | Description |
@@ -233,20 +241,21 @@ The parameter conventions below all ultimately resolve to one of the four storag
 
 | Command | Description |
 | ---- | ---- |
-| `lfv track [<file>]` | Add a file to tracking. When `<file>` is given, errors if the path matches `.lfvignore`; otherwise removes it from the untracked list in `config.yaml`. If that path was previously untracked rather than deleted, the original `file-id` is reused and the status table is updated to `modified` (awaiting the first `lfv snap` when there is no snapshot history). With no file argument, automatically scans all trackable files not yet in the status table and adds them to tracking. `lfv track` and `lfv untrack` are the only commands that change the dynamic untracked list, i.e. the only expression of the user's tracking intent. |
-| `lfv untrack <file>` | Stop tracking: errors if the file is LFV-invisible; if visible, updates the dynamic untracked list in `config.yaml`; if the file exists on disk, records `untracked` in the status table (keeping its file-id so `lfv track` can reuse it), otherwise only config is touched. History is preserved and can be resumed with `lfv track`. `lfv untrack` and `lfv track` are the only commands that change the dynamic untracked list, i.e. the only expression of the user's tracking intent; deleting a file (through `lfv delete` or the OS) never changes it. |
+| `lfv track [<file>]` | Add a file to tracking. When `<file>` is given, removes it from the untracked list in `config.yaml`. If that path was previously untracked rather than deleted, the original `file-id` is reused and the status table is updated to `modified` (awaiting the first `lfv snap` when there is no snapshot history). With no file argument, automatically scans all trackable files not yet in the status table and adds them to tracking. |
+| `lfv untrack <file>` | Stop tracking: updates the dynamic untracked list in `config.yaml`; if the file exists on disk, records `untracked` in the status table (keeping its file-id so `lfv track` can reuse it), otherwise only config is touched. History is preserved and can be resumed with `lfv track`. |
 | `lfv mv <old-file> <new-file>` | Migrate the tracked file at the `<old-file>` path to the `<new-file>` path. `<old-file>` accepts a path or a file-id (a file-id always corresponds to a path); `<new-file>` accepts a path only, not a file-id. If the content after the move would violate single-branch object uniqueness (design §4.13), the whole command is refused and the file on disk has not been moved at that point. Whether the actual file move is performed in the working tree is governed by design §4.6. |
 | `lfv relink <src-file-id> --onto <dst-file-id>` | Splice the history of src-file-id's current branch onto the end of dst-file-id's current branch; the on-disk file becomes identified by dst-file-id and src-file-id is retired. **Operates only on the current branch of each of the two file-ids**, touches no other branch, and performs no 4-way merge content integration. Designed for the case where a new file was created by mistake; not intended as a routine command. Preconditions: src-file-id is active and its file is present on disk (`unmodified` or `modified`); dst-file-id owns no live path (it has disappeared, was deleted, or was imported but not activated) — merging two live files is refused. See design §4.7. |
-| `lfv delete <file>` | Delete a tracked file. Errors if the path is in the dynamic untracked list of `config.yaml` or is LFV-invisible: LFV does not delete files it does not track, and the user deletes them in the OS. Otherwise sets the file to modified in the status table and deletes the file itself. When a later `lfv snap` detects that it is modified and absent from disk, it appends an `object = null` Snapshot and updates the cached state in the status table. Its history is preserved in full and it can be revived at any time with `lfv revive`. |
+| `lfv delete <file>` | Delete a tracked file. Errors if the path is in the dynamic untracked list of `config.yaml`: LFV does not delete files it does not track, and the user deletes them in the OS. Otherwise sets the file to modified in the status table and deletes the file itself. When a later `lfv snap` detects that it is modified and absent from disk, it appends an `object = null` Snapshot and updates the cached state in the status table. Its history is preserved in full and it can be revived at any time with `lfv revive`. |
 | `lfv revive <file> [<FS-ish>]` | Revive a file deleted on the current branch: `<FS-ish>` (default: the current branch HEAD) names a deletion snapshot (`object = null`), and the restore point is the last snapshot before it with `object != null`. Implemented as a rewind (§4.5); the original HEAD is preserved by an automatically created `revive/<anchor-short>/<n>` branch. Full resolution rules below the table. A new file with the same name that should continue the old history does not go through revive — use `lfv relink` (§5.7). |
-| `lfv list [--deleted] [--all]` | List all tracked files; each record includes the path, current branch, latest snapshot id, and summary. By default lists active files only; `--deleted` also lists files whose latest Snapshot has `object = null`; `--all` additionally lists retired file-ids (relink sources) and file-ids that are untracked but still have history. |
+| `lfv list [--deleted] [--all]` | List all tracked files; each record includes the path, current branch, latest snapshot id, and summary. By default lists active files only; `--deleted` also lists files whose latest Snapshot has `object = null`; `--all` additionally lists retired file-ids (relink sources), file-ids that are untracked but still have history, and file-ids that left tracking because their path became LFV-invisible. |
+
+**Dynamic untracked list**: `lfv track` and `lfv untrack` are the only commands that change the dynamic untracked list in `config.yaml`, i.e. the only expression of the user's tracking intent; deleting a file (through `lfv delete` or the OS) never changes it.
 
 **`lfv revive` resolution**: revive operates on the current branch of `<file>` only; to revive on another branch, `lfv switch` to it first.
 
 1. Determine the start snapshot T: with `<FS-ish>` omitted, T is the current branch HEAD; otherwise `<FS-ish>` must resolve to the current branch HEAD or one of its ancestors, and anything else is refused with a hint to `lfv switch` first.
 2. The restore path is `T.path` (for a deletion snapshot, the last known path of the file).
-   - If it is LFV-invisible, the command is refused with a message that the path is outside LFV's scope;
-   - if it is in the dynamic untracked list of `config.yaml`, the command is refused with a hint to run `lfv track` first;
+   - If it is in the dynamic untracked list of `config.yaml`, the command is refused with a hint to run `lfv track` first;
    - if it is occupied by another active file-id, the command is refused and the user can make room with `lfv mv` first.
 3. `T.object = null`: the restore point R is the last snapshot before T on the current branch with `object != null` (refused if there is none). A rewind to R is performed (§4.5): the branch name is unchanged, HEAD moves to R, the original HEAD is preserved by a `revive/<anchor-short>/<n>` branch, and R's content is written to the restore path.
 4. `T.object != null`: there is no deletion to revive.
@@ -254,6 +263,11 @@ The parameter conventions below all ultimately resolve to one of the four storag
    - The file has a `tracked` row and exists on disk: nothing is done; a message is printed and the command succeeds.
    - The file has a `tracked` row but is missing from disk (status `D`, the deletion not yet recorded by `lfv snap`): refused, with a hint to restore the content with `lfv show <file> --out <path>`, or to run `lfv snap` first to record the deletion.
    - The file-id has no `tracked` row (e.g. imported but not activated, design §4.16): the file is activated without a rewind — T's content is written to the restore path and the file enters tracking; no preserving branch is created.
+
+**Changing `.lfvignore`**: editing `.lfvignore` is a heavyweight operation that moves the boundary of LFV's scope; LFV neither rewrites history nor marks it, and handles the working tree as follows:
+
+- **A path becomes LFV-invisible**: the next scan drops its status-table row without producing a `D`, and leaves the file on disk, `config.yaml` and the history untouched. For each tracked file that leaves tracking this way the scan prints a warning once, stating that its history is preserved and that any changes not yet snapped exist only on disk. Until its path becomes visible again, such a file-id has no live path; it is listed by `lfv list --all` and can be referenced by its file-id.
+- **A path becomes LFV-visible again**: a file there resumes the file-id that left tracking at that path, exactly as if `.lfvignore` had never changed — no new file-id is allocated, and its status is derived against that file-id's HEAD snapshot (`unmodified` when path and content are unchanged, otherwise `M`). The history is determined by the repository alone, and the status-table row is only a cache of it (design §4.4).
 
 **Path rules**: so that history recorded on any platform can be restored on every other platform, trackable paths follow the Windows file-name rules (the characters Linux and macOS forbid are a subset):
 
@@ -371,7 +385,7 @@ Text files use a line-based diff (3 lines of context by default); binary files s
 | Command | Description |
 | ---- | ---- |
 | `lfv rewind <file> <FS-ish>` | Restore the working-area file content to the File Object of the snapshot that `<FS-ish>` points to (content only, the path is not changed; when the HEAD snapshot path differs from the on-disk path, the next `lfv snap` records an `R`). **The branch name is unchanged**: a preserving branch `rewind/<anchor-short>/<n>` pointing at the original HEAD is created automatically first, then the current branch's HEAD is moved to the target snapshot. Refuses to run while the file is in `modified` state (run `lfv snap` first, or discard the changes yourself), except in loopback mode. When used to resolve a loopback event, the user passes the matched ancestor snapshot itself, and LFV splices according to the rules in design §4.13. |
-| `lfv rewind <TS-ish>` | Restore the working area to the state of the specified Tree Snapshot. Updates `.lfv/trees/HEAD`; applies an FF-priority strategy per file (details in §4.5.1). |
+| `lfv rewind <TS-ish> [--force]` | Restore the working area to the state of the specified Tree Snapshot. Updates `.lfv/trees/HEAD`; applies an FF-priority strategy per file (details in §4.5.1). Refuses when the target manifest contains LFV-invisible paths; `--force` rewinds anyway and skips those entries (§4.5.1). |
 | `lfv branches <file>` | List all branches of that file. |
 | `lfv switch <file> <branch>` | Switch that file's current branch (also updating the working-area content to that branch's head snapshot). File plane only; the tree plane is not touched. Refuses while the file is in `modified` state. When the target branch's HEAD has `object = null` (the file is deleted on that branch), the file is removed from the working tree; that path still resolves afterwards (falling back to the last non-retired file-id that held it), but once a new file takes the path it resolves to the new file-id, so referencing it stably means using the file-id. |
 | `lfv branch-rename <file> <old> <new>` | Rename a branch. `<new>` must satisfy the naming rules in §4.6 and must not collide with an existing branch name or tag name of that file; renaming the current branch rewrites that file's `HEAD` as well. |
@@ -380,6 +394,16 @@ Text files use a line-based diff (3 lines of context by default); binary files s
 **Preserved-branch naming rules**: branches created automatically by rewind-style operations are uniformly named `<kind>/<anchor-short>/<n>`. `kind ∈ {rewind, detour, rebase, revive}` states the originating operation (respectively the rewind in this section, loopback handling in design §4.13, §4.7.1, and revive in §4.2); `anchor-short` is the last 8 characters of the ULID of the preserved old HEAD snapshot; `n` increments from 1 to avoid name collisions. The tree plane has no branches; the tag `tree:detour/<anchor-short>/<n>` that `lfv rewind <TS-ish>` creates automatically for the tree HEAD being left behind follows the same naming rule, with `anchor-short` taken from the last 8 characters of the ULID of that departing tree HEAD snapshot.
 
 #### 4.5.1 `lfv rewind <TS-ish>` Execution Flow
+
+**Scope check** (the scope rule of §4, which comes first): if some manifest paths of the target Tree Snapshot are LFV-invisible under the current `.lfvignore`, refuse to run and list them:
+
+```
+error: the target tree snapshot contains paths outside LFV's scope:
+  build/output.md
+run with --force to rewind the rest and skip these entries.
+```
+
+With `--force`, the command runs, and each LFV-invisible manifest entry is skipped with a warning: nothing is written to or deleted from its path, and the file-id it maps to is left exactly as it is (even when that file-id is active at some other, visible path). The tree HEAD still points at `<TS-ish>`, whose manifest is not rewritten; the next `lfv snap --tree` builds its manifest from the tracked files (§4.3.3), so it contains no LFV-invisible path.
 
 **Pre-check**: check whether the working area contains any tracked file in `modified` state (including `A` / `M` / `R` / `D`). If so, refuse to run:
 

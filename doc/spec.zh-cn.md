@@ -70,7 +70,7 @@ LFV (Lightweight File Versioning) 的目标：
 | 头部 | HEAD | 某个跟踪文件当前所在的分支名与最新快照指针。 |
 | 标签 | Tag | 对某个快照的可读命名（可选），用于稳定地引用某个版本。 |
 | 动作 | Action | 改变文件状态的操作。显式动作：`track`、`snap`、`untrack`；隐式动作：`modify`（用户编辑文件）、`auto-track` / `auto-delete`（LFV 扫描时自动响应 OS 事件，见 design §4.3）。 |
-| LFV 可见 | — | 在 `.lfvignore` 匹配目录剪枝后，工作目录中剩余的文件。 |
+| LFV 可见 / LFV 不可见 | — | 一个路径 LFV 可见，当且仅当它同时满足：在工作目录内；不在 `.lfv/` 目录内；不被 `.lfvignore` 匹配（含所在目录被剪枝）。否则为 LFV 不可见，即不在 LFV 的处理范围内。 |
 
 ### 3.2 存储对象：File Object、Tree Object、File Snapshot、Tree Snapshot
 
@@ -222,6 +222,14 @@ LFV 维护一个可重建的**可变索引**（Mutable Index）作为工作区�
   - `<snap-id>`：某个树快照标识（须属于树面，snap-id 全局唯一，归属由索引确定）；
   - `tree:<tag>`：树标签所指的树快照。
 
+**作用域规则**：所有命令都遵守以下规则，各命令的说明中不再重复。
+
+1. 路径写法的 `<file>` 以及 `work:<path>` 中的路径必须 LFV 可见（§3.1）；LFV 不可见的路径一律拒绝，提示该路径不在 LFV 的处理范围内。file-id 总能解析，与其历史中路径的可见性无关。
+2. 命令读写的每个工作区路径都必须 LFV 可见，无论它来自参数（如 `lfv mv` 的 `<new-file>`），还是由历史推出（如 `lfv revive` 的 `T.path`、`lfv rewind <TS-ish>` 的 manifest 路径）。该检查先于其它所有前置条件、在任何改动之前进行，不满足则整条命令拒绝。唯一的例外是 `lfv rewind <TS-ish> --force`（§4.5.1）。`lfv show` 的 `--out <path>` 是用户选定的导出目标，不是工作区路径，不做检查。
+3. 只读历史的命令与参数（`lfv log`，针对快照与对象的 `lfv show`、`lfv diff`，`lfv branches`，`lfv tags`，`lfv list`，`lfv verify`，`lfv export` 等）不受此规则约束：快照中记录的路径是历史数据，与它现在是否可见无关。
+
+可见性总是按当前的 `.lfvignore` 判定；修改 `.lfvignore` 从不改写历史（§4.2 修改 `.lfvignore`）。
+
 ### 4.1 仓库管理
 
 | 命令 | 说明 |
@@ -233,19 +241,20 @@ LFV 维护一个可重建的**可变索引**（Mutable Index）作为工作区�
 
 | 命令 | 说明 |
 | ---- | ---- |
-| `lfv track [<file>]` | 把某文件加入跟踪。指定 `<file>` 时，若路径匹配 `.lfvignore` 则报错；否则从 `config.yaml` 中 untracked 列表移除；若该路径此前是 untrack 而非 delete，则复用原 `file-id`，并将状态表更新为 `modified`（无历史快照时等待首次 `lfv snap`）。无 file 参数时，自动扫描所有可跟踪且尚未进入状态表的文件并加入跟踪。`lfv track` 与 `lfv untrack` 是修改动态 untracked 列表的唯一命令，即用户跟踪意愿的唯一表达。 |
-| `lfv untrack <file>` | 停止跟踪：LFV不可见则报错；可见则更新至 `config.yaml` 动态 untracked 列表；若盘上存在则状态表登记 `untracked`（保留其 file-id 以便 `lfv track` 复用），否则仅 config；历史保留，可 `lfv track`。`lfv untrack` 与 `lfv track` 是修改动态 untracked 列表的唯一命令，即用户跟踪意愿的唯一表达；删除文件（经 `lfv delete` 或 OS）不改变它。 |
+| `lfv track [<file>]` | 把某文件加入跟踪。指定 `<file>` 时，从 `config.yaml` 中 untracked 列表移除；若该路径此前是 untrack 而非 delete，则复用原 `file-id`，并将状态表更新为 `modified`（无历史快照时等待首次 `lfv snap`）。无 file 参数时，自动扫描所有可跟踪且尚未进入状态表的文件并加入跟踪。 |
+| `lfv untrack <file>` | 停止跟踪：更新至 `config.yaml` 动态 untracked 列表；若盘上存在则状态表登记 `untracked`（保留其 file-id 以便 `lfv track` 复用），否则仅 config；历史保留，可 `lfv track`。 |
 | `lfv mv <old-file> <new-file>` | 把 `<old-file>` 路径对应的跟踪文件迁移到 `<new-file>` 路径。`<old-file>` 接受路径或 file-id（file-id 必定对应一个路径）；`<new-file>` 只接受路径，不接受 file-id。若移动后的内容违反分支对象唯一性（design §4.13）则拒绝整条命令，此时盘上文件尚未移动。是否在工作树上执行实际的文件移动，由 design §4.6 规定。 |
 | `lfv relink <src-file-id> --onto <dst-file-id>` | 将 src-file-id 当前分支的历史续接到 dst-file-id 当前分支末尾，盘上文件改由 dst-file-id 标识，src-file-id 退役。**仅针对两个 file-id 各自当前分支**，不涉及其他分支，不做 4-way merge 内容合并。专为误产生新文件的场景设计，不应作为日常命令。前置条件：src-file-id 是活跃的且其文件在盘上存在（`unmodified` 或 `modified`）；dst-file-id 没有活跃路径（已消失、已删除或 import 后未激活），合并两个活文件会被拒绝。详见 design §4.7。 |
-| `lfv delete <file>` | 删除一个已跟踪文件。路径在 `config.yaml` 动态 untracked 列表中或 LFV 不可见时报错：LFV 不删除未跟踪的文件，由用户在 OS 上删除。否则在状态表中将该文件设置为 modified，同时删除该文件。后续 `lfv snap` 时检测到它是 modified 且文件不存在时，追加一条 `object = null` 的 Snapshot，并更新状态表的缓存状态。它的历史完整保留，随时可 `lfv revive`。 |
+| `lfv delete <file>` | 删除一个已跟踪文件。路径在 `config.yaml` 动态 untracked 列表中时报错：LFV 不删除未跟踪的文件，由用户在 OS 上删除。否则在状态表中将该文件设置为 modified，同时删除该文件。后续 `lfv snap` 时检测到它是 modified 且文件不存在时，追加一条 `object = null` 的 Snapshot，并更新状态表的缓存状态。它的历史完整保留，随时可 `lfv revive`。 |
 | `lfv revive <file> [<FS-ish>]` | 复活在当前分支上被删除的文件：`<FS-ish>`（缺省为当前分支 HEAD）指向一条删除快照（`object = null`），恢复点为它之前最后一条 `object != null` 的快照。实现为 rewind（§4.5），原 HEAD 由自动新建的 `revive/<anchor-short>/<n>` 分支保留。完整判定规则见表后说明。同名新文件要接续旧历史不走 revive，用 `lfv relink`（§5.7）。 |
-| `lfv list [--deleted] [--all]` | 列出所有被跟踪文件，每个记录包括路径、当前分支、最新快照ID及摘要。默认仅列活跃文件，`--deleted` 同时列出最新 Snapshot 的 `object = null` 的文件；`--all` 再加上已退役（relink 的 src）与已 untrack 但有历史的 file-id。 |
+| `lfv list [--deleted] [--all]` | 列出所有被跟踪文件，每个记录包括路径、当前分支、最新快照ID及摘要。默认仅列活跃文件，`--deleted` 同时列出最新 Snapshot 的 `object = null` 的文件；`--all` 再加上已退役（relink 的 src）、已 untrack 但有历史、以及因路径变为 LFV 不可见而离开跟踪的 file-id。 |
+
+**动态 untracked 列表**：`lfv track` 与 `lfv untrack` 是修改 `config.yaml` 动态 untracked 列表的唯一命令，即用户跟踪意愿的唯一表达；删除文件（经 `lfv delete` 或 OS）不改变它。
 
 **`lfv revive` 判定规则**：revive 只作用于 `<file>` 的当前分支；要在其它分支上复活，先 `lfv switch` 过去。
 
 1. 确定起点快照 T：省略 `<FS-ish>` 时 T 为当前分支 HEAD；否则 `<FS-ish>` 必须解析为当前分支 HEAD 或其祖先，其它情况拒绝并提示先 `lfv switch`。
 2. 恢复路径为 `T.path`（对删除快照即文件的最后已知路径）。
-   - 若它 LFV 不可见则拒绝，提示该路径不在 LFV 的处理范围内；
    - 若它在 `config.yaml` 动态 untracked 列表中则拒绝，提示先 `lfv track`；
    - 若它已被另一个活跃 file-id 占用则拒绝，用户可先 `lfv mv` 让路；
 3. `T.object = null`：恢复点 R 为当前分支上 T 之前最后一条 `object != null` 的快照（不存在则拒绝）。执行到 R 的 rewind（§4.5）：分支名不变，HEAD 移到 R，原 HEAD 由 `revive/<anchor-short>/<n>` 分支保留，R 的内容写到恢复路径。
@@ -254,6 +263,11 @@ LFV 维护一个可重建的**可变索引**（Mutable Index）作为工作区�
    - 文件有 `tracked` 行且盘上存在：什么也不做，输出提示，命令成功。
    - 文件有 `tracked` 行但盘上缺失（状态 `D`，删除尚未由 `lfv snap` 记录）：拒绝，提示可用 `lfv show <file> --out <path>` 恢复内容，或先 `lfv snap` 记录删除。
    - 该 file-id 没有 `tracked` 行（如 import 后未激活，design §4.16）：不做 rewind，直接激活——把 T 的内容写到恢复路径并进入跟踪，不创建保留分支。
+
+**修改 `.lfvignore`**：编辑 `.lfvignore` 是移动 LFV 处理范围边界的重操作；LFV 既不改写历史，也不给历史打标记，对工作树的处理如下：
+
+- **路径变为 LFV 不可见**：下一次扫描删除其状态表行，不产生 `D`，盘上文件、`config.yaml` 与历史都不动。对每个因此离开跟踪的已跟踪文件，扫描输出一次警告，说明其历史保留，尚未 snap 的改动只存在于盘上。在其路径恢复可见之前，这样的 file-id 没有活跃路径，由 `lfv list --all` 列出，可用 file-id 引用。
+- **路径重新变为 LFV 可见**：该路径上的文件恢复为在此路径离开跟踪的那个 file-id，与从未修改过 `.lfvignore` 完全相同——不分配新的 file-id，状态按该 file-id 的 HEAD 快照推导（路径与内容都未变时为 `unmodified`，否则为 `M`）。历史只由仓库决定，状态表行只是它的缓存（design §4.4）。
 
 **路径规则**：为保证任一平台上记录的历史都能在其它平台上还原，可跟踪路径统一采用 Windows 文件名规则（Linux、macOS 禁止的字符是其子集）：
 
@@ -371,7 +385,7 @@ lfv snap --snap-all -m "第一版完成"   # 用同一 message 逐个 snap 所�
 | 命令 | 说明 |
 | ---- | ---- |
 | `lfv rewind <file> <FS-ish>` | 把工作区文件内容恢复到 `<FS-ish>` 所指向的快照对应的 File Object（只恢复内容，不改路径；HEAD 快照路径与盘上路径不同时，下次 `lfv snap` 记为 `R`）。**分支名不变**：先自动新建保留分支 `rewind/<anchor-short>/<n>` 指向原 HEAD，再把当前分支 HEAD 移到目标快照。文件处于 `modified` 状态时拒绝执行（先 `lfv snap`，或自行丢弃改动），环回模式除外。用于解决环回事件时，用户传入被匹配的祖先快照本身，LFV 按 design §4.13 的规则接续。 |
-| `lfv rewind <TS-ish>` | 把工作区还原到指定 Tree Snapshot 的状态。更新 `.lfv/trees/HEAD`；对每个 file 采用 FF 优先策略（详见 §4.5.1）。 |
+| `lfv rewind <TS-ish> [--force]` | 把工作区还原到指定 Tree Snapshot 的状态。更新 `.lfv/trees/HEAD`；对每个 file 采用 FF 优先策略（详见 §4.5.1）。目标 manifest 含 LFV 不可见路径时拒绝执行；`--force` 仍执行并跳过这些条目（§4.5.1）。 |
 | `lfv branches <file>` | 列出该文件的全部分支。 |
 | `lfv switch <file> <branch>` | 切换该文件的当前分支（同时把工作区内容更新为该分支头部快照）。仅针对文件面，不操作树面。文件处于 `modified` 状态时拒绝。目标分支 HEAD 为 `object = null`（该分支上文件已删除）时，从工作树删除该文件；该路径此后仍可解析（回退到历史中最后拥有它且未退役的 file-id），但一旦被新文件占用就解析到新 file-id，因此稳定引用它应使用 file-id。 |
 | `lfv branch-rename <file> <old> <new>` | 重命名分支。`<new>` 须满足 §4.6 的命名规则，且在该文件内不与现有分支名、标签名重复；重命名当前分支时同步改写该文件的 `HEAD`。 |
@@ -380,6 +394,16 @@ lfv snap --snap-all -m "第一版完成"   # 用同一 message 逐个 snap 所�
 **保留分支命名规则**：回溯类操作自动新建的保留分支统一命名为 `<kind>/<anchor-short>/<n>`。`kind ∈ {rewind, detour, rebase, revive}` 标明来源操作（分别对应本节 rewind、环回处理 design §4.13、§4.7.1、§4.2 revive）；`anchor-short` 为被保留的旧 HEAD 快照 ULID 的末 8 位；`n` 从 1 起递增以避免重名。树面没有分支，`lfv rewind <TS-ish>` 为离开的 tree HEAD 自动创建的标签 `tree:detour/<anchor-short>/<n>` 沿用同一命名规则，其 `anchor-short` 取离开的 tree HEAD 快照 ULID 的末 8 位。
 
 #### 4.5.1 `lfv rewind <TS-ish>` 的执行流程
+
+**作用域检查**（§4 作用域规则，最先进行）：若目标 Tree Snapshot 的 manifest 中有路径在当前 `.lfvignore` 下 LFV 不可见，则拒绝执行并列出这些路径：
+
+```
+error: the target tree snapshot contains paths outside LFV's scope:
+  build/output.md
+run with --force to rewind the rest and skip these entries.
+```
+
+带 `--force` 时照常执行，每个 LFV 不可见的 manifest 条目都被跳过并给出警告：不向其路径写入也不删除任何内容，其映射到的 file-id 保持原样（即使该 file-id 在另一个可见路径上是活跃的）。tree HEAD 仍指向 `<TS-ish>`，其 manifest 不被改写；下一次 `lfv snap --tree` 从已跟踪文件构建 manifest（§4.3.3），因此不含任何 LFV 不可见路径。
 
 **前置校验**：检查工作区是否存在任何 `modified` 状态的跟踪文件（含 `A` / `M` / `R` / `D`）。若存在则拒绝执行：
 
