@@ -71,6 +71,9 @@ In order to stay "lightweight", the following are **out of scope**:
 | Tag | An optional readable name for a snapshot, used to reference a version stably. |
 | Action | An operation that changes file state. Explicit actions: `track`, `snap`, `untrack`; implicit actions: `modify` (the user edits a file), `auto-track` / `auto-delete` (LFV responds to OS events automatically during a scan, see design §4.3). |
 | LFV-visible / LFV-invisible | A path is LFV-visible if and only if it is inside the working directory, not inside the `.lfv/` directory, and not matched by `.lfvignore` (including through a pruned directory). Otherwise it is LFV-invisible, i.e. outside LFV's scope. |
+| Retired | A file-id whose identity has ended: it owns no path and never again competes for one, but its history stays reachable and every reference to it (snap-ids, tags, tree snapshots) stays valid. Retiring (`lfv delete --retire`) ends a file-id for good; `lfv relink` ends by retiring its src. |
+| Standby | A file-id set aside for now: it keeps its identity and history but does not compete for its path, so it is never resumed automatically; it becomes active again only when the user chooses it (`lfv track --as`, `lfv revive`). Imported file-ids start on standby, and the candidates not chosen for a path go on standby. |
+| Dropped | History the user has given up: nothing keeps it reachable any more, so `lfv gc --purge` physically removes it. Dropping serves the removal of inappropriate content (§5.9). |
 
 ### 3.2 Storage Objects: File Object, Tree Object, File Snapshot, Tree Snapshot
 
@@ -175,6 +178,8 @@ The co-referent ancestor snaps of two branches may be the same snapshot, or diff
 
 LFV maintains a rebuildable **Mutable Index** as a cache of working-area state, so that no command has to scan the whole filesystem; the recommended implementation is an embedded database. Storage objects (Objects), the Snapshot chain, and the metadata files under `.lfv` (`HEAD`, the branch table, the tag table, `config.yaml`) together form the repository's source of truth, so a corrupted index can be rebuilt from it at any time (`lfv rebuild-index`, §4.8). See design §3.6 for details.
 
+**Cache consistency**: the index holds no information of its own. For the same source of truth, `.lfvignore` and working tree, the index state left by any command must equal the state that `lfv rebuild-index` followed by a full scan would produce; only pure performance data (such as recorded on-disk hashes and scan timestamps) is exempt. In particular, whether a file-id is active and at which path is decided by the source of truth, `.lfvignore` and the working tree alone, never by what the index happened to hold before. Any user intent that must persist is therefore recorded in the source of truth, not only in the index.
+
 ### 3.5 YAML Constraints on Metadata Files
 
 This section constrains the **mutable, user-intent metadata files** under `.lfv/` — `config.yaml`, `meta.yaml`, `branches.yaml`, `tags.yaml`, `trees/tags.yaml`, `REPLAY.yaml` (see design §3.7, §3.8). `HEAD` and `trees/HEAD` are plain text and are not subject to this section. Tree Object is also encoded as YAML, but it is a content-addressed object whose canonical form is defined separately in design §3.5, aimed at byte-exact matching; the rules here do not apply to it.
@@ -241,13 +246,14 @@ Visibility is always evaluated against the current `.lfvignore`; a change to `.l
 
 | Command | Description |
 | ---- | ---- |
-| `lfv track [<file>]` | Add a file to tracking. When `<file>` is given, removes it from the untracked list in `config.yaml`. If that path was previously untracked rather than deleted, the original `file-id` is reused and the status table is updated to `modified` (awaiting the first `lfv snap` when there is no snapshot history). With no file argument, automatically scans all trackable files not yet in the status table and adds them to tracking. |
+| `lfv track [<file>] [--as <file-id> \| --new]` | Add a file to tracking. When `<file>` is given, removes it from the untracked list in `config.yaml`. If that path was previously untracked rather than deleted, the original `file-id` is reused and the status table is updated to `modified` (awaiting the first `lfv snap` when there is no snapshot history). With no file argument, automatically scans all trackable files not yet in the status table and adds them to tracking. `--as <file-id>` and `--new` decide which file-id the file at a path belongs to (former file-ids, below): `--as` makes the named candidate active and puts the path's other candidates on standby; `--new` puts all of them on standby and allocates a new file-id. Both keep the file on disk, may be used at any time to switch the active file-id, and are refused while the file-id currently active at the path is `modified`; `--as` is also refused when the file-id is not a candidate of the path. |
 | `lfv untrack <file>` | Stop tracking: updates the dynamic untracked list in `config.yaml`; if the file exists on disk, records `untracked` in the status table (keeping its file-id so `lfv track` can reuse it), otherwise only config is touched. History is preserved and can be resumed with `lfv track`. |
 | `lfv mv <old-file> <new-file>` | Migrate the tracked file at the `<old-file>` path to the `<new-file>` path. `<old-file>` accepts a path or a file-id (a file-id always corresponds to a path); `<new-file>` accepts a path only, not a file-id. If the content after the move would violate single-branch object uniqueness (design §4.13), the whole command is refused and the file on disk has not been moved at that point. Whether the actual file move is performed in the working tree is governed by design §4.6. |
-| `lfv relink <src-file-id> --onto <dst-file-id>` | Splice the history of src-file-id's current branch onto the end of dst-file-id's current branch; the on-disk file becomes identified by dst-file-id and src-file-id is retired. **Operates only on the current branch of each of the two file-ids**, touches no other branch, and performs no 4-way merge content integration. Designed for the case where a new file was created by mistake; not intended as a routine command. Preconditions: src-file-id is active and its file is present on disk (`unmodified` or `modified`); dst-file-id owns no live path (it has disappeared, was deleted, or was imported but not activated) — merging two live files is refused. See design §4.7. |
-| `lfv delete <file>` | Delete a tracked file. Errors if the path is in the dynamic untracked list of `config.yaml`: LFV does not delete files it does not track, and the user deletes them in the OS. Otherwise sets the file to modified in the status table and deletes the file itself. When a later `lfv snap` detects that it is modified and absent from disk, it appends an `object = null` Snapshot and updates the cached state in the status table. Its history is preserved in full and it can be revived at any time with `lfv revive`. |
+| `lfv relink <src-file-id> --onto <dst-file-id>` | Splice the history of src-file-id's current branch onto the end of dst-file-id's current branch; the on-disk file becomes identified by dst-file-id and src-file-id is retired. **Operates only on the current branch of each of the two file-ids**, touches no other branch, and performs no 4-way merge content integration. Designed for the case where a new file was created by mistake; not intended as a routine command. Preconditions: src-file-id is active and its file is present on disk (`unmodified` or `modified`); dst-file-id owns no live path (it has disappeared, was deleted, or is on standby, such as an imported file-id) — merging two live files is refused. A dst on standby leaves standby. Its last step retires src-file-id, as `lfv delete <src-file-id> --retire` does. See design §4.7. |
+| `lfv delete <file> [--retire]` | Delete a tracked file. Errors if the path is in the dynamic untracked list of `config.yaml`: LFV does not delete files it does not track, and the user deletes them in the OS. Otherwise sets the file to modified in the status table and deletes the file itself. When a later `lfv snap` detects that it is modified and absent from disk, it appends an `object = null` Snapshot and updates the cached state in the status table. Its history is preserved in full and it can be revived at any time with `lfv revive`. With `--retire`, the whole file-id is retired instead (§3.1): if it is active, its on-disk file is deleted and its tracking ends without a deletion snapshot; otherwise nothing on disk is touched, and the dynamic-untracked refusal above does not apply. Refused when the file-id is already retired or dropped, or has a merge/rebase in progress. A retired file-id is never a former file-id of any path and cannot be revived, relinked onto or chosen with `lfv track --as`; its history stays readable and reachable. |
 | `lfv revive <file> [<FS-ish>]` | Revive a file deleted on the current branch: `<FS-ish>` (default: the current branch HEAD) names a deletion snapshot (`object = null`), and the restore point is the last snapshot before it with `object != null`. Implemented as a rewind (§4.5); the original HEAD is preserved by an automatically created `revive/<anchor-short>/<n>` branch. Full resolution rules below the table. A new file with the same name that should continue the old history does not go through revive — use `lfv relink` (§5.7). |
-| `lfv list [--deleted] [--all]` | List all tracked files; each record includes the path, current branch, latest snapshot id, and summary. By default lists active files only; `--deleted` also lists files whose latest Snapshot has `object = null`; `--all` additionally lists retired file-ids (relink sources), file-ids that are untracked but still have history, and file-ids that left tracking because their path became LFV-invisible. |
+| `lfv drop <file-id>` | Give up the whole history of a file-id, for removing inappropriate content (§5.9); to merely set a file-id aside, retire it with `lfv delete --retire`. Refused when the file-id is active (including `D`: run `lfv snap` first) or has a merge/rebase in progress. Records the drop in the repository: from then on the file-id is never a former file-id of any path, cannot be revived, relinked onto or chosen with `lfv track --as`, and its branches and tags no longer keep its snapshots reachable. Its history stays readable (`lfv log`, `lfv show`) until `lfv gc --purge` physically removes it (§4.8, §5.9). A dropped file-id cannot be restored by any command. |
+| `lfv list [--deleted] [--all]` | List all tracked files; each record includes the path, current branch, latest snapshot id, and summary. By default lists active files only; `--deleted` also lists files whose latest Snapshot has `object = null`; `--all` additionally lists file-ids on standby, retired file-ids, file-ids that are untracked but still have history, file-ids that left tracking because their path became LFV-invisible, and dropped file-ids not yet purged. |
 
 **Dynamic untracked list**: `lfv track` and `lfv untrack` are the only commands that change the dynamic untracked list in `config.yaml`, i.e. the only expression of the user's tracking intent; deleting a file (through `lfv delete` or the OS) never changes it.
 
@@ -262,12 +268,20 @@ Visibility is always evaluated against the current `.lfvignore`; a change to `.l
    - `<FS-ish>` was given explicitly: refused, with a hint to use `lfv rewind <file> <FS-ish>`.
    - The file has a `tracked` row and exists on disk: nothing is done; a message is printed and the command succeeds.
    - The file has a `tracked` row but is missing from disk (status `D`, the deletion not yet recorded by `lfv snap`): refused, with a hint to restore the content with `lfv show <file> --out <path>`, or to run `lfv snap` first to record the deletion.
-   - The file-id has no `tracked` row (e.g. imported but not activated, design §4.16): the file is activated without a rewind — T's content is written to the restore path and the file enters tracking; no preserving branch is created.
+   - The file-id has no `tracked` row (e.g. on standby after an import, design §4.16): the file is activated without a rewind — T's content is written to the restore path, the file-id leaves standby and the file enters tracking; no preserving branch is created.
 
 **Changing `.lfvignore`**: editing `.lfvignore` is a heavyweight operation that moves the boundary of LFV's scope; LFV neither rewrites history nor marks it, and handles the working tree as follows:
 
 - **A path becomes LFV-invisible**: the next scan drops its status-table row without producing a `D`, and leaves the file on disk, `config.yaml` and the history untouched. For each tracked file that leaves tracking this way the scan prints a warning once, stating that its history is preserved and that any changes not yet snapped exist only on disk. Until its path becomes visible again, such a file-id has no live path; it is listed by `lfv list --all` and can be referenced by its file-id.
-- **A path becomes LFV-visible again**: a file there resumes the file-id that left tracking at that path, exactly as if `.lfvignore` had never changed — no new file-id is allocated, and its status is derived against that file-id's HEAD snapshot (`unmodified` when path and content are unchanged, otherwise `M`). The history is determined by the repository alone, and the status-table row is only a cache of it (design §4.4).
+- **A path becomes LFV-visible again**: a file there resumes the file-id that left tracking at that path (former file-ids, below), exactly as if `.lfvignore` had never changed — no new file-id is allocated, and its status is derived against that file-id's HEAD snapshot (`unmodified` when path and content are unchanged, otherwise `M`).
+
+**Former file-ids**: when a file exists at an LFV-visible path P that is not in the dynamic untracked list, which file-id it belongs to is decided from the repository alone (§3.4). The **candidates** of P are the file-ids that are neither retired nor dropped, whose HEAD is not a deletion snapshot, and whose last recorded path is P — the path of the current-branch HEAD snapshot, or, when there is no snapshot yet, the path at which the file-id was tracked. A candidate on standby (§3.1) does not compete for P.
+
+- **Exactly one candidate not on standby**: the file belongs to it automatically; its status is derived against that file-id's HEAD snapshot.
+- **None not on standby**: the file is new and auto-track allocates a new file-id (with the same-path hint when P last belonged to a deleted file-id, §4.3.1).
+- **Several not on standby**: P is **in conflict**. No file-id is allocated until the user removes the ambiguity: `lfv track <P> --as <file-id>` (the other candidates go on standby), `lfv track <P> --new` (all of them go on standby), or taking unwanted candidates out for good with `lfv delete <file-id> --retire` or, for inappropriate content, `lfv drop <file-id>`. As soon as a single candidate is left not on standby, the file belongs to it.
+
+Whatever the state, the user may switch the file-id active at P at any time with `lfv track <P> --as <file-id>` or `--new`; the file-id that was active goes on standby. `lfv status <P>` shows the candidates (§4.3.1). Every choice is recorded in the repository, so rebuilding the index never undoes it.
 
 **Path rules**: so that history recorded on any platform can be restored on every other platform, trackable paths follow the Windows file-name rules (the characters Linux and macOS forbid are a subset):
 
@@ -323,6 +337,16 @@ Tracked files (changes):
                       to continue its history instead, run:
                         lfv relink file:01HA7EEE --onto file:023BHCA1
 
+Conflicts (several former file-ids):
+  !   docs/draft.md                    (2 competing, 1 on standby)
+  !   notes/2026/plan.md               (2 competing)
+  these paths have no file-id until the ambiguity is removed; for each path,
+  `lfv status <path>` lists its candidates, and one of these resolves it:
+    lfv track <path> --as <file-id>    claim the file for one candidate
+    lfv track <path> --new             claim the file as a new file-id
+    lfv delete <file-id> --retire      retire an unwanted candidate
+    lfv drop <file-id>                 drop a candidate with inappropriate content
+
 Untracked (config.yaml):
   ~   drafts/local.md                  (2.1 KB)
 ```
@@ -334,6 +358,23 @@ Untracked (config.yaml):
 - `R` = rename (an auto-detected rename still pending; an explicit `lfv mv` appends a Snapshot immediately)
 - `D` = suspected delete (a **tracked** file in `modified` state that has disappeared from disk; the next `lfv snap` appends an `object = null` Snapshot according to the current filesystem state)
 - `~` = dynamic untracked (`status = untracked`, config policy + the file exists on disk)
+- `!` = conflict (a file exists at a path where several candidates not on standby compete, §4.2; it has no file-id, so it is listed in a block of its own, which is always shown). Without `<file>`, each conflicting path takes one summary line with its candidate counts, and a single remedy note follows the last one, listing the commands that remove the ambiguity (`lfv track --as`, `lfv track --new`, `lfv delete --retire`, `lfv drop`).
+
+**Candidates of a path** (`lfv status <path>` only; not shown for a file-id argument or without an argument): after the path's own line, every candidate of the path (§4.2) is listed, on standby or not, with the active one and the ones on standby marked. With exactly one candidate not on standby, it was chosen automatically and nothing needs to be done. With several, the path is in conflict, and the hint lists the ways to resolve it:
+
+```
+$ lfv status docs/draft.md
+  !   docs/draft.md
+                      candidates:
+                        file:01HA7BCD   HEAD 2026-05-17  "chapter 3 draft"
+                        file:01HB2XYZ   HEAD 2026-06-02  "imported draft"
+                        file:01HC9QRS   HEAD 2026-04-01  "old draft"  [standby]
+                      several candidates compete for this path; resolve with one of:
+                        lfv track docs/draft.md --as <file-id>
+                        lfv track docs/draft.md --new
+                        lfv delete <file-id> --retire
+                        lfv drop <file-id>
+```
 
 **The `file-id` column**:
 
@@ -363,7 +404,7 @@ lfv snap --tree --tag v1.0 -m "first edition complete"   # tag it at creation ti
 lfv snap --snap-all -m "first edition complete"   # snap every modified file one by one with the same message
 ```
 
-**Precondition**: no tracked file is in `modified` state; otherwise the command errors and prompts the user to run `lfv snap` first.
+**Precondition**: no tracked file is in `modified` state and no path is in conflict (§4.2); otherwise the command errors and prompts the user to run `lfv snap` first, or to resolve the conflict with `lfv track <path> --as <file-id>`.
 
 The `--snap-all` parameter can be used to clear `modified` beforehand: LFV runs one `lfv snap` for each `modified` file with the same `<msg>` (equivalent to the user doing it manually one by one, with each file getting its own independent snapshot in its history). The failure of one file's snap (a loopback, for instance) does not affect the snaps of the others. `modified` must be cleared before a tree snapshot is created; `--snap-all` and `--tree` cannot be used together.
 
@@ -389,7 +430,7 @@ Text files use a line-based diff (3 lines of context by default); binary files s
 | `lfv branches <file>` | List all branches of that file. |
 | `lfv switch <file> <branch>` | Switch that file's current branch (also updating the working-area content to that branch's head snapshot). File plane only; the tree plane is not touched. Refuses while the file is in `modified` state. When the target branch's HEAD has `object = null` (the file is deleted on that branch), the file is removed from the working tree; that path still resolves afterwards (falling back to the last non-retired file-id that held it), but once a new file takes the path it resolves to the new file-id, so referencing it stably means using the file-id. |
 | `lfv branch-rename <file> <old> <new>` | Rename a branch. `<new>` must satisfy the naming rules in §4.6 and must not collide with an existing branch name or tag name of that file; renaming the current branch rewrites that file's `HEAD` as well. |
-| `lfv branch-delete <file> <branch>` | Delete a branch (only the pointer is deleted; snapshots and objects are retained so they can be shared and recovered). Refuses to delete the branch the current HEAD is on; switch elsewhere with `lfv switch` first. |
+| `lfv branch-drop <file> <branch>` | Drop a branch (§3.1): only the pointer is removed; snapshots and objects are retained, so they can be shared and recovered, until `lfv gc --purge` removes those no longer reachable. Refuses to drop the branch the current HEAD is on; switch elsewhere with `lfv switch` first. |
 
 **Preserved-branch naming rules**: branches created automatically by rewind-style operations are uniformly named `<kind>/<anchor-short>/<n>`. `kind ∈ {rewind, detour, rebase, revive}` states the originating operation (respectively the rewind in this section, loopback handling in design §4.13, §4.7.1, and revive in §4.2); `anchor-short` is the last 8 characters of the ULID of the preserved old HEAD snapshot; `n` increments from 1 to avoid name collisions. The tree plane has no branches; the tag `tree:detour/<anchor-short>/<n>` that `lfv rewind <TS-ish>` creates automatically for the tree HEAD being left behind follows the same naming rule, with `anchor-short` taken from the last 8 characters of the ULID of that departing tree HEAD snapshot.
 
@@ -423,10 +464,10 @@ run `lfv snap` first, or discard changes manually.
 | ---- | ---- |
 | `lfv tag <file> <FS-ish> <name>` | Tag a snapshot of a file. |
 | `lfv tags <file>` | List all tags of that file. |
-| `lfv tag-delete <file> <name>` | Delete a file tag. |
+| `lfv tag-drop <file> <name>` | Drop a file tag. |
 | `lfv tag --tree <TS-ish> <name>` | Tag a Tree Snapshot (stored as `tree:<name>`). |
 | `lfv tags --tree` | List all tree tags. |
-| `lfv tag-delete --tree <name>` | Delete a tree tag. |
+| `lfv tag-drop --tree <name>` | Drop a tree tag. |
 
 **Naming rules for branch names and tag names** (one shared rule set, validated at creation; a violation is refused outright):
 
@@ -562,11 +603,11 @@ Replay the change of a single snapshot as one step on top of the current branch'
 | Command | Description |
 | ---- | ---- |
 | `lfv gc` | Reclaim objects not referenced by any snapshot. |
-| `lfv gc --purge` | Reclaim unreferenced snapshots along with objects not referenced by any snapshot, warning that this is a high-risk operation from which data cannot be recovered. Reachability is defined in design §3.11. |
+| `lfv gc --purge` | Reclaim unreferenced snapshots along with objects not referenced by any snapshot, warning that this is a high-risk operation from which data cannot be recovered. The snapshots of dropped file-ids are unreferenced by definition, so this also removes them and their file-id directories. Reachability is defined in design §3.11. |
 | `lfv verify` | Verify the integrity of the object store (recompute hashes and compare); recompute each snapshot's `digest` line by line; walk every branch of every file and check single-branch object uniqueness (design §4.13), reporting a violation as a data-integrity error; check that the objects referenced by Tree Objects exist. |
 | `lfv rebuild-index` | Discard `index.db` and rebuild it from the source of truth (objects/, snapshots.log, the yaml files) (design §3.10). Does not touch HEAD, branches, tags, or config. |
 | `lfv export <file> [--format zip\|tar] -o <out>` | Export the whole history of a file as a self-contained archive for migration. The archive contains that file-id's directory and the File Objects reachable from it, with the same directory structure as `.lfv`. |
-| `lfv import <archive>` | Import an archive produced by `lfv export`: merge its file-id directory (`meta.yaml`, `HEAD`, branch/tag tables, `snapshots.log`) and the reachable File Objects into the current repository, keeping the file-id unchanged and merging objects by content hash. Every snapshot `digest` is verified before importing; a corrupted archive is rejected with an error and nothing is partially imported. Errors if that file-id already exists in the current repository (which should not happen normally, as ULIDs are globally unique). **After an import the working tree is not modified and no status-table row is registered** — the file history enters the repository in an "inactive" state and must be restored to the working tree on demand with `lfv revive <file-id>`. Internal execution steps are in design §4.16. |
+| `lfv import <archive>` | Import an archive produced by `lfv export`: merge its file-id directory (`meta.yaml`, `HEAD`, branch/tag tables, `snapshots.log`) and the reachable File Objects into the current repository, keeping the file-id unchanged and merging objects by content hash. Every snapshot `digest` is verified before importing; a corrupted archive is rejected with an error and nothing is partially imported. Errors if that file-id already exists in the current repository (which should not happen normally, as ULIDs are globally unique). **After an import the working tree is not modified and no status-table row is registered** — the file-id enters the repository on standby (§3.1): it is restored to the working tree with `lfv revive <file-id>`, or, when a file already exists at its path, claimed with `lfv track <path> --as <file-id>`. Internal execution steps are in design §4.16. |
 
 ## 5. Typical Workflows (Spec)
 
@@ -692,7 +733,7 @@ lfv rewind tree:v1.0
 lfv rewind snap:01HXYZ
 ```
 
-### 5.9 Content Deletion
+### 5.9 Purging Inappropriate Content
 
 When history contains inappropriate content (privacy or security issues, or sensitive versions that are no longer needed), LFV provides a **three-step workflow** for thorough elimination. This section explains the reasoning and how tree snapshots interact with that flow.
 
@@ -703,10 +744,12 @@ When history contains inappropriate content (privacy or security issues, or sens
 For each branch containing inappropriate content, execute in order:
 
 1. **Reconstruct history**: `rewind` to the parent snapshot of the one containing inappropriate content, create a new branch. On the new branch, individually `merge --pick` subsequent snapshots from the original branch, editing to remove inappropriate content as needed, forming a new append-only snapshot chain. This entire process operates within existing primitives without violating append-only.
-2. **Delete the original branch**: delete the original branch containing the inappropriate content. The snapshot chain on that branch loses all reachable entry points and enters a dangling state.
+2. **Drop the original branch**: `lfv branch-drop` the original branch containing the inappropriate content. The snapshot chain on that branch loses all reachable entry points and enters a dangling state.
 3. **Physical purge**: run `lfv gc --purge` to delete all dangling snapshots along with their associated File Objects and Tree Objects.
 
 When inappropriate content appears on several branches, apply steps 1–2 to each relevant branch separately, then run a single unified `gc --purge` at the end.
+
+When the whole history of a file is inappropriate, or none of it is worth keeping, steps 1–2 reduce to dropping its file-id: if it is still active, retire it first with `lfv delete <file-id> --retire`; then `lfv drop <file-id>`, and finally `lfv gc --purge`.
 
 #### 5.9.2 Handling of Tree Snapshots
 
@@ -714,7 +757,7 @@ Tree Snapshots are also bound by the append-only constraint and cannot be modifi
 
 - The Tree Snapshot itself **remains** in the append-only log (it can still serve as a timeline node), but the File Object it references is physically gone, so `lfv show` / `lfv diff` queries display `[object missing]`.
 - A Tree Object that is no longer referenced by any Tree Snapshot (i.e. the working-directory snapshot it corresponds to was also cleaned through rewind + gc --purge) is deleted along with the other dangling objects.
-- **Recommended practice**: before performing a content deletion, move the tree HEAD to a milestone free of the inappropriate content with `lfv rewind tree:<tag>`, to avoid leaving broken references on the tree plane. If a broken reference is created inadvertently, `lfv verify` reports the Tree Object pointing at a non-existent File Object.
+- **Recommended practice**: before purging content, move the tree HEAD to a milestone free of the inappropriate content with `lfv rewind tree:<tag>`, to avoid leaving broken references on the tree plane. If a broken reference is created inadvertently, `lfv verify` reports the Tree Object pointing at a non-existent File Object.
 
 Dangling snapshots and File/Tree Objects are retained by default (the user may want to recover them later); only `gc --purge` performs true physical deletion.
 
@@ -744,7 +787,7 @@ For collaborative work with repositories in other locations, remote repositories
 ## 7. Roadmap (rough)
 
 - **v0.1**: `init` / `config` / `track` / `untrack` / `snap` / `status` / `log` / `show` / `list` / `rebuild-index`; plus `branches` / `switch` / `rewind` — the loopback hint of `lfv snap` tells the user to run `rewind`, so those three must land together with `snap`.
-- **v0.2**: `diff` / `mv` / `delete` / `revive` / `relink` / `branch-rename` / `branch-delete`.
+- **v0.2**: `diff` / `mv` / `delete` / `revive` / `relink` / `branch-rename` / `branch-drop`.
 - **v0.3**: the `tag` family, `export` / `import`, `gc`, `verify`.
 - **v0.4**: `merge` / `rebase` / `merge --pick`, conflict handling.
 - **v0.5**: tree plane (`snap --tree` / `log --tree` / `rewind <TS-ish>` / `tag --tree`), performance tuning.

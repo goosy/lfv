@@ -148,17 +148,19 @@ On this basis, LFV physically rejects Git-style multi-parent DAG topology in ord
 | **History Readability** | Easily polluted. The single-file history line (`git log <file>`) is blurred by numerous unrelated commits and crossing lines. | Absolutely pure. Ancestor path uniquely determined, perfectly restoring the linear evolution of that single file over time. |
 | **Target Scenario** | Multi-person collaboration, multi-file high-frequency merge distributed large software projects. | Single-person, single-file, offline, local — such as notes, configuration files, NAS backups and other single-file history tracking. |
 
-## 10. Complete Deletion of Inappropriate Content
+## 10. Purging Inappropriate Content
 
 LFV's append-only guarantee means that snapshots within **the traversable range** cannot be modified. Unreachable (dangling) snapshots are exempt from this constraint and can be safely physically deleted.
 
 Based on this, the deletion flow for inappropriate content (e.g., historical versions involving privacy or security issues) is as follows:
 
 1. **Reconstruct history**: `rewind` to the parent snapshot of the one containing inappropriate content, create a new branch. On the new branch, individually `merge --pick` subsequent snapshots from the original branch, editing to remove inappropriate content as needed, forming a new append-only snapshot chain. This entire process operates within existing primitives without violating append-only.
-2. **Delete the original branch**: Delete the original branch containing inappropriate content. The snapshot chain on the original branch loses all reachable entry points and enters a dangling state.
+2. **Drop the original branch**: `lfv branch-drop` the original branch containing inappropriate content. The snapshot chain on the original branch loses all reachable entry points and enters a dangling state.
 3. **Physical purge**: Execute `lfv gc --purge` to delete all dangling snapshots and their associated File Objects.
 
 For inappropriate content appearing across multiple branches, apply steps 1–2 to each relevant branch separately, then execute a single unified `gc --purge`. `gc --purge` is an explicit heavy operation that warns users this is irreversible physical deletion.
+
+**A shorter path: dropping the whole file-id.** When the whole history of a file is inappropriate, or none of it is worth keeping, steps 1–2 can be replaced by dropping its file-id: retire it with `lfv delete <file-id> --retire` if it is still active, then `lfv drop <file-id>`, and run `gc --purge`. This removes every branch and tag of the file at once, including the current branch, which `branch-drop` refuses, and needs no reconstruction. The price is that nothing of the file's history survives, so the branch-by-branch path remains the one to use when part of the history must be kept.
 
 By default, dangling snapshots and File Objects are retained — users can still recover them.
 
@@ -266,7 +268,7 @@ If `lfv mv <src> <f_dst-id>` were allowed to mix path manipulation with history 
 
 `lfv relink` also solves a second problem that `lfv mv` fundamentally cannot: **a new `file-id` produced by mistake**. A typical case is an OS-level rename plus a content change, which defeats automatic rename detection and leaves a `D` row for the old `file-id` next to a fresh one for the new path. The user then splices the fresh `file-id`'s history onto the old one and retires it. This is semantically a history-continuation operation, a different level of concept from a plain path rename; forcing them together would only make both commands hard to understand.
 
-Relink is deliberately **not** a way to merge two live files. `dst` must own no live path (`D`, deleted, or imported but not activated) and `src` must be a live file on disk (stored status `modified` or `unmodified`). Merging two live file-ids would require one of the two on-disk files to vanish or be overwritten, which is a very different operation with far more complex semantics.
+Relink is deliberately **not** a way to merge two live files. `dst` must own no live path (`D`, deleted, or on standby) and `src` must be a live file on disk (stored status `modified` or `unmodified`). Merging two live file-ids would require one of the two on-disk files to vanish or be overwritten, which is a very different operation with far more complex semantics.
 
 ## 16. Tree reverse references use `tree_file_refs` DB table
 
@@ -392,13 +394,44 @@ A ULID is Crockford Base32-encoded: of its 26 characters, roughly the first 10 a
 
 ## 31. LFV visibility is checked at use time, never recorded in history
 
-**Why no visibility flag in the history**: visibility is a function of a path and the current `.lfvignore`, not a property of a file-id or a snapshot. One file-id's snapshots may sit at different paths on different branches, some visible and some not, so a per-file-id flag has no single correct value; a per-snapshot flag would violate the immutability of `snapshots.log`; and because `.lfvignore` can be edited back, any stored flag would either have to be rewritten or would drift from the rules. The state a file-id falls into when its path becomes invisible — a `tracked` row dropped by the scan, history intact, no live path — already exists (a deleted file, an imported file-id not yet activated), so no new storage state is needed.
+**Why no visibility flag in the history**: visibility is a function of a path and the current `.lfvignore`, not a property of a file-id or a snapshot. One file-id's snapshots may sit at different paths on different branches, some visible and some not, so a per-file-id flag has no single correct value; a per-snapshot flag would violate the immutability of `snapshots.log`; and because `.lfvignore` can be edited back, any stored flag would either have to be rewritten or would drift from the rules. The state a file-id falls into when its path becomes invisible — a `tracked` row dropped by the scan, history intact, no live path — already exists (a deleted file, an imported file-id on standby), so no new storage state is needed.
 
 **Why a single scope rule instead of per-command checks**: continuous monitoring is unnecessary; one matcher call at the moment a command fixes a working-area path is cheap, and the matcher is already loaded for the scan. Most commands operate on an active file-id whose path the scan has already confirmed, so the check only matters for paths taken from arguments or from history. Stating it once in spec §4 (and implementing it once, before any other precondition) keeps commands from diverging — a per-command clause is easy to forget, as `mv`'s target path and the tree rewind manifest showed.
 
 **Why a path that becomes visible again resumes its former file-id**: while the path is invisible, the repository itself does not change — the file-id's HEAD still sits at that path with content. Whether a file-id is tracked is decided by the repository; the `tracked` row is only a cache of it, and `rebuild-index` would give that file-id its row back. If the scan allocated a new file-id instead, the result would depend on whether a cache row happened to be dropped, and a later `rebuild-index` would find two file-ids claiming one path. Resuming makes a visibility round trip behave exactly like a file deleted and restored in the OS before any `lfv snap`: same file-id, `unmodified` if nothing changed. For the same reason the resume check runs before rename detection: `rebuild-index` assigns the path to that file-id unconditionally.
 
 **Why `lfv rewind <TS-ish>` refuses without `--force`**: restoring a tree snapshot is expected to reproduce it in full; silently skipping entries would leave a working tree that no longer matches the tree HEAD. Requiring `--force` makes the user acknowledge the scope change. The target Tree Snapshot is not rewritten (it is immutable); the next `lfv snap --tree` is built from the tracked files and therefore contains no invisible path, just as it never contains inactive files.
+
+## 32. Former file-ids: one tracking rule, user-resolved conflicts, and `lfv drop`
+
+**Why one tracking rule shared by the scan and `rebuild-index`**: spec §3.4 requires the index to equal what a rebuild followed by a full scan would produce. When the scan and `rebuild-index` each had their own idea of which file-id is active where, they drifted apart: `rebuild-index` gave rows to file-ids whose path was invisible or dynamically untracked, while the scan allocated new file-ids for paths that a rebuild would hand back to an existing one. A single rule, called by both, makes such divergence impossible by construction rather than by review.
+
+**Why a file-id without snapshots counts as a former file-id**: before its first snapshot, `meta.initial_path` is the only record of where the file lives, and `rebuild-index` already used it to keep that file-id. Treating it as the last recorded path keeps the scan in line. For the same reason, cancelling an `A` file that disappeared deletes its directory instead of leaving an empty shell: the shell would remain a candidate for its path and silently capture the next file created there.
+
+**Why a conflict is never resolved automatically**: several former file-ids for one path do not arise from ordinary use; they come from importing history, merging repositories across devices, or leftovers of a crash. Any automatic tie-break (latest HEAD, largest ULID) would decide for the user which history a file continues, and would keep deciding it the same way every time. LFV therefore allocates nothing and asks.
+
+**Why the user's choice is recorded as standby on the other candidates**: when several candidates compete for a path, the repository itself must record which one the user chose, or rebuilding the index would bring the conflict back (spec §3.4). Several records were considered. Keeping the choice only until the next snap is not enough: the snap changes the chosen file-id's log, but the other candidates still claim the path. A binding on the path in `config.yaml` needs lifetime rules of its own and leaves the candidates competing underneath. A deletion snapshot appended to the losers would write an identity decision into content history, and would claim that the file vanished from a path where a file exists. A full `active` field would duplicate what is already derived from visibility, the untracked list and the HEAD snapshot, and would have to be kept in step with all of them. `standby` is narrow: it only says "do not compete", and everything else stays derived. It is set and cleared only by the user's explicit choice (`lfv track --as` / `--new`, `lfv revive`), so the user can switch the active file-id at any time, and since only candidates not on standby compete, a new conflict is always put to the user.
+
+**Why the choice is made by claiming, not by deleting**: at the moment of a conflict the file exists at the path and belongs to no file-id yet, so `lfv delete <file-id>` would read as deleting that very file. What the user does is claim it — "this file is X" — which belongs to `lfv track`; putting the other candidates on standby is the consequence of the claim.
+
+**Why imported file-ids start on standby**: an imported history is not yet wanted in the working tree. Before `standby` existed, this intent lived only in the absence of an index row, which `rebuild-index` could not reproduce.
+
+**Why relink is not a way to end a conflict**: a conflict may also be ended for good by retiring unwanted candidates (`lfv delete --retire`, §33) or, for inappropriate content, dropping them. Relinking one candidate onto another would append its whole chain to the other's history, which has no meaning for two long independent histories and is often refused by the single-branch object uniqueness check, since such candidates typically share objects.
+
+## 33. `delete` keeps history, `drop` gives it up
+
+LFV has two ways of setting history aside, and each command belongs to exactly one of them:
+
+- **Keeping the history**: `lfv delete` ends a file's presence on disk with a deletion snapshot, and the file can be revived; `lfv delete --retire` ends the identity of a whole file-id — it never owns a path again, but its history stays reachable, so every snap-id, tag and tree snapshot that refers to it stays valid.
+- **Giving the history up**: `lfv drop`, `lfv branch-drop` and `lfv tag-drop` remove what keeps snapshots reachable, and `lfv gc --purge` then removes them physically.
+
+**Why retirement is spelled `delete --retire`**: it keeps the history, like every other `delete`, so the word `delete` never means losing history in LFV; only `drop` does. The flag marks that the identity itself ends, which a plain delete does not do (a deleted file can be revived).
+
+**Why relink ends by retiring rather than dropping its src**: the chain relink copies onto dst has new snap-ids and later timestamps, so the snap-ids and tags of src, and the tree snapshots taken before the relink, still point at src's own snapshots. Dropping src would break all of them after the next purge. Relink is therefore a composition — splice the chain, hand the on-disk file to dst, then retire src with the same step `lfv delete --retire` uses — and is not one atomic operation.
+
+**Why `branch-delete` and `tag-delete` became `branch-drop` and `tag-drop`**: removing a branch or a tag removes a gc root, and snapshots reachable only through it are removed by the next purge (a `tree:detour` tag, for instance, is often the only root of the tree HEAD it preserves). That is dropping, not deletion in LFV's sense.
+
+**Why `lfv drop` serves inappropriate content**: before it existed, removing content meant rebuilding each affected branch and deleting the original ones (§10). When the whole history of a file is inappropriate, dropping the file-id does the same in one step; it amounts to dropping every branch and tag of that file-id, including the current branch, which `branch-drop` refuses.
 
 ## Possible Future Extensions
 

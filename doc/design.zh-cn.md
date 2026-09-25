@@ -228,9 +228,13 @@ pub struct TrackedFile {
 pub struct FileMeta {
     pub created_at: Timestamp,
     pub initial_path: RepoPath,                  // path at track time; lets an A-state file survive rebuild-index
-    pub retired: Option<Retired>,                // set by relink on the src side
+    pub retired: Option<Retired>,                // set by `lfv delete --retire`, or by relink on the src side
+    pub dropped: Option<Dropped>,                // set by `lfv drop`
+    pub standby: Option<Standby>,                // set by import and by `lfv track --as/--new`; cleared when chosen
 }
-pub struct Retired { pub at: Timestamp, pub onto: FileId }
+pub struct Retired { pub at: Timestamp, pub onto: Option<FileId> }  // onto: set by relink only
+pub struct Dropped { pub at: Timestamp }
+pub struct Standby { pub at: Timestamp }
 ```
 
 - `TrackedStore::create(initial_path) -> FileId`：分配 ULID，建目录，写 `meta.yaml`、`HEAD = main`、空 `branches.yaml`（分支在首条快照时才写入，§3.8）、空日志。
@@ -263,7 +267,7 @@ fn flag(row, head: Option<&Snapshot>) -> Flag
 
 `untracked` 行单独一张表（§3.6），只登记盘上存在的路径（§4.2）。
 
-不变量：**同一时刻一条路径至多属于一个活跃（未退役、非 untracked）file-id**；`D` 行占用的是它 HEAD 快照的路径，若该路径重新出现文件，扫描视为同一文件回归（`M` 或 unmodified），而非新文件。
+不变量：**同一时刻一条路径至多属于一个活跃（未退役、非 untracked）file-id**，处于冲突（§3.10）的路径不属于任何 file-id；`D` 行占用的是它 HEAD 快照的路径，若该路径重新出现文件，扫描视为同一文件回归（`M` 或 unmodified），而非新文件。
 
 ### 2.8 参数解析（`resolve`）
 
@@ -488,6 +492,7 @@ Tree Object 通常很小（每个跟踪文件一行），低于 `min_bytes` 压�
 | ---- | ---- | ---- |
 | `tracked` | 当前拥有路径的跟踪文件（含盘上消失、待 `lfv snap` 记录删除的 `D` 行）。主键 file-id；缓存 HEAD 快照的 path/object/size 与上次扫描的盘上 mtime/size/hash，供增量扫描短路。 | ✓ |
 | `untracked` | `config.yaml` 动态 untracked 列表 ∩ LFV 可见 ∩ 盘上存在的路径；保留已知的前 file-id 供 `lfv track` 复用。 | ✓ |
+| `conflicted` | 盘上存在的、处于冲突（spec §4.2）的路径：LFV 可见、非动态未跟踪、有多个非待命候选（§3.10）。 | ✓ |
 | `scan_meta` | 扫描元数据：`last_completed_at`、`.lfvignore` 与 `config.yaml` 的 mtime，供增量扫描失效判定。 | ✓ |
 | `branches` | 每个文件的分支指针缓存。真理源为 `.lfv/files/<ULID>/branches.yaml`。 | ✓ |
 | `tags` | 每个文件的标签缓存。真理源为 `.lfv/files/<ULID>/tags.yaml` 及 `.lfv/trees/tags.yaml`。 | ✓ |
@@ -523,7 +528,13 @@ CREATE UNIQUE INDEX tracked_path ON tracked(path) WHERE present = 1;
 -- dynamically untracked paths that exist on disk (config.yaml untracked list ∩ visible ∩ on disk)
 CREATE TABLE untracked (
     path      TEXT PRIMARY KEY,
-    file_id   TEXT,                  -- former file-id, if non-retired and not currently active; reused by `lfv track` (§3.10)
+    file_id   TEXT,                  -- former file-id per the tracking rule (§3.10); reused by `lfv track`
+    size      INTEGER NOT NULL
+);
+
+-- paths in conflict that exist on disk (several candidates not on standby; §3.10)
+CREATE TABLE conflicted (
+    path      TEXT PRIMARY KEY,
     size      INTEGER NOT NULL
 );
 
@@ -592,12 +603,16 @@ LFV 不支持 detached HEAD——`rewind` 强制新建分支保留旧 HEAD，所
 ```yaml
 created_at: 2026-05-17T09:21:33Z
 initial_path: "docs/note.md"      # path at track time; the only record of it before the first snapshot
-retired: ~                        # ~ until `lfv relink <this> --onto <onto>`, then a nested block:
+retired: ~                        # ~ until `lfv delete <this> --retire` or `lfv relink <this> --onto <onto>`, then a nested block:
                                    #   at: 2026-06-01T08:00:00Z
-                                   #   onto: file:01HA7BCD...
+                                   #   onto: file:01HA7BCD...     (relink only)
+dropped: ~                        # ~ until `lfv drop <this>`, then a nested block:
+                                   #   at: 2026-06-02T10:00:00Z
+standby: ~                        # ~ unless set aside (import, or not chosen by `lfv track --as/--new`):
+                                   #   at: 2026-06-03T11:00:00Z
 ```
 
-`initial_path` 让尚无快照的文件在 `rebuild-index` 后仍能回到 `tracked` 表而不被再次分配 file-id；`retired` 让退役 file-id 在重建时不与 `onto` 一侧争抢路径。
+`initial_path` 是尚无快照文件最后记录的路径（§3.10），使这样的文件在 `rebuild-index` 前后、以及一段时间没有 `tracked` 行之后，仍保有原 file-id；`retired` 与 `dropped` 使 file-id 不具资格，从而不参与路径争夺；`standby` 使具备资格的 file-id 在被用户选中之前不参与争夺。
 
 **`.lfv/files/<ULID>/REPLAY.yaml`**
 
@@ -644,7 +659,7 @@ rewind/7RQ2M9KA/1: snap:01HABC...
 ```
 
 - 分支首次创建时写入；`lfv snap` 在当前分支上产生新快照后更新对应 value。
-- `lfv branch-delete` 删除对应 key；快照本身不受影响（append-only）。
+- `lfv branch-drop` 删除对应 key；快照本身不受影响（append-only）。
 
 **`.lfv/files/<ULID>/tags.yaml`**
 
@@ -687,27 +702,41 @@ tree:release: snap:01HZZZ...
 | `relink`（§4.7） | ① 复制链 append 到 dst 日志 → ② dst `branches.yaml` 推进 → ③ src `meta.yaml` 写 `retired` → ④ index（`tracked` 行改挂到 dst；若仍有 `untracked` 行指向 dst，将其 `file_id` 置空） | ① 后：dst 日志尾部多一段无分支引用的悬空链（`gc --purge` 可回收），重跑 relink 会重新生成一段新 ULID 的链；② 后：src 未退役，两个 file-id 同时声称同一路径，需重跑 relink；③ 后：索引落后，包括一条指向 dst 的 stale `untracked.file_id`——无害，§3.10 的重建规则本就排除活跃 file-id |
 | `import`（§4.16） | ① 写 `objects/` → ② 归档目录整体 rename 到 `files/<ULID>/` → ③ index `snap_locator` | ① 后：多出无引用对象（`gc` 回收）；② 是原子分界点，rename 成功即视为导入完成；③ 后：索引落后，`rebuild-index` 修复 |
 | `snap --tree`（§4.11） | ① 写 Tree Object → ② append Tree Snapshot → ③ `trees/HEAD` → ④ `trees/tags.yaml` → ⑤ index | ① 后：多一个无引用对象；② 后：悬空 Tree Snapshot；③ 后：标签未写入，重跑 `--tag` 即可；④ 后：索引落后 |
+| `track --as` / `--new`（§4.4） | `--as`：① 清除所选 file-id 的 `standby` → ② 在该路径其余每个候选的 `meta.yaml` 写入 `standby` → ③ 若该路径离开 `untracked`，原子写入 `config.yaml` → ④ index。`--new`：① 在每个候选写入 `standby` → ② 创建新 file-id → ③、④ 同上 | `--as` ① 后：多个候选再次争夺，路径处于冲突，重跑命令即可完成。`--new` ① 后：没有候选参与争夺，下次扫描会把该文件作为新文件 auto-track，这正是预期结果。② 或 ③ 后：索引落后 |
+| `delete --retire`（§4.8） | ① 删除盘上文件（仅限活跃的 file-id） → ② `meta.yaml` 写 `retired` → ③ index | ① 后：文件显示为 `D`，重跑命令即可完成；② 后：索引落后 |
+| `drop`（§4.8） | ① `meta.yaml` 写 `dropped` → ② index | ① 后：索引落后 |
+| 取消 `A` 文件的跟踪（§4.9） | ① 删除其 `meta.yaml` → ② 删除 `files/<id>/` 的其余内容 → ③ index | ① 或 ② 后：`files/` 下没有 `meta.yaml` 的目录属于残留垃圾，`rebuild-index` 跳过、`gc` 删除；② 后：索引落后 |
 | `gc --purge`（§3.11） | ① 按可达性裁剪各日志 → ② 按新引用集删除对象 | 两步之间崩溃只会多留对象，安全 |
 
 ### 3.10 `rebuild-index` 算法
 
+**跟踪判定规则**实现 spec §3.4（缓存一致性）与 spec §4.2（原 file-id）。它是"哪个 file-id 活跃在哪个路径"的唯一推导：`rebuild-index`、扫描（§4.3.1、§4.4）、`lfv track` 与 `lfv drop` 都调用它（`index::tracking_rule`），没有任何一处另行重述。
+
+- file-id 的*最后记录的路径*：其当前分支 HEAD 快照的 `head.path`；没有快照时为 `meta.initial_path`。
+- *具备资格*：`meta.retired` 与 `meta.dropped` 均未设置，且该 file-id 没有快照，或其 HEAD 的 `object != null`。
+- 路径 P 的*候选*：最后记录的路径为 P 的、具备资格的 file-id，无论是否待命；*争夺者*：没有 `meta.standby` 的候选。
+- 对 LFV 可见且不在 `config.untracked` 中的路径 P：只有一个争夺者时，该 file-id 活跃在 P；有多个时，P **处于冲突**，P 上没有活跃的 file-id；没有争夺者时，P 上没有活跃的 file-id。其它路径上都没有活跃的 file-id。
+
+活跃在 P 的 file-id 有一条 `tracked` 行，`path = P`，`present = stat(P)`。处于冲突且盘上存在的路径有一条 `conflicted` 行。
+
+`rebuild-index` 就是把这条规则应用于整个仓库：
+
 1. 重建 schema。
-2. 遍历 `files/*/`：读 meta、HEAD、branches、tags、日志。写 `branches`、`tags`、`snap_locator`。`retired` 的 file-id 不写 `tracked`（但仍写 `snap_locator`，`lfv log file:<src>` 要能用）。按当前分支 HEAD 快照：
-   - 有且 `object != null` → `tracked` 行：`path = head.path`，`present = stat 成功`，`head_*` 填充，`disk_*` 置空（迫使下次扫描重新 hash）；
-   - 有且 `object == null` → 已删除，无行；
-   - 无快照 → `path = meta.initial_path`，`present = stat`，`head_* = NULL`。
-3. tree plane：读 `trees/snapshots.log` → `snap_locator(file_id = NULL)`；`trees/tags.yaml` → `tags`；`tree_file_refs` 按下面的归属规则重建。
-4. `untracked`：`config.untracked ∩ 可见 ∩ 盘上存在`；在未退役且非活跃（§2.7）的 file-id 中，`file_id` 取其当前分支 HEAD 满足 `path == P` 且 `object != null` 的那个（同时满足者取 HEAD `created_at` 最晚的一个）——不是历史中间某一刻经过 P 的 file-id；不存在则留空。
-5. 清空 `scan_meta` → 下次扫描为全量。
+2. 遍历 `files/*/`（跳过没有 `meta.yaml` 的目录，§3.9）：读 meta、HEAD、branches、tags、日志。为每个 file-id（含退役与已清除的，`lfv log file:<id>` 在 purge 之前要能用）写 `branches`、`tags`、`snap_locator`，并记下每个 file-id 最后记录的路径与资格。
+3. 对每个最后记录的路径应用跟踪判定规则：每个活跃的 file-id 得到一条 `tracked` 行（`head_*` 取自其 HEAD 快照，没有快照时为 NULL；`disk_*` 置空，迫使下次扫描重新 hash）；每个处于冲突且盘上存在的路径得到一条 `conflicted` 行。
+4. tree plane：读 `trees/snapshots.log` → `snap_locator(file_id = NULL)`；`trees/tags.yaml` → `tags`；`tree_file_refs` 按下面的归属规则重建。
+5. `untracked`：`config.untracked ∩ 可见 ∩ 盘上存在`；`file_id` 取 P 唯一的争夺者，否则留空。
+6. 清空 `scan_meta` → 下次扫描为全量。
 
 **`tree_file_refs` 归属规则**：Tree Object 只有 `{path, hash}`，没有 file-id。对每个清单条目 `(P, H)`，在所有 file-id 日志中找 `path == P && object == H && created_at <= tree.created_at` 的快照，取 **created_at 最晚**者所属 file-id。此规则对"删除后同路径新文件"和 relink（复制链的 ULID 更新，时间更晚）两种情况都给出正确答案；残余歧义只在同一时刻两个 file-id 持有相同 `(P, H)`，正常操作不会发生。
 
 ### 3.11 可达性与 gc
 
-- 根：file plane = 所有 file-id（含退役）的所有分支头 + 所有标签 + 存在的 `REPLAY.yaml` 里引用的快照；tree plane = `trees/HEAD` + 所有 `tree:` 标签。
+- 根：file plane = 所有未清除 file-id（含退役）的所有分支头与所有标签 + 存在的 `REPLAY.yaml` 里引用的快照；tree plane = `trees/HEAD` + 所有 `tree:` 标签。
 - 可达快照 = 从根沿 `parent` 闭包。可达对象 = 可达快照的 `object` ∪ 可达 Tree Snapshot 清单中的条目。
 - `lfv gc`：删除**任何快照（含悬空）都不引用**的对象；不动日志。
-- `lfv gc --purge`：先按可达性对每个日志执行 `SnapshotLog::prune`：不可达快照整行丢弃，保留的行逐字节不变——这是日志除追加之外唯一的变更，只删除、从不改写已有记录；再按新的引用集删除对象。两步之间崩溃是安全的（只会多留对象）。
+- `lfv gc --purge`：先按可达性对每个日志执行 `SnapshotLog::prune`：不可达快照整行丢弃，保留的行逐字节不变——这是日志除追加之外唯一的变更，只删除、从不改写已有记录；再按新的引用集删除对象。日志因此变空的已清除 file-id，连同其索引行一起删除目录 `files/<id>/`（`meta.yaml` 最后删）。各步之间崩溃都是安全的（只会多留对象，或多留一个日志为空的已清除目录）。
+- `lfv gc` 与 `lfv gc --purge` 也删除 `files/` 下没有 `meta.yaml` 的残留目录（§3.9）。
 
 ## 4. 内部机制
 
@@ -779,8 +808,8 @@ cli::<cmd>::run(args)
 
 | 层级 | 对象 | 扫描动作 |
 | ---- | ---- | ---- |
-| **A. 已登记路径** | `tracked` / `untracked` 中已有的行 | 对每行先依据 `.lfvignore` mtime 决定是否判断 LFV 可见，不可见则删除状态表记录，可见则 `stat` + 状态更新；`stat` 失败的 tracked 行走 auto-delete（§4.5）。成本 O(已登记路径数)。 |
-| **B. 发现新路径** | 遍历中见到的、尚未登记的 LFV 可见路径 | 动态未跟踪文件设置为 `untracked`；可跟踪候选先尝试恢复原 file-id（§4.4），再做改名识别（§4.6），未配对者执行 auto-track（§4.4）。 |
+| **A. 已登记路径** | `tracked` / `untracked` / `conflicted` 中已有的行 | 对每行先依据 `.lfvignore` mtime 决定是否判断 LFV 可见，不可见则删除状态表记录，可见则 `stat` + 状态更新；`stat` 失败的 tracked 行走 auto-delete（§4.5）。`conflicted` 行每次扫描都用跟踪判定规则（§3.10）重新评估：文件已消失则删除，唯一的争夺者使某个 file-id 变为活跃时转为 `tracked` 行。成本 O(已登记路径数)。 |
+| **B. 发现新路径** | 遍历中见到的、尚未登记的 LFV 可见路径 | 动态未跟踪文件设置为 `untracked`；可跟踪候选先用跟踪判定规则检查：路径上有活跃的 file-id 则恢复它，路径处于冲突则登记 `conflicted` 行（§4.4）；只有没有候选的路径才做改名识别（§4.6），未配对者执行 auto-track（§4.4）。 |
 
 以上扫描动作都会更新状态表。此外，`lfv track`、`lfv untrack` 也会更新 `config.yaml` 与状态表。
 
@@ -819,12 +848,14 @@ cli::<cmd>::run(args)
 - 若匹配 `.lfvignore` → **忽略**（不登记，§4.2）；
 - 若在 `config.yaml` 动态 untracked 列表中 → 登记为 `untracked`（§4.2）；
 - 若路径违反 spec §4.2 路径规则 → 不登记，只给出警告（扫描照常继续）并提示加入 `.lfvignore`；
-- 若该路径存在**原 file-id** → 恢复它（见下文）；此判断先于改名识别（§4.6）；
+- 若跟踪判定规则（§3.10）使某个 file-id 活跃在该路径 → 恢复它；若该路径处于冲突 → 登记为 `conflicted`（均见下文）；两者都先于改名识别（§4.6）；
 - 否则，且改名识别未配对 → 视为「OS 新建」，自动 `track`：`tracked::TrackedStore::create(path)` 分配 `file-id`、建目录并写 `meta.initial_path`，`tracked` 表插入 `status = modified`、无 `head_*` 的行。
 
 **不会立即追加 Snapshot**，由后续 `lfv snap` 落盘首条 Snapshot。
 
-**恢复原 file-id**：路径 P 的原 file-id，指未退役、没有 `tracked` 行、且当前分支 HEAD 的 `path == P`、`object != null` 的 file-id（并列时取 HEAD `created_at` 最晚者，再取 snap-id 最大者）——与 §3.10 第 4 步 `untracked.file_id` 的候选规则相同。对仓库而言，这样的 file-id 仍在跟踪中，只是丢了 `tracked` 行，典型原因是其路径曾有一段时间 LFV 不可见（§4.3.1）。因此扫描按 `rebuild-index` 的方式（§3.10 第 2 步）重建该行：`path = head.path`，`present = 1`，`head_*` 取自 HEAD 快照，状态按 §2.7 推导（盘上内容等于 `head.object` 时为 `unmodified`，否则为 `modified`）。不分配 file-id，也不写 `files/` 下的任何内容。此判断先于改名识别，因为 `rebuild-index` 会无条件把 P 分配给该 file-id；若改为分配新 file-id，就会有两个 file-id 同时占有 P，而这种状态 `rebuild-index` 无法重现。候选在每次扫描中一次性收集为内存映射 `HEAD path -> file-id`，且仅在层级 B 有新路径时才收集。
+**恢复原 file-id**（spec §4.2）：对跟踪判定规则使其活跃在 P 的 file-id，扫描按 `rebuild-index` 的方式（§3.10）重建其 `tracked` 行：`present = 1`，`head_*` 取自其 HEAD 快照（没有快照时为 NULL），状态按 §2.7 推导（盘上内容等于 `head.object` 时为 `unmodified`，否则为 `modified`）。不分配 file-id，也不写 `files/` 下的任何内容。此判断先于改名识别，因为 `rebuild-index` 会无条件把 P 分配给该 file-id；若改为分配新 file-id，就会有两个 file-id 同时占有 P，而这种状态 `rebuild-index` 无法重现。P 处于冲突时，改为插入一条 `conflicted` 行，此外什么也不做。没有 `tracked` 行的具备资格 file-id 的最后记录路径，在每次扫描中一次性收集为内存映射 `path -> [file-id]`，且仅在层级 B 有新路径或 `conflicted` 非空时才收集。
+
+**`lfv track <P> --as <F>` / `--new`**（`ops::track_as`，spec §4.2）：P 上当前活跃的 file-id 处于 `modified` 时拒绝；`--as` 的 F 不是 P 的候选时也拒绝。`--as` 清除 F 的 `standby`，并在 P 的其余每个候选写入 `standby`；`--new` 在 P 上创建新 file-id（`TrackedStore::create`），并在 P 的每个候选写入 `standby`。若 P 在 `config.untracked` 中，将其移除。盘上文件不动：之后 F（或新 file-id）是 P 唯一的争夺者，索引把 P 的 `conflicted`、`untracked` 或原 `tracked` 行替换为它的 `tracked` 行，状态按 §2.7 相对其 HEAD 推导。对一个有多个争夺者的动态未跟踪路径执行普通的 `lfv track <P>`，只会把 P 从 `untracked` 中移除，P 随即处于冲突。`lfv status <P>` 用与扫描相同的映射列出 P 的候选（spec §4.3.1）。
 
 自动 track 的触发时机：`lfv status`（扫描时即时执行）、`lfv track`（无参跟踪时执行）、`lfv snap`（无参批量拍照前执行）。
 
@@ -879,10 +910,10 @@ cli::<cmd>::run(args)
 该命令专为"用户误操作导致 LFV 产生了新的 file-id"的场景设计（典型场景：OS 层改名+改内容导致 auto-track 分配了新 file-id），不应作为日常命令。如果 src-file-id 还没有历史，则 dst-file-id 的历史维护不变，只做 file-id 绑定转移。
 
 - **src-file-id**：活跃的 file-id（在跟踪中、未退役），且文件在盘上存在（`present = 1`）；存储状态 `modified` 或 `unmodified` 均可。`present = 0` 则拒绝，因为没有盘上文件可以移交
-- **dst-file-id**：必须没有活跃路径——已从磁盘消失的文件（`present = 0`，旧 file-id，待续接）、最新快照 `object = null` 的已删除文件、已 untrack 但仍有历史的 file-id（无 `tracked` 行；其原路径可能还在 `config.untracked` 里并留有一条活的 `untracked` 行），或 import 进来尚未激活的 file-id（无 `tracked` 行）。dst 当前占有活跃路径（`present = 1`）则拒绝：relink 不用于合并两个活文件。dst 若仍有 `tracked` 行（`present = 0`），由改挂后的 src 行取代
+- **dst-file-id**：必须没有活跃路径——已从磁盘消失的文件（`present = 0`，旧 file-id，待续接）、最新快照 `object = null` 的已删除文件、已 untrack 但仍有历史的 file-id（无 `tracked` 行；其原路径可能还在 `config.untracked` 里并留有一条活的 `untracked` 行），或处于待命的 file-id，如 import 进来的（无 `tracked` 行；relink 在推进其分支表时一并清除其 `standby`）。已退役或已清除的 dst 被拒绝。dst 当前占有活跃路径（`present = 1`）则拒绝：relink 不用于合并两个活文件。dst 若仍有 `tracked` 行（`present = 0`），由改挂后的 src 行取代
 - **最终保留的 file-id 是 `--onto` 的那一侧（dst-file-id）**，与介词方向一致
 
-执行后 src-file-id 的当前路径和内容作为 dst-file-id 历史的下一条 Snapshot 追加（情况一中与 dst 末尾快照完全相同时不追加）；src-file-id 的 `tracked` 行改挂到 dst-file-id（`file_id` 换、`head_*` 取 dst），不再产生新快照。**src-file-id 的 `files/<src-file-id>/` 目录及 `snapshots.log` 完整保留**（append-only，不删除），并在其 `meta.yaml` 写入 `retired: {at, onto: dst}`；src-file-id 成为"已退役"的 file-id，`lfv log src-file-id` 仍然有效，`lfv list` 默认不列。
+执行后 src-file-id 的当前路径和内容作为 dst-file-id 历史的下一条 Snapshot 追加（情况一中与 dst 末尾快照完全相同时不追加）；src-file-id 的 `tracked` 行改挂到 dst-file-id（`file_id` 换、`head_*` 取 dst），不再产生新快照。**src-file-id 的 `files/<src-file-id>/` 目录及 `snapshots.log` 完整保留**（append-only，不删除），最后一步由 `lfv delete <src> --retire` 所用的同一个 `ops::retire`（§4.8）让 src-file-id 退役，并记录 `onto: dst`——relink 是续接与退役的组合，而不是一个原子步骤（§3.9）；src-file-id 成为"已退役"的 file-id，`lfv log src-file-id` 仍然有效，`lfv list` 默认不列。
 
 如果 dst 原是"已 untrack 但有历史"的 file-id，它的原路径在 `config.untracked` 中保持不变；只清一件事：若还有一条 `untracked` 行的 `file_id = dst`，将该字段置空（索引层记录，§3.9）。
 
@@ -909,6 +940,10 @@ src-file-id 已经产生了若干 Snapshot（链为 `snap_A1 -> snap_A2 -> ... -
 
 文件 **历史完整保留**：仍可 `lfv log` / `lfv show` / `lfv diff` 查询；想"复活"用 `lfv revive`（§4.10）或直接 `lfv rewind <file> <snap>`，二者都会自动新建保留分支（不破坏既有删除事件）。
 
+**`lfv delete <file> --retire`**（`ops::retire(file, onto)`，spec §4.2）：该 file-id 已退役、已清除或有 `REPLAY.yaml` 时拒绝。① 若该 file-id 有 `present = 1` 的 `tracked` 行，删除其盘上文件；② 在其 `meta.yaml` 写入 `retired: {at, onto}`（此处不写 `onto`）；③ 索引：删除其 `tracked` 行，重新计算指向它的 `untracked.file_id`，并用跟踪判定规则（§3.10）重新评估把它列为候选的路径——只剩一个候选的 `conflicted` 路径转为该 file-id 的 `tracked` 行。不追加任何快照。`lfv relink` 调用 `ops::retire(src, onto = dst)` 并跳过步骤 ①，因为盘上文件已移交给 dst。`lfv revive`、`lfv relink --onto` 与 `lfv track --as` 都拒绝已退役的 file-id。
+
+**`lfv drop <file-id>`**（`ops::drop`，spec §4.2）：该 file-id 有 `tracked` 行（含 `D`）、有 `REPLAY.yaml`、或已被清除时拒绝。在其 `meta.yaml` 写入 `dropped: {at}`，然后更新索引：重新计算指向它的 `untracked.file_id`，并用跟踪判定规则（§3.10）重新评估把它列为候选的路径——只剩一个候选的 `conflicted` 路径转为该 file-id 的 `tracked` 行。其日志、分支与标签保持原样，由 `lfv gc --purge` 删除（§3.11）。`lfv revive`、`lfv relink --onto` 与 `lfv track --as` 都拒绝已清除的 file-id。
+
 ### 4.9 `lfv snap`：内部执行流程
 
 **单文件**（`ops::snap_file`）：
@@ -921,7 +956,7 @@ src-file-id 已经产生了若干 Snapshot（链为 `snap_A1 -> snap_A2 -> ... -
    - 否则 `snapshot::loop_check`（§4.13）→ 命中则拒绝并输出 rewind 提示；
    - append `Snapshot { parent: head_snap, path, object: hash, size }`；分支表推进；`tracked` 行更新 `head_*`、`disk_*`，`status = unmodified`。
 3. `present = 0`：
-   - `head_snap` 为 `None`（`A` 且已消失）→ 不产生快照，删除 `tracked` 行，`files/<id>/` 目录保留为空壳（gc 可清理）；
+   - `head_snap` 为 `None`（`A` 且已消失）→ 不产生快照，删除 `tracked` 行，并删除 `files/<id>/` 目录（写入顺序见 §3.9）：该 file-id 没有历史，残留的目录会一直是其 `initial_path` 的候选（§3.10）；
    - 否则 append `Snapshot { parent: head_snap, path: 盘上最后已知路径, object: null, size: 0 }`；分支表推进；删除 `tracked` 行。
 4. 写入顺序按 §3.9。
 
@@ -967,8 +1002,9 @@ if t.object == null:
 else if fs_ish given                             -> error (use `lfv rewind <file> <FS-ish>`)
 else if tracked row exists && present = 1        -> no-op, print a message
 else if tracked row exists && present = 0        -> error (status D: `lfv show <file> --out <path>`, or `lfv snap` first)
-else:                                            // no tracked row, e.g. imported (§4.16)
+else:                                            // no tracked row, e.g. on standby after an import (§4.16)
     object.restore_to(t.object, t.path)
+    clear meta.standby if set
     insert tracked row (present = 1, unmodified); no preserving branch
 ```
 
@@ -1097,11 +1133,11 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 1. 解压/打开归档，定位其 `<ULID>/` 目录；若当前仓库 `files/<ULID>/` 已存在则报错拒绝（正常不会发生，ULID 全局唯一），不做部分导入或合并两条历史。
 2. 解析归档内 `snapshots.log`，逐行重算 `digest`（§3.3.2）并与记录比对；任一行不符即整体拒绝导入。
 3. 遍历该日志引用到的每个 `object` hash：归档同时带着这些 File Object（结构与 `.lfv/objects/` 一致），对每个 hash 若本地 `objects/` 已存在则跳过（按内容去重，与 §3.2 的写入策略一致），否则原样写入（不重新压缩判定，信任归档里的编码；`verify` 会在之后校验 hash）。
-4. 把归档的 `meta.yaml`、`HEAD`、`branches.yaml`、`tags.yaml`、`snapshots.log` 整体拷贝到 `.lfv/files/<ULID>/`。
-5. 为该日志的每条快照写入 `snap_locator(snap_id, file_id)`，使 `lfv log <snap-id>` 立即可用；**不**创建 `tracked` 行，也不修改 `config.yaml`——该 file-id 处于"有历史、未激活"状态，等同于 §4.7 relink 中"已退役"的 file-id，但没有 `meta.retired`（它不是被某个 dst 吸收，只是尚未 materialize）。
-6. 输出汇总：file-id、分支数、快照数、导入的对象数。提示可用 `lfv revive <file-id>` 恢复到工作树。
+4. 把归档的 `meta.yaml`、`HEAD`、`branches.yaml`、`tags.yaml`、`snapshots.log` 整体拷贝到 `.lfv/files/<ULID>/`，并在目录 rename 就位（§3.9）之前，在拷贝的 `meta.yaml` 中写入 `standby: {at}`，保证 import 进来的 file-id 从不以没有该标记的状态出现。
+5. 为该日志的每条快照写入 `snap_locator(snap_id, file_id)`，使 `lfv log <snap-id>` 立即可用；**不**创建 `tracked` 行，也不修改 `config.yaml`——该 file-id 处于待命（spec §3.1）：它有历史，但不是任何路径的争夺者，因此扫描与 `rebuild-index` 都不会激活它。
+6. 输出汇总：file-id、分支数、快照数、导入的对象数。提示可用 `lfv revive <file-id>` 恢复到工作树，其路径上已有文件时可用 `lfv track <path> --as <file-id>` 认领。
 
-对无 `tracked` 行、`HEAD` 快照 `object != null` 的 file-id，`lfv revive` 不做 rewind、直接激活（§4.10）：内容写到 `HEAD.path` 并插入 `tracked` 行；该路径已被另一个活跃 file-id 占用时拒绝，用户可先 `lfv mv` 让路。
+对无 `tracked` 行、`HEAD` 快照 `object != null` 的 file-id，`lfv revive` 不做 rewind、直接激活（§4.10）：内容写到 `HEAD.path`，清除 `standby`，并插入 `tracked` 行；该路径已被另一个活跃 file-id 占用时拒绝，用户可先 `lfv mv` 让路。
 
 ### 4.17 流程 → 模块映射总表
 
@@ -1113,8 +1149,8 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | auto-delete §4.5 | 扫描 | `scan` 层级 A | `index` |
 | 改名识别 §4.6 | 扫描 | `scan::rename_detect` | `index`、`object`（hash） |
 | mv §4.6 | mv | `ops::mv` | `resolve`、`object`、`snapshot`、`tracked`、`index` |
-| relink §4.7 | relink | `ops::relink` | `snapshot`（复制链）、`tracked`（retired）、`index` |
-| delete §4.8 | delete | `ops::delete` | `index`、`util::fs` |
+| relink §4.7 | relink | `ops::relink` | `snapshot`（复制链）、`ops::retire`、`index` |
+| delete §4.8 | delete、delete --retire | `ops::delete` / `ops::retire` | `index`、`util::fs`、`tracked`（meta）、`index::tracking_rule` |
 | snap §4.9 | snap | `ops::snap_file` / `ops::snap_all` | `object`、`snapshot::loop_check`、`tracked`、`index` |
 | rewind / switch / revive §4.10 | rewind, switch, revive | `ops::rewind_file` / `ops::switch` / `ops::revive` | `snapshot`、`object::restore_to`、`tracked`、`index` |
 | snap --tree §4.11 | snap --tree | `ops::tree_snap` | `object::TreeManifest`、`tree`、`index` |
@@ -1124,7 +1160,10 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | verify §4.15 | verify | `ops::verify` | 全部存储层 |
 | import §4.16 | import | `ops::import` | `snapshot`（digest 校验）、`object`（去重写入）、`tracked`（meta/branches/tags 拷贝）、`index.snap_locator` |
 | gc §3.11 | gc | `ops::gc` | `snapshot::prune`、`object::remove` |
-| rebuild-index §3.10 | rebuild-index | `ops::rebuild_index` | `index`、`tracked`、`tree` |
+| 跟踪判定规则 §3.10 | rebuild-index、scan、track、drop | `index::tracking_rule` | `tracked`（meta、HEAD）、`repo`（`config.untracked`）、`scan::visibility` |
+| track --as / --new §4.4 | track --as、track --new | `ops::track_as` | `tracked`（meta standby、`TrackedStore::create`）、`repo`（config）、`index::tracking_rule`、`index` |
+| drop §4.8 | drop | `ops::drop` | `tracked`（meta）、`index::tracking_rule`、`index` |
+| rebuild-index §3.10 | rebuild-index | `ops::rebuild_index` | `index`、`index::tracking_rule`、`tracked`、`tree` |
 | log / show / diff / list / branches / tags | 查询类 | `ops::query::*` | `resolve`、`snapshot`、`diff`、`index` |
 
 ## 5. 路线图落地顺序（对照 spec §7）
@@ -1132,7 +1171,7 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 | 版本 | 命令 | 需要的模块 |
 | --- | --- | --- |
 | v0.1 | init / config / track / untrack / snap / status / log / show / list / rebuild-index；branches / switch / rewind | `util repo object snapshot reftable tracked index scan resolve ops(snap, track, untrack, log, status, show, list, rebuild_index, rewind_file, switch)`；**`index` 的全部 schema 与 `rebuild-index` 一起在 v0.1 落地**，否则后续无法验证"可重建"这一核心承诺；`rewind` 与 `branches` / `switch` 也必须落在 v0.1——`lfv snap` 的环回提示要求用户执行 `rewind`（§4.13.2） |
-| v0.2 | diff / mv / delete / revive / relink / branch-rename / branch-delete | `diff`、`ops(mv, delete, revive, relink)`（只依赖 v0.1 模块） |
+| v0.2 | diff / mv / delete / revive / relink / branch-rename / branch-drop | `diff`、`ops(mv, delete, revive, relink)`（只依赖 v0.1 模块） |
 | v0.3 | tag / export / import / gc / verify | `ops(gc, verify, export, import)` |
 | v0.4 | merge / rebase / --pick | `merge` |
 | v0.5 | tree plane | `tree`、`ops(tree_snap, tree_rewind)`、`tree_file_refs` |

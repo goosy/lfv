@@ -228,9 +228,13 @@ pub struct TrackedFile {
 pub struct FileMeta {
     pub created_at: Timestamp,
     pub initial_path: RepoPath,                  // path at track time; lets an A-state file survive rebuild-index
-    pub retired: Option<Retired>,                // set by relink on the src side
+    pub retired: Option<Retired>,                // set by `lfv delete --retire`, or by relink on the src side
+    pub dropped: Option<Dropped>,                // set by `lfv drop`
+    pub standby: Option<Standby>,                // set by import and by `lfv track --as/--new`; cleared when chosen
 }
-pub struct Retired { pub at: Timestamp, pub onto: FileId }
+pub struct Retired { pub at: Timestamp, pub onto: Option<FileId> }  // onto: set by relink only
+pub struct Dropped { pub at: Timestamp }
+pub struct Standby { pub at: Timestamp }
 ```
 
 - `TrackedStore::create(initial_path) -> FileId`: allocates a ULID, creates the directory, writes `meta.yaml`, `HEAD = main`, an empty `branches.yaml` (the branch is written only with the first snapshot, §3.8), and an empty log.
@@ -263,7 +267,7 @@ fn flag(row, head: Option<&Snapshot>) -> Flag
 
 `untracked` rows live in a table of their own (§3.6) and record only paths that exist on disk (§4.2).
 
-Invariant: **at any moment a path belongs to at most one active (non-retired, non-untracked) file-id**; a `D` row occupies the path of its HEAD snapshot, and if a file reappears at that path the scan treats it as the same file returning (`M` or unmodified), not as a new file.
+Invariant: **at any moment a path belongs to at most one active (non-retired, non-untracked) file-id**, and a path in conflict (§3.10) belongs to none; a `D` row occupies the path of its HEAD snapshot, and if a file reappears at that path the scan treats it as the same file returning (`M` or unmodified), not as a new file.
 
 ### 2.8 Argument resolution (`resolve`)
 
@@ -488,6 +492,7 @@ The mutable index lives in `index.db` and records the working-area state of each
 | ---- | ---- | ---- |
 | `tracked` | Tracked files that currently own a path (including `D` rows that have disappeared from disk and are waiting for `lfv snap` to record the deletion). Primary key file-id; caches the HEAD snapshot's path/object/size and the on-disk mtime/size/hash from the last scan, to short-circuit incremental scans. | ✓ |
 | `untracked` | The dynamic untracked list in `config.yaml` ∩ LFV-visible ∩ paths that exist on disk; keeps the known former file-id for `lfv track` to reuse. | ✓ |
+| `conflicted` | Paths in conflict (spec §4.2) that exist on disk: LFV-visible, not dynamically untracked, with several candidates not on standby (§3.10). | ✓ |
 | `scan_meta` | Scan metadata: `last_completed_at` and the mtimes of `.lfvignore` and `config.yaml`, for incremental-scan invalidation. | ✓ |
 | `branches` | Branch pointer cache per file. Source of truth: `.lfv/files/<ULID>/branches.yaml`. | ✓ |
 | `tags` | Tag cache per file. Source of truth: `.lfv/files/<ULID>/tags.yaml` and `.lfv/trees/tags.yaml`. | ✓ |
@@ -523,7 +528,13 @@ CREATE UNIQUE INDEX tracked_path ON tracked(path) WHERE present = 1;
 -- dynamically untracked paths that exist on disk (config.yaml untracked list ∩ visible ∩ on disk)
 CREATE TABLE untracked (
     path      TEXT PRIMARY KEY,
-    file_id   TEXT,                  -- former file-id, if non-retired and not currently active; reused by `lfv track` (§3.10)
+    file_id   TEXT,                  -- former file-id per the tracking rule (§3.10); reused by `lfv track`
+    size      INTEGER NOT NULL
+);
+
+-- paths in conflict that exist on disk (several candidates not on standby; §3.10)
+CREATE TABLE conflicted (
+    path      TEXT PRIMARY KEY,
     size      INTEGER NOT NULL
 );
 
@@ -592,12 +603,16 @@ LFV does not support a detached HEAD — `rewind` always creates a new branch to
 ```yaml
 created_at: 2026-05-17T09:21:33Z
 initial_path: "docs/note.md"      # path at track time; the only record of it before the first snapshot
-retired: ~                        # ~ until `lfv relink <this> --onto <onto>`, then a nested block:
+retired: ~                        # ~ until `lfv delete <this> --retire` or `lfv relink <this> --onto <onto>`, then a nested block:
                                    #   at: 2026-06-01T08:00:00Z
-                                   #   onto: file:01HA7BCD...
+                                   #   onto: file:01HA7BCD...     (relink only)
+dropped: ~                        # ~ until `lfv drop <this>`, then a nested block:
+                                   #   at: 2026-06-02T10:00:00Z
+standby: ~                        # ~ unless set aside (import, or not chosen by `lfv track --as/--new`):
+                                   #   at: 2026-06-03T11:00:00Z
 ```
 
-`initial_path` lets a file with no snapshot yet return to the `tracked` table after `rebuild-index` instead of being assigned a new file-id; `retired` keeps a retired file-id from competing for the path with the `onto` side during a rebuild.
+`initial_path` is the last recorded path of a file with no snapshot yet (§3.10), so such a file keeps its file-id across `rebuild-index` and across a stretch of time without a `tracked` row; `retired` and `dropped` make a file-id ineligible, so it never competes for a path; `standby` keeps an eligible file-id from competing until the user chooses it.
 
 **`.lfv/files/<ULID>/REPLAY.yaml`**
 
@@ -644,7 +659,7 @@ rewind/7RQ2M9KA/1: snap:01HABC...
 ```
 
 - Written when a branch is first created; the corresponding value is updated after `lfv snap` produces a new snapshot on the current branch.
-- `lfv branch-delete` removes the corresponding key; the snapshots themselves are unaffected (append-only).
+- `lfv branch-drop` removes the corresponding key; the snapshots themselves are unaffected (append-only).
 
 **`.lfv/files/<ULID>/tags.yaml`**
 
@@ -687,27 +702,41 @@ The other multi-step write flows follow the same principle: the source of truth 
 | `relink` (§4.7) | (1) append the copied chain to the dst log → (2) advance dst `branches.yaml` → (3) write `retired` into src `meta.yaml` → (4) index (re-hang the `tracked` row onto dst; null out `untracked.file_id` if a row still references dst) | after (1): the tail of the dst log holds a dangling chain no branch references (reclaimable by `gc --purge`), and re-running relink produces a fresh chain with new ULIDs; after (2): src is not retired, so two file-ids claim the same path and relink must be re-run; after (3): the index lags, including a stale `untracked.file_id` pointing at dst — harmless, §3.10's rebuild rule excludes active file-ids anyway |
 | `import` (§4.16) | (1) write `objects/` → (2) rename the archive directory wholesale into `files/<ULID>/` → (3) index `snap_locator` | after (1): extra unreferenced objects (reclaimed by `gc`); (2) is the atomic dividing line — a successful rename means the import happened; after (3): the index lags, repaired by `rebuild-index` |
 | `snap --tree` (§4.11) | (1) write the Tree Object → (2) append the Tree Snapshot → (3) `trees/HEAD` → (4) `trees/tags.yaml` → (5) index | after (1): one extra unreferenced object; after (2): a dangling Tree Snapshot; after (3): the tag was not written, just re-run with `--tag`; after (4): the index lags |
+| `track --as` / `--new` (§4.4) | `--as`: (1) clear `standby` of the chosen file-id → (2) write `standby` into the `meta.yaml` of every other candidate of the path → (3) atomic write of `config.yaml` if the path leaves `untracked` → (4) index. `--new`: (1) write `standby` into every candidate → (2) create the new file-id → (3), (4) as above | `--as` after (1): several candidates compete again and the path is in conflict; re-running the command completes it. `--new` after (1): no candidate competes, so the next scan auto-tracks the file as new, which is the intended result. After (2) or (3): the index lags |
+| `delete --retire` (§4.8) | (1) delete the on-disk file (active file-id only) → (2) write `retired` into `meta.yaml` → (3) index | after (1): the file shows as `D`, and re-running the command completes it; after (2): the index lags |
+| `drop` (§4.8) | (1) write `dropped` into `meta.yaml` → (2) index | after (1): the index lags |
+| cancelling an `A` file (§4.9) | (1) delete its `meta.yaml` → (2) delete the rest of `files/<id>/` → (3) index | after (1) or (2): a directory under `files/` without `meta.yaml` is leftover garbage, skipped by `rebuild-index` and removed by `gc`; after (2): the index lags |
 | `gc --purge` (§3.11) | (1) prune every log by reachability → (2) delete objects by the new reference set | a crash between the two steps only leaves extra objects behind, which is safe |
 
 ### 3.10 The `rebuild-index` algorithm
 
+**The tracking rule** implements spec §3.4 (cache consistency) and spec §4.2 (former file-ids). It is the only derivation of "which file-id is active at which path": `rebuild-index`, the scan (§4.3.1, §4.4), `lfv track` and `lfv drop` all call it (`index::tracking_rule`), and none restates it.
+
+- *Last recorded path* of a file-id: `head.path` of its current-branch HEAD snapshot; with no snapshot, `meta.initial_path`.
+- *Eligible*: `meta.retired` and `meta.dropped` are both unset, and the file-id has no snapshot or its HEAD has `object != null`.
+- *Candidates* of a path P: the eligible file-ids whose last recorded path is P, on standby or not; *contenders*: the candidates without `meta.standby`.
+- For a path P that is LFV-visible and not in `config.untracked`: with one contender, that file-id is active at P; with several, P is **in conflict** and nothing is active at P; with none, nothing is active at P. For any other path, nothing is active at it.
+
+A file-id active at P has a `tracked` row with `path = P` and `present = stat(P)`. A path in conflict that exists on disk has a `conflicted` row.
+
+`rebuild-index` applies the rule to the whole repository:
+
 1. Rebuild the schema.
-2. Walk `files/*/`: read meta, HEAD, branches, tags, and the log. Write `branches`, `tags`, `snap_locator`. A `retired` file-id gets no `tracked` row (but still gets `snap_locator`, since `lfv log file:<src>` must keep working). According to the HEAD snapshot of the current branch:
-   - present with `object != null` → a `tracked` row: `path = head.path`, `present = stat succeeded`, `head_*` filled in, `disk_*` left empty (forcing the next scan to re-hash);
-   - present with `object == null` → deleted, no row;
-   - no snapshot → `path = meta.initial_path`, `present = stat`, `head_* = NULL`.
-3. Tree plane: read `trees/snapshots.log` → `snap_locator(file_id = NULL)`; `trees/tags.yaml` → `tags`; rebuild `tree_file_refs` with the attribution rule below.
-4. `untracked`: `config.untracked ∩ visible ∩ exists on disk`; among file-ids that are non-retired and not currently active (§2.7), `file_id` is the one whose current-branch HEAD has `path == P` and `object != null` (ties: latest HEAD `created_at` wins) — not any file-id whose history merely passed through P at some earlier point; empty if none qualifies.
-5. Clear `scan_meta` → the next scan is a full one.
+2. Walk `files/*/` (skipping directories without `meta.yaml`, §3.9): read meta, HEAD, branches, tags, and the log. Write `branches`, `tags`, `snap_locator` for every file-id, retired and dropped ones included (`lfv log file:<id>` must keep working until a purge), and record each file-id's last recorded path and eligibility.
+3. Apply the tracking rule to every last recorded path: each active file-id gets a `tracked` row (`head_*` from its HEAD snapshot, or NULL when it has none; `disk_*` left empty, forcing the next scan to re-hash); each path in conflict that exists on disk gets a `conflicted` row.
+4. Tree plane: read `trees/snapshots.log` → `snap_locator(file_id = NULL)`; `trees/tags.yaml` → `tags`; rebuild `tree_file_refs` with the attribution rule below.
+5. `untracked`: `config.untracked ∩ visible ∩ exists on disk`; `file_id` is P's only contender, and empty otherwise.
+6. Clear `scan_meta` → the next scan is a full one.
 
 **The `tree_file_refs` attribution rule**: a Tree Object holds only `{path, hash}` and no file-id. For each manifest entry `(P, H)`, search all file-id logs for a snapshot with `path == P && object == H && created_at <= tree.created_at` and take the file-id of the one with the **latest created_at**. This rule gives the right answer both for "a new file at the same path after a deletion" and for relink (the copied chain has newer ULIDs and later timestamps); the only residual ambiguity is two file-ids holding the same `(P, H)` at the very same moment, which normal operation does not produce.
 
 ### 3.11 Reachability and gc
 
-- Roots: file plane = every branch head of every file-id (including retired ones) + every tag + the snapshots referenced by an existing `REPLAY.yaml`; tree plane = `trees/HEAD` + every `tree:` tag.
+- Roots: file plane = every branch head and every tag of every file-id that is not dropped (retired ones included) + the snapshots referenced by an existing `REPLAY.yaml`; tree plane = `trees/HEAD` + every `tree:` tag.
 - Reachable snapshots = the closure from the roots along `parent`. Reachable objects = the `object` of every reachable snapshot ∪ the entries in the manifests of reachable Tree Snapshots.
 - `lfv gc`: deletes objects that **no snapshot (dangling ones included) references**; the logs are left alone.
-- `lfv gc --purge`: first `SnapshotLog::prune` each log according to reachability: unreachable snapshot lines are dropped whole and the kept lines stay byte-for-byte unchanged — the only change to a log besides appending, which deletes but never modifies an existing record; then delete objects according to the new reference set. A crash between the two steps is safe (it only leaves extra objects behind).
+- `lfv gc --purge`: first `SnapshotLog::prune` each log according to reachability: unreachable snapshot lines are dropped whole and the kept lines stay byte-for-byte unchanged — the only change to a log besides appending, which deletes but never modifies an existing record; then delete objects according to the new reference set. A dropped file-id whose log is now empty has its directory `files/<id>/` deleted (`meta.yaml` last) together with its index rows. A crash between the steps is safe (it only leaves extra objects, or a dropped directory with an empty log, behind).
+- `lfv gc` and `lfv gc --purge` also delete leftover directories under `files/` that have no `meta.yaml` (§3.9).
 
 ## 4. Internal Mechanisms
 
@@ -779,8 +808,8 @@ A few concepts first:
 
 | Level | Subject | Scan action |
 | ---- | ---- | ---- |
-| **A. Registered paths** | rows already in `tracked` / `untracked` | For each row, first decide from the `.lfvignore` mtime whether LFV visibility has to be re-evaluated; if invisible, delete the status-table record, and if visible, `stat` + state update. A tracked row whose `stat` fails goes to auto-delete (§4.5). Cost O(number of registered paths). |
-| **B. Newly discovered paths** | LFV-visible paths seen during traversal that are not yet registered | A dynamically untracked file is set to `untracked`; a trackable candidate first tries to resume a former file-id (§4.4), then goes through rename detection (§4.6), and if unpaired, auto-track (§4.4). |
+| **A. Registered paths** | rows already in `tracked` / `untracked` / `conflicted` | For each row, first decide from the `.lfvignore` mtime whether LFV visibility has to be re-evaluated; if invisible, delete the status-table record, and if visible, `stat` + state update. A tracked row whose `stat` fails goes to auto-delete (§4.5). A `conflicted` row is re-evaluated with the tracking rule (§3.10) on every scan: deleted when the file is gone, turned into a `tracked` row when a single contender now makes a file-id active. Cost O(number of registered paths). |
+| **B. Newly discovered paths** | LFV-visible paths seen during traversal that are not yet registered | A dynamically untracked file is set to `untracked`; a trackable candidate is first checked with the tracking rule: a file-id active at the path is resumed, a path in conflict gets a `conflicted` row (§4.4); only a path with no candidate goes through rename detection (§4.6), and if unpaired, auto-track (§4.4). |
 
 All the scan actions above update the status table. In addition, `lfv track` and `lfv untrack` also update `config.yaml` along with the status table.
 
@@ -819,12 +848,14 @@ When a scan finds a path in the working tree that is **LFV-visible** and not yet
 - if it matches `.lfvignore` → **ignore** it (not registered, §4.2);
 - if it is in the dynamic untracked list of `config.yaml` → register it as `untracked` (§4.2);
 - if the path violates the spec §4.2 path rules → do not register it; only issue a warning (the scan continues) with a hint to add it to `.lfvignore`;
-- if a **former file-id** exists for the path → resume it (below); this is decided before rename detection (§4.6);
+- if the tracking rule (§3.10) makes some file-id active at the path → resume it; if the path is in conflict → register it as `conflicted` (both below); both are decided before rename detection (§4.6);
 - otherwise, and when rename detection does not pair it → treat it as an "OS create" and `track` it automatically: `tracked::TrackedStore::create(path)` allocates a `file-id`, creates the directory, and writes `meta.initial_path`, while a row with `status = modified` and no `head_*` is inserted into the `tracked` table.
 
 **No Snapshot is appended immediately**; the first Snapshot is written by a later `lfv snap`.
 
-**Resuming a former file-id**: a former file-id of path P is a file-id that is non-retired, has no `tracked` row, and whose current-branch HEAD has `path == P` and `object != null` (ties: latest HEAD `created_at`, then largest snap-id) — the same candidate rule as the `untracked.file_id` of §3.10 step 4. Such a file-id is still tracked as far as the repository is concerned; it only lost its `tracked` row, typically because its path was LFV-invisible for a while (§4.3.1). The scan therefore rebuilds the row exactly as `rebuild-index` would (§3.10 step 2): `path = head.path`, `present = 1`, `head_*` from the HEAD snapshot, with the status derived per §2.7 (`unmodified` when the disk content equals `head.object`, otherwise `modified`). No file-id is allocated and nothing is written under `files/`. This check precedes rename detection because `rebuild-index` assigns P to that file-id unconditionally; allocating a new file-id instead would leave two file-ids claiming P, a state `rebuild-index` could not reproduce. The candidates are collected once per scan into an in-memory map `HEAD path -> file-id`, and only when level B has new paths.
+**Resuming a former file-id** (spec §4.2): the scan rebuilds the `tracked` row of the file-id the tracking rule makes active at P exactly as `rebuild-index` would (§3.10), with `present = 1`, `head_*` from its HEAD snapshot (NULL when it has none) and the status derived per §2.7 (`unmodified` when the disk content equals `head.object`, otherwise `modified`). No file-id is allocated and nothing is written under `files/`. This check precedes rename detection because `rebuild-index` assigns P to that file-id unconditionally; allocating a new file-id instead would leave two file-ids claiming P, a state `rebuild-index` could not reproduce. When P is in conflict, a `conflicted` row is inserted instead and nothing else happens. The last recorded paths of the eligible file-ids without a `tracked` row are collected once per scan into an in-memory map `path -> [file-id]`, and only when level B has new paths or `conflicted` is not empty.
+
+**`lfv track <P> --as <F>` / `--new`** (`ops::track_as`, spec §4.2): refused when the file-id currently active at P is `modified`, and for `--as` when F is not a candidate of P. `--as` clears `standby` of F and writes `standby` into every other candidate of P; `--new` creates a new file-id at P (`TrackedStore::create`) and writes `standby` into every candidate of P. P leaves `config.untracked` if listed. The file on disk is not touched: afterwards F (or the new file-id) is P's only contender, and the index replaces P's `conflicted`, `untracked` or previous `tracked` row with its `tracked` row, the status derived per §2.7 against its HEAD. A plain `lfv track <P>` on a dynamically untracked path with several contenders only removes P from `untracked`, and P becomes a path in conflict. `lfv status <P>` lists P's candidates from the same map as the scan (spec §4.3.1).
 
 When auto-track runs: `lfv status` (executed on the spot during the scan), `lfv track` (when tracking with no argument), and `lfv snap` (before a no-argument batch snapshot).
 
@@ -879,10 +910,10 @@ The benefit of this design: before `lfv snap`, a `D` file is still in the tracki
 The command is designed for the scenario "a user mistake caused LFV to produce a new file-id" (typically: a rename plus a content change at the OS level made auto-track allocate a new file-id) and should not be used as a routine command. If src-file-id has no history yet, dst-file-id's history is left as it is and only the file-id binding is transferred.
 
 - **src-file-id**: an active file-id (tracked, not retired) whose file is present on disk (`present = 1`); the stored status may be either `modified` or `unmodified` (`A`/`M`/blank are only render-time flags, §2.7). Refused if `present = 0`, because there is no on-disk file to hand over
-- **dst-file-id**: must own no live path — a file that has disappeared from disk (`present = 0`, the old file-id, awaiting continuation), a deleted file whose latest snapshot has `object = null`, an untracked file-id that still has history (no `tracked` row; its former path may sit in `config.untracked` with a live `untracked` row), or an imported file-id that has not been activated (no `tracked` row). A dst that currently owns a live path (`present = 1`) is refused: relink is not a way to merge two live files. If dst still has a `tracked` row (`present = 0`), it is replaced by src's re-hung row
+- **dst-file-id**: must own no live path — a file that has disappeared from disk (`present = 0`, the old file-id, awaiting continuation), a deleted file whose latest snapshot has `object = null`, an untracked file-id that still has history (no `tracked` row; its former path may sit in `config.untracked` with a live `untracked` row), or a file-id on standby, such as an imported one (no `tracked` row; relink clears its `standby` together with advancing its branch table). A retired or dropped dst is refused. A dst that currently owns a live path (`present = 1`) is refused: relink is not a way to merge two live files. If dst still has a `tracked` row (`present = 0`), it is replaced by src's re-hung row
 - **The file-id that survives is the `--onto` side (dst-file-id)**, consistent with the direction of the preposition
 
-Afterwards, src-file-id's current path and content are appended as the next Snapshot of dst-file-id's history (in Case 1, not when they are identical to dst's last snapshot); src-file-id's `tracked` row is re-hung onto dst-file-id (the `file_id` is swapped and `head_*` taken from dst) and produces no further snapshot. **src-file-id's `files/<src-file-id>/` directory and `snapshots.log` are preserved in full** (append-only, never deleted), and `retired: {at, onto: dst}` is written into its `meta.yaml`; src-file-id becomes a "retired" file-id, `lfv log src-file-id` still works, and `lfv list` does not list it by default.
+Afterwards, src-file-id's current path and content are appended as the next Snapshot of dst-file-id's history (in Case 1, not when they are identical to dst's last snapshot); src-file-id's `tracked` row is re-hung onto dst-file-id (the `file_id` is swapped and `head_*` taken from dst) and produces no further snapshot. **src-file-id's `files/<src-file-id>/` directory and `snapshots.log` are preserved in full** (append-only, never deleted), and, as the last step, src-file-id is retired by the same `ops::retire` that `lfv delete <src> --retire` uses (§4.8), recording `onto: dst` — relink is a composition of splicing and retiring, not one atomic step (§3.9); src-file-id becomes a "retired" file-id, `lfv log src-file-id` still works, and `lfv list` does not list it by default.
 
 If dst was an untracked-with-history file-id, its former path stays in `config.untracked` unchanged; only a live `untracked` row with `file_id = dst`, if any, has that field nulled (index bookkeeping, §3.9).
 
@@ -909,6 +940,10 @@ From then on that file-id has no `tracked` row. Its last path is preserved in th
 
 The file's **history is preserved in full**: `lfv log` / `lfv show` / `lfv diff` still work. To "revive" it, use `lfv revive` (§4.10) or `lfv rewind <file> <snap>` directly; both automatically create a preserving branch (so the existing delete event is not destroyed).
 
+**`lfv delete <file> --retire`** (`ops::retire(file, onto)`, spec §4.2): refused when the file-id is already retired or dropped, or has a `REPLAY.yaml`. (1) If the file-id has a `tracked` row with `present = 1`, delete its on-disk file; (2) write `retired: {at, onto}` into its `meta.yaml` (`onto` absent here); (3) index: delete its `tracked` row, recompute an `untracked.file_id` naming it, and re-evaluate with the tracking rule (§3.10) the path that listed it as a candidate — a `conflicted` path left with a single candidate turns into that file-id's `tracked` row. No snapshot is appended. `lfv relink` calls `ops::retire(src, onto = dst)` and skips step (1), because the on-disk file has already been handed to dst. `lfv revive`, `lfv relink --onto` and `lfv track --as` refuse a retired file-id.
+
+**`lfv drop <file-id>`** (`ops::drop`, spec §4.2): refused when the file-id has a `tracked` row (`D` included), has a `REPLAY.yaml`, or is already dropped. It writes `dropped: {at}` into the file-id's `meta.yaml` and then updates the index: an `untracked.file_id` naming it is recomputed, and the path that listed it as a candidate is re-evaluated with the tracking rule (§3.10) — a `conflicted` path left with a single candidate turns into that file-id's `tracked` row. Its log, branches and tags are left as they are; `lfv gc --purge` removes them (§3.11). `lfv revive`, `lfv relink --onto` and `lfv track --as` refuse a dropped file-id.
+
 ### 4.9 `lfv snap`: internal execution flow
 
 **Single file** (`ops::snap_file`):
@@ -921,7 +956,7 @@ The file's **history is preserved in full**: `lfv log` / `lfv show` / `lfv diff`
    - otherwise `snapshot::loop_check` (§4.13) → refuse on a hit and print the rewind hint;
    - append `Snapshot { parent: head_snap, path, object: hash, size }`; advance the branch table; update the `tracked` row's `head_*` and `disk_*`, with `status = unmodified`.
 3. `present = 0`:
-   - `head_snap` is `None` (`A` and already gone) → produce no snapshot, delete the `tracked` row, and leave the `files/<id>/` directory as an empty shell (which gc can clean up);
+   - `head_snap` is `None` (`A` and already gone) → produce no snapshot, delete the `tracked` row, and delete the `files/<id>/` directory (write order in §3.9): the file-id has no history, and a leftover directory would stay a candidate for its `initial_path` (§3.10);
    - otherwise append `Snapshot { parent: head_snap, path: the last known on-disk path, object: null, size: 0 }`; advance the branch table; delete the `tracked` row.
 4. The write order follows §3.9.
 
@@ -967,8 +1002,9 @@ if t.object == null:
 else if fs_ish given                             -> error (use `lfv rewind <file> <FS-ish>`)
 else if tracked row exists && present = 1        -> no-op, print a message
 else if tracked row exists && present = 0        -> error (status D: `lfv show <file> --out <path>`, or `lfv snap` first)
-else:                                            // no tracked row, e.g. imported (§4.16)
+else:                                            // no tracked row, e.g. on standby after an import (§4.16)
     object.restore_to(t.object, t.path)
+    clear meta.standby if set
     insert tracked row (present = 1, unmodified); no preserving branch
 ```
 
@@ -1097,11 +1133,11 @@ pub struct ReplayState {          // persisted as REPLAY.yaml while in progress 
 1. Unpack/open the archive and locate its `<ULID>/` directory; if `files/<ULID>/` already exists in the current repository, error out and refuse (which should not happen normally, as ULIDs are globally unique), performing no partial import and no merge of two histories.
 2. Parse the `snapshots.log` inside the archive, recomputing the `digest` (§3.3.2) of each line and comparing it with the record; a single mismatch rejects the whole import.
 3. Walk every `object` hash the log references: the archive carries those File Objects with it (in the same structure as `.lfv/objects/`), and for each hash, skip it if the local `objects/` already has it (deduplicating by content, consistent with the write policy of §3.2), otherwise write it as-is (with no fresh compression decision, trusting the encoding in the archive; `verify` will check the hash afterwards).
-4. Copy the archive's `meta.yaml`, `HEAD`, `branches.yaml`, `tags.yaml`, and `snapshots.log` wholesale into `.lfv/files/<ULID>/`.
-5. Write `snap_locator(snap_id, file_id)` for every snapshot in that log, so `lfv log <snap-id>` works immediately; **do not** create a `tracked` row and do not modify `config.yaml` — that file-id is in a "has history, not activated" state, equivalent to a "retired" file-id in the relink of §4.7 but without `meta.retired` (it was not absorbed by some dst, it simply has not been materialized yet).
-6. Print a summary: file-id, number of branches, number of snapshots, number of objects imported. Mention that `lfv revive <file-id>` can restore it to the working tree.
+4. Copy the archive's `meta.yaml`, `HEAD`, `branches.yaml`, `tags.yaml`, and `snapshots.log` wholesale into `.lfv/files/<ULID>/`, setting `standby: {at}` in the copied `meta.yaml` before the directory is renamed into place (§3.9), so an imported file-id is never seen without it.
+5. Write `snap_locator(snap_id, file_id)` for every snapshot in that log, so `lfv log <snap-id>` works immediately; **do not** create a `tracked` row and do not modify `config.yaml` — that file-id is on standby (spec §3.1): it has history but is not a contender for any path, so neither the scan nor `rebuild-index` activates it.
+6. Print a summary: file-id, number of branches, number of snapshots, number of objects imported. Mention that `lfv revive <file-id>` can restore it to the working tree, and that `lfv track <path> --as <file-id>` claims a file already at its path.
 
-For a file-id with no `tracked` row whose `HEAD` snapshot has `object != null`, `lfv revive` activates it without a rewind (§4.10): the content is written to `HEAD.path` and a `tracked` row is inserted; if that path is already occupied by another active file-id, it is refused, and the user can make room with `lfv mv` first.
+For a file-id with no `tracked` row whose `HEAD` snapshot has `object != null`, `lfv revive` activates it without a rewind (§4.10): the content is written to `HEAD.path`, `standby` is cleared and a `tracked` row is inserted; if that path is already occupied by another active file-id, it is refused, and the user can make room with `lfv mv` first.
 
 ### 4.17 Flow → module mapping table
 
@@ -1113,8 +1149,8 @@ For a file-id with no `tracked` row whose `HEAD` snapshot has `object != null`, 
 | auto-delete §4.5 | scan | `scan` level A | `index` |
 | Rename detection §4.6 | scan | `scan::rename_detect` | `index`, `object` (hash) |
 | mv §4.6 | mv | `ops::mv` | `resolve`, `object`, `snapshot`, `tracked`, `index` |
-| relink §4.7 | relink | `ops::relink` | `snapshot` (chain copy), `tracked` (retired), `index` |
-| delete §4.8 | delete | `ops::delete` | `index`, `util::fs` |
+| relink §4.7 | relink | `ops::relink` | `snapshot` (chain copy), `ops::retire`, `index` |
+| delete §4.8 | delete, delete --retire | `ops::delete` / `ops::retire` | `index`, `util::fs`, `tracked` (meta), `index::tracking_rule` |
 | snap §4.9 | snap | `ops::snap_file` / `ops::snap_all` | `object`, `snapshot::loop_check`, `tracked`, `index` |
 | rewind / switch / revive §4.10 | rewind, switch, revive | `ops::rewind_file` / `ops::switch` / `ops::revive` | `snapshot`, `object::restore_to`, `tracked`, `index` |
 | snap --tree §4.11 | snap --tree | `ops::tree_snap` | `object::TreeManifest`, `tree`, `index` |
@@ -1124,7 +1160,10 @@ For a file-id with no `tracked` row whose `HEAD` snapshot has `object != null`, 
 | verify §4.15 | verify | `ops::verify` | the whole storage layer |
 | import §4.16 | import | `ops::import` | `snapshot` (digest check), `object` (deduplicated write), `tracked` (meta/branches/tags copy), `index.snap_locator` |
 | gc §3.11 | gc | `ops::gc` | `snapshot::prune`, `object::remove` |
-| rebuild-index §3.10 | rebuild-index | `ops::rebuild_index` | `index`, `tracked`, `tree` |
+| Tracking rule §3.10 | rebuild-index, scan, track, drop | `index::tracking_rule` | `tracked` (meta, HEAD), `repo` (`config.untracked`), `scan::visibility` |
+| track --as / --new §4.4 | track --as, track --new | `ops::track_as` | `tracked` (meta standby, `TrackedStore::create`), `repo` (config), `index::tracking_rule`, `index` |
+| drop §4.8 | drop | `ops::drop` | `tracked` (meta), `index::tracking_rule`, `index` |
+| rebuild-index §3.10 | rebuild-index | `ops::rebuild_index` | `index`, `index::tracking_rule`, `tracked`, `tree` |
 | log / show / diff / list / branches / tags | queries | `ops::query::*` | `resolve`, `snapshot`, `diff`, `index` |
 
 ## 5. Roadmap Implementation Order (cf. spec §7)
@@ -1132,7 +1171,7 @@ For a file-id with no `tracked` row whose `HEAD` snapshot has `object != null`, 
 | Version | Commands | Required modules |
 | --- | --- | --- |
 | v0.1 | init / config / track / untrack / snap / status / log / show / list / rebuild-index; branches / switch / rewind | `util repo object snapshot reftable tracked index scan resolve ops(snap, track, untrack, log, status, show, list, rebuild_index, rewind_file, switch)`; **the full `index` schema lands in v0.1 together with `rebuild-index`**, since otherwise the core promise of "rebuildable" cannot be verified later; `rewind` plus `branches` / `switch` must also land in v0.1 — the loopback hint of `lfv snap` tells the user to run `rewind` (§4.13.2) |
-| v0.2 | diff / mv / delete / revive / relink / branch-rename / branch-delete | `diff`, `ops(mv, delete, revive, relink)` (they depend only on v0.1 modules) |
+| v0.2 | diff / mv / delete / revive / relink / branch-rename / branch-drop | `diff`, `ops(mv, delete, revive, relink)` (they depend only on v0.1 modules) |
 | v0.3 | tag / export / import / gc / verify | `ops(gc, verify, export, import)` |
 | v0.4 | merge / rebase / --pick | `merge` |
 | v0.5 | tree plane | `tree`, `ops(tree_snap, tree_rewind)`, `tree_file_refs` |
